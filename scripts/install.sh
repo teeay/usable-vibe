@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Mistral Vibe Installation Script
-# This script installs uv if not present and then installs mistral-vibe using uv
+# Usable Vibe Installation Script
+# This script installs uv if not present and then installs uvibe using uv
 
 set -euo pipefail
 
@@ -99,16 +99,16 @@ function install_uv() {
 }
 
 function check_vibe_installed() {
-    if [[ -n "$(find_command_in_path vibe "$ORIGINAL_PATH")" ]]; then
-        info "vibe is already installed"
+    if [[ -n "$(find_command_in_path uvibe "$ORIGINAL_PATH")" ]]; then
+        info "uvibe is already installed"
         VIBE_INSTALLED=true
         return
     fi
 
     local uv_bin_dir
     uv_bin_dir=$(uv tool dir --bin 2>/dev/null || true)
-    if [[ -n "$uv_bin_dir" && -x "$uv_bin_dir/vibe" ]]; then
-        info "vibe is already installed (off PATH) at $uv_bin_dir/vibe"
+    if [[ -n "$uv_bin_dir" && -x "$uv_bin_dir/uvibe" ]]; then
+        info "uvibe is already installed (off PATH) at $uv_bin_dir/uvibe"
         VIBE_INSTALLED=true
         return
     fi
@@ -117,17 +117,17 @@ function check_vibe_installed() {
 }
 
 function install_vibe() {
-    info "Installing mistral-vibe from GitHub repository using uv..."
-    uv tool install mistral-vibe
+    info "Installing uvibe from GitHub repository using uv..."
+    uv tool install uvibe
 
-    success "Mistral Vibe installed successfully! (commands: vibe, vibe-acp)"
+    success "Usable Vibe installed successfully! (commands: uvibe, uvibe-acp)"
 }
 
 function update_vibe() {
-    info "Updating mistral-vibe from GitHub repository using uv..."
-    uv tool upgrade mistral-vibe
+    info "Updating uvibe from GitHub repository using uv..."
+    uv tool upgrade uvibe
 
-    success "Mistral Vibe updated successfully!"
+    success "Usable Vibe updated successfully!"
 }
 
 function main() {
@@ -142,7 +142,7 @@ function main() {
     echo "██████████████████░░"
     echo "██████████████████░░"
     echo
-    echo "Starting Mistral Vibe installation..."
+    echo "Starting Usable Vibe installation..."
     echo
 
     check_platform
@@ -161,27 +161,27 @@ function main() {
         update_vibe
     fi
 
-    if [[ -n "$(find_command_in_path vibe "$ORIGINAL_PATH")" ]]; then
+    if [[ -n "$(find_command_in_path uvibe "$ORIGINAL_PATH")" ]]; then
         success "Installation completed successfully!"
         echo
-        echo "You can now run vibe with:"
-        echo "  vibe"
+        echo "You can now run uvibe with:"
+        echo "  uvibe"
         echo
         echo "Or for ACP mode:"
-        echo "  vibe-acp"
+        echo "  uvibe-acp"
     else
         local UV_BIN_DIR
         local VIBE_BIN_PATH=""
         UV_BIN_DIR=$(uv tool dir --bin 2>/dev/null || true)
-        if [[ -n "$UV_BIN_DIR" && -x "$UV_BIN_DIR/vibe" ]]; then
-            VIBE_BIN_PATH="$UV_BIN_DIR/vibe"
+        if [[ -n "$UV_BIN_DIR" && -x "$UV_BIN_DIR/uvibe" ]]; then
+            VIBE_BIN_PATH="$UV_BIN_DIR/uvibe"
         fi
 
         if [[ -n "$VIBE_BIN_PATH" ]]; then
-            print_missing_path_instructions "vibe" "$VIBE_BIN_PATH"
+            print_missing_path_instructions "uvibe" "$VIBE_BIN_PATH"
         else
-            error "Installation completed but 'vibe' command not found"
-            error "uv did not expose a 'vibe' executable in the expected tools directory."
+            error "Installation completed but 'uvibe' command not found"
+            error "uv did not expose a 'uvibe' executable in the expected tools directory."
             error "Please check your installation and PATH settings"
         fi
         exit 1

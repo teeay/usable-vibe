@@ -150,5 +150,5 @@ def run_onboarding(
             )
         case "completed":
             rprint(
-                '\nSetup complete 🎉. Run "vibe" to start using the Usable Vibe CLI.\n'
+                '\nSetup complete 🎉. Run "uvibe" to start using the Usable Vibe CLI.\n'
             )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke tests for the built vibe-acp binary.
+"""Smoke tests for the built uvibe-acp binary.
 
 Usage: python tests/smoke_binary.py <binary-dir>
 
@@ -227,7 +227,7 @@ def test_no_executable_stack(binary_dir: Path) -> None:
     checked = 0
 
     # Check main binary + everything under _internal/
-    candidates = [binary_dir / "vibe-acp"]
+    candidates = [binary_dir / "uvibe-acp"]
     candidates.extend(internal_dir.rglob("*"))
 
     for filepath in candidates:
@@ -262,7 +262,7 @@ def main() -> None:
         sys.exit(1)
 
     binary_dir = Path(sys.argv[1])
-    binary_name = "vibe-acp.exe" if platform.system() == "Windows" else "vibe-acp"
+    binary_name = "uvibe-acp.exe" if platform.system() == "Windows" else "uvibe-acp"
     binary = binary_dir / binary_name
 
     if not binary.exists():

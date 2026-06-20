@@ -66,7 +66,7 @@ def spawned_vibe_process() -> SpawnedVibeFactory:
         captured = io.StringIO()
         child = pexpect.spawn(
             "uv",
-            ["run", "vibe", "--workdir", str(workdir), *(extra_args or [])],
+            ["run", "uvibe", "--workdir", str(workdir), *(extra_args or [])],
             cwd=str(TESTS_ROOT.parent),
             env=os.environ,
             encoding="utf-8",

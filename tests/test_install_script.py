@@ -24,18 +24,18 @@ case "$*" in
   "tool dir --bin")
     echo "$tool_bin_dir"
     ;;
-  "tool install mistral-vibe"|"tool upgrade mistral-vibe")
+  "tool install uvibe"|"tool upgrade uvibe")
     mkdir -p "$tool_bin_dir"
-    cat >"$tool_bin_dir/vibe" <<'VIBE'
+    cat >"$tool_bin_dir/uvibe" <<'VIBE'
 #!/usr/bin/env bash
 exit 0
 VIBE
-    chmod +x "$tool_bin_dir/vibe"
-    cat >"$tool_bin_dir/vibe-acp" <<'VIBE_ACP'
+    chmod +x "$tool_bin_dir/uvibe"
+    cat >"$tool_bin_dir/uvibe-acp" <<'VIBE_ACP'
 #!/usr/bin/env bash
 exit 0
 VIBE_ACP
-    chmod +x "$tool_bin_dir/vibe-acp"
+    chmod +x "$tool_bin_dir/uvibe-acp"
     ;;
   *)
     echo "unexpected uv invocation: $*" >&2
@@ -117,7 +117,7 @@ def test_install_reports_missing_path_for_uv_tool_bin(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert (
-        "Your PATH does not include the folder that contains 'vibe'." in result.stderr
+        "Your PATH does not include the folder that contains 'uvibe'." in result.stderr
     )
     assert f'export PATH="{uv_bin_dir}:$PATH"' in result.stderr
     assert (
@@ -142,18 +142,18 @@ def test_install_succeeds_when_uv_bin_dir_is_already_on_path(tmp_path: Path) -> 
 
     assert result.returncode == 0
     assert "Installation completed successfully!" in result.stdout
-    assert (fake_bin / "vibe").exists()
-    assert (fake_bin / "vibe-acp").exists()
+    assert (fake_bin / "uvibe").exists()
+    assert (fake_bin / "uvibe-acp").exists()
 
 
 def test_install_fails_when_vibe_not_in_uv_tool_dir(tmp_path: Path) -> None:
-    """Covers the fallback error when uv tool dir doesn't contain a vibe binary."""
+    """Covers the fallback error when uv tool dir doesn't contain a uvibe binary."""
     home = tmp_path / "home"
     fake_bin = tmp_path / "fake-bin"
     home.mkdir()
     fake_bin.mkdir()
 
-    # Create a fake uv that does NOT produce a vibe binary on install
+    # Create a fake uv that does NOT produce a uvibe binary on install
     _write_executable(
         fake_bin / "uv",
         """\
@@ -163,7 +163,7 @@ def test_install_fails_when_vibe_not_in_uv_tool_dir(tmp_path: Path) -> None:
         case "$*" in
           "--version") echo "uv 0.test" ;;
           "tool dir --bin") echo "$tool_bin_dir" ;;
-          "tool install mistral-vibe") mkdir -p "$tool_bin_dir" ;;
+          "tool install uvibe") mkdir -p "$tool_bin_dir" ;;
           *) echo "unexpected: $*" >&2; exit 1 ;;
         esac
         """,
@@ -176,7 +176,7 @@ def test_install_fails_when_vibe_not_in_uv_tool_dir(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 1
-    assert "uv did not expose a 'vibe' executable" in result.stderr
+    assert "uv did not expose a 'uvibe' executable" in result.stderr
     assert "Your PATH does not include" not in result.stderr
 
 
@@ -186,13 +186,13 @@ def test_update_succeeds_when_vibe_is_already_on_path(tmp_path: Path) -> None:
     home.mkdir()
     fake_bin.mkdir()
     _write_fake_uv(fake_bin / "uv")
-    _write_fake_vibe(fake_bin / "vibe")
+    _write_fake_vibe(fake_bin / "uvibe")
 
     result = _run_install_script(home, [fake_bin], {"UV_TOOL_BIN_DIR": str(fake_bin)})
 
     assert result.returncode == 0
-    assert "Updating mistral-vibe from GitHub repository using uv..." in result.stdout
+    assert "Updating uvibe from GitHub repository using uv..." in result.stdout
     assert (
-        "Installing mistral-vibe from GitHub repository using uv..."
+        "Installing uvibe from GitHub repository using uv..."
         not in result.stdout
     )

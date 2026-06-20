@@ -80,7 +80,7 @@ newer release exists; accepting runs `uv tool upgrade uvibe`, then
 
 - `vibe -c` / `--continue`: most recent session in this terminal (TTY-scoped;
   falls back to latest in cwd).
-- `vibe --resume [SESSION_ID]`: specific session; without an id, opens a picker.
+- `uvibe --resume [SESSION_ID]`: specific session; without an id, opens a picker.
 - In-session: `/resume` (alias `/continue`).
 
 #### Session storage & folder scoping
@@ -502,7 +502,7 @@ vibe --workdir DIR                  # Change working directory
 vibe --add-dir DIR                  # Extra working dir loaded for context (repeatable). Implicitly trusted.
 vibe --trust                        # Trust cwd for this invocation only (not persisted)
 vibe -c / --continue                # Continue most recent session in this terminal (TTY-scoped, falls back to latest in cwd)
-vibe --resume [SESSION_ID]          # Resume a specific session
+uvibe --resume [SESSION_ID]          # Resume a specific session
 vibe -v / --version                 # Show version
 vibe --setup                        # Run onboarding/setup
 vibe --max-turns N                  # Max assistant turns (programmatic mode)
@@ -656,7 +656,7 @@ Detailed instructions for the model...
   to `WARNING`.
 - `LOG_MAX_BYTES` - Max size in bytes of `vibe.log` before rotation
   (default: `10485760`, i.e. 10 MiB).
-- `DEBUG_MODE` - When `true`, forces `DEBUG`-level logging. Under `vibe-acp`
+- `DEBUG_MODE` - When `true`, forces `DEBUG`-level logging. Under `uvibe-acp`
   it also attaches `debugpy` on `localhost:5678`.
 - `VIBE_TYPING_GRACE_PERIOD_MS` - Milliseconds the agent waits for a typing
   pause before showing tool-approval / ask-user-question dialogs (default:

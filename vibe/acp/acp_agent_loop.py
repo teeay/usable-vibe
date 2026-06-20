@@ -455,12 +455,12 @@ class VibeAcpAgentLoop(AcpAgent):
         self.client_info = client_info
 
         # The ACP Agent process can be launched in 3 different ways, depending on installation
-        #  - dev mode: `uv run vibe-acp`, ran from the project root
-        #  - uv tool install: `vibe-acp`, similar to dev mode, but uv takes care of path resolution
-        #  - bundled binary: `./vibe-acp` from binary location
+        #  - dev mode: `uv run uvibe-acp`, ran from the project root
+        #  - uv tool install: `uvibe-acp`, similar to dev mode, but uv takes care of path resolution
+        #  - bundled binary: `./uvibe-acp` from binary location
         # The 2 first modes are working similarly, under the hood uv runs `/some/python /my/entrypoint.py``
         # The last mode is quite different as our bundler also includes the python install.
-        # So sys.executable is already /path/to/binary/vibe-acp.
+        # So sys.executable is already /path/to/binary/uvibe-acp.
         # For this reason, we make a distinction in the way we call the setup command
         command = sys.executable
         if "python" not in Path(command).name:

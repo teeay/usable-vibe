@@ -79,7 +79,7 @@ async def _spawn_vibe_acp(env: dict[str, str]) -> asyncio.subprocess.Process:
     return await asyncio.create_subprocess_exec(
         "uv",
         "run",
-        "vibe-acp",
+        "uvibe-acp",
         stdin=aio_subprocess.PIPE,
         stdout=aio_subprocess.PIPE,
         stderr=aio_subprocess.PIPE,
@@ -286,7 +286,7 @@ def test_vibe_acp_setup_shows_onboarding_and_exits_on_cancel(
     captured = io.StringIO()
     child = pexpect.spawn(
         "uv",
-        ["run", "vibe-acp", "--setup"],
+        ["run", "uvibe-acp", "--setup"],
         cwd=str(TESTS_ROOT.parent),
         env=env,
         encoding="utf-8",

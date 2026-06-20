@@ -162,7 +162,7 @@ def test_resumed_session_prints_only_fresh_token_usage_on_exit(
 
     first_output = strip_ansi(captured.getvalue())
     assert _ALT_SCREEN not in captured.getvalue()
-    resume_match = re.search(r"Or: vibe --resume ([0-9a-f-]+)", first_output)
+    resume_match = re.search(r"Or: uvibe --resume ([0-9a-f-]+)", first_output)
     assert resume_match is not None
     session_id = resume_match.group(1)
     assert (

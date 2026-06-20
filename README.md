@@ -8,6 +8,9 @@ so that what the terminal does best is not emulated in a scripting language TUI.
 The principle is: if you want a GUI, make a GUI, but if it's terminal, let it be a real one.
 
 There should be no functional differences and everything should work exactly like the original.
+The two should be possible to install at the same time, the Usable version being called `uvibe`.
+
+Note that to allow ACP when Usable Vibe is running, `uvibe` will call itself `@mistralai/mistral-vibe`.
 
 Vibe is copyright (c) Mistral AI, released under the Apache 2.0 license.
 

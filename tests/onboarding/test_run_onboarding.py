@@ -73,4 +73,4 @@ def test_successfully_completes(
     onboarding.run_onboarding(StubApp("completed"))
 
     out = capsys.readouterr().out
-    assert 'Setup complete 🎉. Run "vibe" to start using the Usable Vibe CLI.' in out
+    assert 'Setup complete 🎉. Run "uvibe" to start using the Usable Vibe CLI.' in out

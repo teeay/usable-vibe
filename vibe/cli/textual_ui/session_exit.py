@@ -28,4 +28,4 @@ def print_session_resume_message(
     print(format_session_usage(stats))
     print()
     rprint("To continue this session, run: [bold dark_orange]vibe --continue[/]")
-    rprint(f"Or: [bold dark_orange]vibe --resume {session_id}[/]")
+    rprint(f"Or: [bold dark_orange]uvibe --resume {session_id}[/]")
