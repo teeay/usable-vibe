@@ -42,10 +42,8 @@ from vibe.cli.textual_ui.native_scroll.tool_result_render import (
 from vibe.cli.textual_ui.native_scroll.widget_render import (
     render_hook_line,
     render_hook_run,
-    render_user_prompt,
     render_widget_block,
 )
-from vibe.cli.textual_ui.widgets.messages import UserMessage
 from vibe.core.hooks.models import (
     HookEndEvent,
     HookEvent,
@@ -368,7 +366,7 @@ class ScrollbackCommitter:
             case UserMessageEvent():
                 # Local prompts are already committed via render_widget (the app
                 # mounts a UserMessage before the turn); committing here too would
-                # duplicate them. (Remote-session echo is a later parity item.)
+                # duplicate them.
                 self.flush()
             case HookEvent():
                 self._handle_hook_event(event)
@@ -467,16 +465,6 @@ class ScrollbackCommitter:
             messages, tool_call_map, omitted_count=omitted_count
         ):
             self._enqueue(block)
-
-    def commit_remote_user_message(self, content: str) -> None:
-        """Commit a remote-session user prompt to native scrollback.
-
-        Local prompts are committed via the widget path, so ``handle_event``
-        no-ops ``UserMessageEvent``; remote prompts have no widget path, so the
-        remote stream commits them here.
-        """
-        self.flush()
-        self._enqueue(render_user_prompt(UserMessage.PROMPT_CHAR, content))
 
     def commit_startup_header(self, *, version: str, model: str, cwd: str) -> None:
         """Commit the compact durable session header once at startup."""

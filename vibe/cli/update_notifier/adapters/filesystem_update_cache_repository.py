@@ -4,11 +4,11 @@ import asyncio
 import json
 from pathlib import Path
 
-from vibe.cli.cache import read_cache, write_cache
 from vibe.cli.update_notifier.ports.update_cache_repository import (
     UpdateCache,
     UpdateCacheRepository,
 )
+from vibe.core.cache_store import FileSystemVibeCodeCacheStore, VibeCodeCacheStore
 from vibe.core.paths import CACHE_FILE
 
 _CACHE_SECTION = "update_cache"
@@ -20,6 +20,9 @@ class FileSystemUpdateCacheRepository(UpdateCacheRepository):
             Path(base_path) / "cache.toml" if base_path is not None else CACHE_FILE.path
         )
         self._base_path = self._cache_file.parent
+        self._cache_store: VibeCodeCacheStore = FileSystemVibeCodeCacheStore(
+            self._cache_file
+        )
         self._legacy_json = self._base_path / "update_cache.json"
         self._cached: UpdateCache | None = None
         self._loaded = False
@@ -41,13 +44,14 @@ class FileSystemUpdateCacheRepository(UpdateCacheRepository):
             payload["seen_whats_new_version"] = update_cache.seen_whats_new_version
         if update_cache.dismissed_version is not None:
             payload["dismissed_version"] = update_cache.dismissed_version
-        await asyncio.to_thread(write_cache, self._cache_file, _CACHE_SECTION, payload)
+        await asyncio.to_thread(
+            self._cache_store.write_section, _CACHE_SECTION, payload
+        )
         self._cached = update_cache
         self._loaded = True
 
     def _read_section(self) -> dict | None:
-        cache = read_cache(self._cache_file)
-        if section := cache.get(_CACHE_SECTION):
+        if section := self._cache_store.read_section(_CACHE_SECTION):
             return section
 
         try:
@@ -56,10 +60,8 @@ class FileSystemUpdateCacheRepository(UpdateCacheRepository):
             return None
 
         if isinstance(data, dict):
-            write_cache(
-                self._cache_file,
-                _CACHE_SECTION,
-                {k: v for k, v in data.items() if v is not None},
+            self._cache_store.write_section(
+                _CACHE_SECTION, {k: v for k, v in data.items() if v is not None}
             )
         return data
 

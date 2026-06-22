@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from pathlib import Path
@@ -114,7 +115,7 @@ class QueuePorts:
     Everything the drain engine needs that only ``VibeApp`` can provide is
     funnelled through here, so the controller never touches app internals
     directly. The app keeps ownership of the things it must (the agent task
-    handle, the loading widget, the remote/feedback managers).
+    handle, the loading widget, and feedback manager).
     """
 
     mount_and_scroll: Callable[..., Awaitable[None]]
@@ -123,8 +124,6 @@ class QueuePorts:
     agent_running: Callable[[], bool]
     bash_task: Callable[[], asyncio.Task | None]
     active_model: Callable[[], ModelConfig | None]
-    remote_is_active: Callable[[], bool]
-    remote_stop_stream: Callable[[], Awaitable[None]]
     remove_loading_widget: Callable[[], Awaitable[None]]
     set_loading_queue_count: Callable[[int], None]
     inject_user_context: Callable[..., Awaitable[None]]
@@ -132,7 +131,6 @@ class QueuePorts:
     start_agent_turn: Callable[..., asyncio.Task]
     await_agent_turn: Callable[[], Awaitable[None]]
     run_bash: Callable[..., asyncio.Task]
-    handle_user_message: Callable[[str], Awaitable[None]]
     maybe_show_feedback_bar: Callable[[], None]
     send_skill_telemetry: Callable[[str | None], None]
     send_at_mention_telemetry: Callable[[PathPromptPayload, str], None]
@@ -159,6 +157,7 @@ class QueueController:
         self._widgets: list[Widget] = []
         self._header: QueueHeaderMessage | None = None
         self._drain_task: asyncio.Task | None = None
+        self._drain_enabled = True
 
     @property
     def queue(self) -> MessageQueue:
@@ -277,6 +276,8 @@ class QueueController:
     # -- drain engine -----------------------------------------------------
 
     def start_drain_if_needed(self) -> None:
+        if not self._drain_enabled:
+            return
         if self._drain_task is not None and not self._drain_task.done():
             return
         if not self._queue or self._queue.paused:
@@ -292,9 +293,18 @@ class QueueController:
     def draining(self) -> bool:
         return self._drain_task is not None and not self._drain_task.done()
 
+    async def shutdown(self) -> None:
+        self._drain_enabled = False
+        drain_task = self._drain_task
+        if drain_task is None or drain_task.done():
+            return
+        drain_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await drain_task
+
     async def _drain(self) -> None:
         try:
-            while self._queue and not self._queue.paused:
+            while self._drain_enabled and self._queue and not self._queue.paused:
                 await self._remove_header()
                 pending = await self._consume_until_bash_or_empty()
                 if not pending:
@@ -401,16 +411,9 @@ class QueueController:
             self._ports.send_at_mention_telemetry(item.payload, message_id)
 
     async def _run_tail_prompt(self, item: QueuedItem, widget: UserMessage) -> None:
-        if self._ports.remote_is_active():
-            await widget.remove()
-            await self._ports.handle_user_message(item.content)
-            self._ports.send_skill_telemetry(item.skill_name)
-            return
-
         await self._activate_prompt(item, widget)
         self._ports.maybe_show_feedback_bar()
 
-        await self._ports.remote_stop_stream()
         await self._ports.remove_loading_widget()
         self._ports.start_agent_turn(
             item.content, prebuilt_images=item.images, prebuilt_payload=item.payload
@@ -426,5 +429,8 @@ class QueueController:
         try:
             await bash_task
         except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
             return False
         return True

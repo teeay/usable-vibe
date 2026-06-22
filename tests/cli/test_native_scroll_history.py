@@ -1,11 +1,9 @@
-"""Native-scroll coverage for non-local transcript sources (Phase 6).
+"""Native-scroll coverage for resumed transcript sources.
 
-Resumed session history and remote-session events are routed through the same
-``ScrollbackCommitter`` as local turns: the recent history tail commits to native
-scrollback (with a marker for earlier messages), remote durable events commit via
-the committer, and neither path mounts durable content into the hidden
-``#messages`` tree. The interactive load-more affordance is not used in native
-mode.
+Resumed session history routes through the same ``ScrollbackCommitter`` as local
+turns: the recent history tail commits to native scrollback with a marker for
+earlier messages and never mounts durable content into the hidden ``#messages``
+tree. The interactive load-more affordance is not used in native mode.
 """
 
 from __future__ import annotations
@@ -16,14 +14,7 @@ from tests.conftest import build_test_vibe_app
 from vibe.cli.textual_ui.native_scroll.committer import ScrollbackCommitter
 from vibe.cli.textual_ui.native_scroll.history_render import render_history_blocks
 from vibe.cli.textual_ui.widgets.load_more import HistoryLoadMoreRequested
-from vibe.core.types import (
-    AssistantEvent,
-    FunctionCall,
-    LLMMessage,
-    Role,
-    ToolCall,
-    UserMessageEvent,
-)
+from vibe.core.types import FunctionCall, LLMMessage, Role, ToolCall
 
 
 def _committer() -> ScrollbackCommitter:
@@ -98,13 +89,6 @@ def test_commit_history_enqueues_tail_and_marker() -> None:
     assert "answer" in text
 
 
-def test_commit_remote_user_message_commits_prompt() -> None:
-    committer = _committer()
-    committer.commit_remote_user_message("remote prompt")
-    text = _lines(committer)
-    assert "remote prompt" in text
-
-
 # -- resume integration ----------------------------------------------------
 
 
@@ -164,31 +148,3 @@ async def test_load_more_is_noop_in_native_mode() -> None:
 
         assert app._committer.has_pending is False
         assert app._load_more.widget is None
-
-
-# -- remote integration ----------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_remote_events_commit_via_committer() -> None:
-    app = build_test_vibe_app()
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        assert app._committer is not None
-        app._committer.drain_lines()
-
-        await app.on_remote_event(
-            UserMessageEvent(content="remote user says hi", message_id="u1"),
-            loading_widget=None,
-        )
-        await app.on_remote_event(
-            AssistantEvent(content="remote assistant reply", message_id="a1"),
-            loading_widget=None,
-        )
-        await app.on_remote_finalize_streaming()
-        await pilot.pause()
-
-        text = "\n".join(app._committer.drain_lines())
-        assert "remote user says hi" in text
-        assert "remote assistant reply" in text
-        assert list(app._messages_area.children) == []

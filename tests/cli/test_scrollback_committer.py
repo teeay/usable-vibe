@@ -31,6 +31,7 @@ from vibe.core.types import (
     AssistantEvent,
     BaseEvent,
     CompactEndEvent,
+    FileImageSource,
     ImageAttachment,
     ReasoningEvent,
     ToolCallEvent,
@@ -575,7 +576,11 @@ def test_user_message_attachment_carries_file_hyperlink(tmp_path: Path) -> None:
         UserMessage(
             "look",
             images=[
-                ImageAttachment(path=image, alias="shot.png", mime_type="image/png")
+                ImageAttachment(
+                    source=FileImageSource(path=image),
+                    alias="shot.png",
+                    mime_type="image/png",
+                )
             ],
         )
     )

@@ -255,6 +255,34 @@ def test_release_removes_upstream_install_before_prepending_fork_readme() -> Non
     assert remove_index < prepend_index
 
 
+def test_rebrand_updates_all_e2e_resume_hint_regexes() -> None:
+    rebrand_script = (REPO_ROOT / "private" / "scripts" / "rebrand.sh").read_text(
+        encoding="utf-8"
+    )
+    fork_env = (REPO_ROOT / "private" / "fork.env").read_text(encoding="utf-8")
+    script_name = next(
+        line.removeprefix("SCRIPT_NAME=")
+        for line in fork_env.splitlines()
+        if line.startswith("SCRIPT_NAME=")
+    )
+    upstream_regex = 'r"Or: vibe --resume ([0-9a-f-]+)"'
+    released_regex = f'r"Or: {script_name} --resume ([0-9a-f-]+)"'
+    files_with_resume_hint: list[Path] = []
+
+    for path in (REPO_ROOT / "tests" / "e2e").rglob("*.py"):
+        content = path.read_text(encoding="utf-8")
+        if "Or:" not in content or "--resume ([0-9a-f-]+)" not in content:
+            continue
+
+        files_with_resume_hint.append(path)
+        if upstream_regex in content:
+            assert path.relative_to(REPO_ROOT).as_posix() in rebrand_script
+        else:
+            assert released_regex in content
+
+    assert files_with_resume_hint
+
+
 def test_publish_pypi_rewrites_readme_only_for_build() -> None:
     publish_script = (REPO_ROOT / "private" / "scripts" / "publish-pypi.sh").read_text(
         encoding="utf-8"
@@ -266,3 +294,79 @@ def test_publish_pypi_rewrites_readme_only_for_build() -> None:
     restore_index = publish_script.index("restore_pypi_readme", build_index)
     test_index = publish_script.index("uv run pytest -n auto")
     assert backup_index < rewrite_index < build_index < restore_index < test_index
+
+
+def test_publish_pypi_help_describes_prompted_publish_flow() -> None:
+    result = subprocess.run(
+        ["bash", "private/scripts/publish-pypi.sh", "--help"],
+        capture_output=True,
+        check=False,
+        cwd=REPO_ROOT,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "Default mode builds and tests the package" in result.stdout
+    assert "then asks" in result.stdout
+    assert "prompts for the PyPI token" in result.stdout
+
+
+def test_publish_pypi_default_flow_asks_to_publish_after_validation() -> None:
+    publish_script = (REPO_ROOT / "private" / "scripts" / "publish-pypi.sh").read_text(
+        encoding="utf-8"
+    )
+
+    test_index = publish_script.index("uv run pytest -n auto")
+    validation_index = publish_script.index("write_validation", test_index)
+    confirm_index = publish_script.index("if confirm_publish", validation_index)
+    prompt_index = publish_script.index("prompt_for_token_if_needed", confirm_index)
+    publish_index = publish_script.index("publish_artifacts", prompt_index)
+    assert test_index < validation_index < confirm_index < prompt_index < publish_index
+
+
+def test_publish_pypi_existing_artifact_flow_prompts_before_upload() -> None:
+    publish_script = (REPO_ROOT / "private" / "scripts" / "publish-pypi.sh").read_text(
+        encoding="utf-8"
+    )
+
+    branch_index = publish_script.index('if [[ "${publish}" == 1 ]]; then')
+    validation_index = publish_script.index("require_validated_artifacts", branch_index)
+    prompt_index = publish_script.index("prompt_for_token_if_needed", validation_index)
+    publish_index = publish_script.index("publish_artifacts", prompt_index)
+    default_branch_index = publish_script.index("else", branch_index)
+    assert (
+        branch_index
+        < validation_index
+        < prompt_index
+        < publish_index
+        < default_branch_index
+    )
+
+
+def test_publish_external_commits_tags_and_pushes_release() -> None:
+    publish_script = (
+        REPO_ROOT / "private" / "scripts" / "publish-external.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "--push" not in publish_script
+    assert "--message" not in publish_script
+    tag_guard_index = publish_script.index("refs/tags/${release_tag}")
+    sync_index = publish_script.index("rsync -a --delete")
+    add_index = publish_script.index('uv run git -C "${external_dir}" add -A')
+    commit_index = publish_script.index('uv run git -C "${external_dir}" commit')
+    tag_index = publish_script.index('uv run git -C "${external_dir}" tag -a')
+    push_branch_index = publish_script.index(
+        'uv run git -C "${external_dir}" push origin "${external_branch}"'
+    )
+    push_tag_index = publish_script.index(
+        'uv run git -C "${external_dir}" push origin "${release_tag}"'
+    )
+    assert (
+        tag_guard_index
+        < sync_index
+        < add_index
+        < commit_index
+        < tag_index
+        < push_branch_index
+        < push_tag_index
+    )

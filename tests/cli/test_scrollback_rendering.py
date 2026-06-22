@@ -20,6 +20,7 @@ from vibe.cli.textual_ui.scrollback_committer import ScrollbackCommitter
 from vibe.cli.textual_ui.widgets.messages import UserMessage, WhatsNewMessage
 from vibe.core.types import (
     AssistantEvent,
+    FileImageSource,
     ImageAttachment,
     ReasoningEvent,
     ToolCallEvent,
@@ -126,7 +127,11 @@ async def test_user_message_image_attachments_reach_scrollback(tmp_path: Path) -
         message = UserMessage(
             "look at this",
             images=[
-                ImageAttachment(path=image, alias="shot.png", mime_type="image/png")
+                ImageAttachment(
+                    source=FileImageSource(path=image),
+                    alias="shot.png",
+                    mime_type="image/png",
+                )
             ],
         )
         assert _committer(app).render_widget(message) is True
