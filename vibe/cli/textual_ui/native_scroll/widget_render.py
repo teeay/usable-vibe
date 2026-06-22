@@ -32,7 +32,7 @@ from vibe.cli.textual_ui.widgets.messages import (
     WarningMessage,
 )
 from vibe.core.hooks.models import HookMessageSeverity, HookType
-from vibe.core.types import ImageAttachment
+from vibe.core.types import FileImageSource, ImageAttachment, InlineImageSource
 
 
 def render_widget_block(widget: Widget) -> RenderableType | None:  # noqa: PLR0911
@@ -117,6 +117,10 @@ def _attachments_line(images: list[ImageAttachment]) -> RenderableType:
         if index:
             line.append(", ", style="dim")
         # Carry a file:// terminal hyperlink on the alias, matching the widget's
-        # clickable attachment links.
-        line.append(image.alias, style=Style(link=image.path.as_uri(), dim=True))
+        # clickable attachment links. Inline images have no durable file target.
+        match image.source:
+            case FileImageSource(path=path):
+                line.append(image.alias, style=Style(link=path.as_uri(), dim=True))
+            case InlineImageSource():
+                line.append(image.alias, style="dim")
     return line

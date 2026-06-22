@@ -203,7 +203,7 @@ def _render_edit_result(
         result.old_string,
         result.new_string,
         _language_for_path(result.file),
-        result.ui_start_line,
+        result.ui_start_lines,
         dark=dark,
         ansi=ansi,
     )
@@ -214,7 +214,7 @@ def _diff_rows(
     old_string: str,
     new_string: str,
     language: str,
-    start_line: int | None,
+    start_lines: list[int] | None,
     *,
     dark: bool,
     ansi: bool,
@@ -229,6 +229,20 @@ def _diff_rows(
         )
     )[2:]  # drop the ``--- / +++`` file headers; the gutter carries position.
 
+    if not start_lines:
+        return _diff_occurrence_rows(diff_lines, None, syntax, ansi=ansi)
+
+    rows: list[RenderableType] = []
+    for index, start_line in enumerate(start_lines):
+        if index:
+            rows.append(Text("⋯", style="dim"))  # gap between occurrences
+        rows.extend(_diff_occurrence_rows(diff_lines, start_line, syntax, ansi=ansi))
+    return rows
+
+
+def _diff_occurrence_rows(
+    diff_lines: list[str], start_line: int | None, syntax: Syntax, *, ansi: bool
+) -> list[RenderableType]:
     offset = (start_line - 1) if start_line else 0
     old_lineno = new_lineno = 0  # overwritten by the first @@ header
     rows: list[RenderableType] = []

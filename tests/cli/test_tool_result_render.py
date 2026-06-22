@@ -28,7 +28,7 @@ def _plain(renderable: RenderableType | None, width: int = 80) -> str:
 def _edit_result(old: str, new: str, *, start_line: int | None = None) -> EditResult:
     result = EditResult(file="a.py", message="Edited", old_string=old, new_string=new)
     if start_line is not None:
-        result._ui_start_line = start_line
+        result._ui_start_lines = [start_line]
     return result
 
 
@@ -100,6 +100,17 @@ def test_edit_diff_marks_hunk_gap_between_separate_changes() -> None:
     text = _plain(
         render_result_body("edit", _edit_result(old, new), dark=True, ansi=False)
     )
+    assert "⋯" in text
+
+
+def test_edit_diff_repeats_replace_all_occurrences() -> None:
+    result = EditResult(file="a.py", message="Edited", old_string="x", new_string="y")
+    result._ui_start_lines = [3, 9]
+    text = _plain(render_result_body("edit", result, dark=True, ansi=False))
+    assert "3 - x" in text
+    assert "3 + y" in text
+    assert "9 - x" in text
+    assert "9 + y" in text
     assert "⋯" in text
 
 

@@ -11,10 +11,12 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sys
 import time
 from typing import Any, ClassVar, assert_never, cast
 from uuid import uuid4
 from weakref import WeakKeyDictionary
+import webbrowser
 
 from pydantic import BaseModel
 from rich import print as rprint
@@ -34,7 +36,7 @@ from textual.widgets import Static
 
 from vibe import __version__ as CORE_VERSION
 from vibe.cli.clipboard import copy_selection_to_clipboard, copy_text_to_clipboard
-from vibe.cli.commands import CommandAvailabilityContext, CommandRegistry
+from vibe.cli.commands import CommandRegistry
 from vibe.cli.narrator_manager import (
     NarratorManager,
     NarratorManagerPort,
@@ -43,6 +45,7 @@ from vibe.cli.narrator_manager import (
 from vibe.cli.plan_offer.adapters.http_whoami_gateway import HttpWhoAmIGateway
 from vibe.cli.plan_offer.decide_plan_offer import (
     PlanInfo,
+    check_teleport_eligibility,
     decide_plan_offer,
     plan_offer_cta,
     plan_title,
@@ -63,7 +66,6 @@ from vibe.cli.textual_ui.notifications import (
     TextualNotificationAdapter,
 )
 from vibe.cli.textual_ui.quit_manager import QuitManager
-from vibe.cli.textual_ui.remote import RemoteSessionManager, is_progress_event
 from vibe.cli.textual_ui.scheduled_loop_runner import ScheduledLoopRunner
 from vibe.cli.textual_ui.session_exit import print_session_resume_message
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
@@ -162,6 +164,7 @@ from vibe.core.agent_loop import AgentLoop, TeleportError
 from vibe.core.agents import AgentProfile
 from vibe.core.audio_player.audio_player import AudioPlayer
 from vibe.core.audio_recorder import AudioRecorder
+from vibe.core.auth import MCPOAuthError
 from vibe.core.autocompletion.path_prompt import (
     PathPromptPayload,
     PathResource,
@@ -181,10 +184,7 @@ from vibe.core.paths import HISTORY_FILE
 from vibe.core.rewind import RewindError
 from vibe.core.session.image_snapshot import ImageSnapshotError, snapshot_image
 from vibe.core.session.resume_sessions import (
-    RemoteResumeResult,
-    RemoteResumeSessions,
     ResumeSessionInfo,
-    can_delete_resume_session_source,
     list_local_resume_sessions,
     session_latest_messages,
     short_session_id,
@@ -196,6 +196,7 @@ from vibe.core.session.saved_sessions import (
 from vibe.core.session.session_loader import SessionLoader
 from vibe.core.session.title_format import format_session_title
 from vibe.core.skills.manager import SkillManager
+from vibe.core.telemetry.types import TeleportFailureStage
 from vibe.core.teleport.telemetry import send_teleport_early_failure_telemetry
 from vibe.core.teleport.types import (
     TeleportCheckingGitEvent,
@@ -212,6 +213,7 @@ from vibe.core.tools.builtins.ask_user_question import (
     Question,
 )
 from vibe.core.tools.connectors import compute_connector_counts
+from vibe.core.tools.mcp import AuthStatus
 from vibe.core.tools.mcp_settings import persist_mcp_toggle
 from vibe.core.tools.permissions import RequiredPermission
 from vibe.core.tools.ui import ToolUIDataAdapter
@@ -222,6 +224,7 @@ from vibe.core.types import (
     AgentProfileChangedEvent,
     AgentStats,
     ApprovalResponse,
+    AssistantEvent,
     BaseEvent,
     ContextTooLongError,
     ImageAttachment,
@@ -229,10 +232,11 @@ from vibe.core.types import (
     PlanReviewEndedEvent,
     PlanReviewRequestedEvent,
     RateLimitError,
+    ReasoningEvent,
     RefusalError,
     Role,
     ToolCallEvent,
-    UserMessageEvent,
+    ToolStreamEvent,
     WaitingForInputEvent,
 )
 from vibe.core.utils import (
@@ -243,6 +247,12 @@ from vibe.core.utils import (
 )
 
 _VSCODE_FAMILY_TERMINALS = {Terminal.VSCODE, Terminal.VSCODE_INSIDERS, Terminal.CURSOR}
+
+
+def is_progress_event(event: object) -> bool:
+    return isinstance(
+        event, (AssistantEvent, ReasoningEvent, ToolCallEvent, ToolStreamEvent)
+    )
 
 
 def _is_vscode_family_terminal() -> bool:
@@ -420,7 +430,7 @@ class VibeApp(App):  # noqa: PLR0904
         patch_driver_parser(driver_class)
         return driver_class
 
-    def __init__(  # noqa: PLR0915
+    def __init__(
         self,
         agent_loop: AgentLoop,
         startup: StartupOptions | None = None,
@@ -450,9 +460,6 @@ class VibeApp(App):  # noqa: PLR0904
         self._agent_task: asyncio.Task | None = None
         self._bash_task: asyncio.Task | None = None
         self._queue = QueueController(self._build_queue_ports())
-        self._remote_manager = RemoteSessionManager()
-        self._remote_resume = RemoteResumeSessions(lambda: self.config)
-        self._resume_merge_task: asyncio.Task[None] | None = None
 
         self._loading_widget: LoadingWidget | None = None
         self._pending_approval: asyncio.Future | None = None
@@ -551,8 +558,6 @@ class VibeApp(App):  # noqa: PLR0904
             agent_running=lambda: self._agent_running,
             bash_task=lambda: self._bash_task,
             active_model=self._active_model_or_none,
-            remote_is_active=lambda: self._remote_manager.is_active,
-            remote_stop_stream=lambda: self._remote_manager.stop_stream(),
             remove_loading_widget=self._remove_loading_widget,
             set_loading_queue_count=self._set_loading_queue_count,
             inject_user_context=self.agent_loop.inject_user_context,
@@ -560,7 +565,6 @@ class VibeApp(App):  # noqa: PLR0904
             start_agent_turn=self._start_queued_agent_turn,
             await_agent_turn=self._await_agent_turn,
             run_bash=self._start_queued_bash,
-            handle_user_message=self._handle_user_message,
             maybe_show_feedback_bar=self._maybe_show_feedback_bar,
             send_skill_telemetry=self._send_skill_telemetry,
             send_at_mention_telemetry=self._send_at_mention_telemetry,
@@ -591,7 +595,7 @@ class VibeApp(App):  # noqa: PLR0904
     def _maybe_show_feedback_bar(self) -> None:
         if self._feedback_bar_manager.should_show(self.agent_loop):
             self._feedback_bar.show()
-            self._feedback_bar_manager.record_feedback_asked()
+            self._feedback_bar_manager.record_feedback_asked(self.agent_loop)
 
     def _start_queued_agent_turn(
         self,
@@ -629,20 +633,13 @@ class VibeApp(App):  # noqa: PLR0904
     def _connectors_enabled(self) -> bool:
         return self.agent_loop.connector_registry is not None
 
-    def _get_command_availability_context(self) -> CommandAvailabilityContext:
-        return CommandAvailabilityContext(
-            vibe_code_enabled=self.agent_loop.base_config.vibe_code_enabled,
-            is_active_model_mistral=self.config.is_active_model_mistral(),
-            plan_info=self._plan_info,
-        )
-
     def _build_command_registry(self) -> CommandRegistry:
         return CommandRegistry(
-            availability_context=self._get_command_availability_context()
+            vibe_code_enabled=self.agent_loop.base_config.vibe_code_enabled
         )
 
     def _refresh_command_registry(self) -> None:
-        self.commands.refresh(self._get_command_availability_context())
+        self.commands.refresh(self.agent_loop.base_config.vibe_code_enabled)
 
     def compose(self) -> ComposeResult:
         with ChatScroll(id="chat"):
@@ -769,7 +766,6 @@ class VibeApp(App):  # noqa: PLR0904
             mount_callback=self._mount_and_scroll,
             get_tools_collapsed=lambda: self._tools_collapsed,
             on_profile_changed=self._on_profile_changed,
-            is_remote=self._remote_manager.is_active,
         )
 
         self._chat_input_container = self.query_one(ChatInputContainer)
@@ -835,6 +831,7 @@ class VibeApp(App):  # noqa: PLR0904
                 await self._ensure_loading_widget("Initializing", show_hint=False)
                 init_widget = self._loading_widget
             await self.agent_loop.wait_until_ready()
+            await self._show_mcp_auth_required_notice()
         except Exception as e:
             await self._mount_and_scroll(
                 ErrorMessage(
@@ -857,6 +854,29 @@ class VibeApp(App):  # noqa: PLR0904
                 self.query_one(MCPApp).refresh_index()
             except Exception:
                 pass
+
+    async def _show_mcp_auth_required_notice(self) -> None:
+        statuses = self.agent_loop.mcp_registry.status()
+        aliases = sorted(
+            alias
+            for alias, status in statuses.items()
+            if status is AuthStatus.NEEDS_AUTH
+        )
+        if not aliases:
+            return
+        command = f"/mcp login {aliases[0]}"
+        if len(aliases) > 1:
+            detail = ", ".join(aliases)
+            message = (
+                "MCP servers need OAuth authentication: "
+                f"{detail}. Run `{command}` to start with {aliases[0]!r}."
+            )
+        else:
+            message = (
+                f"MCP server {aliases[0]!r} needs OAuth authentication. "
+                f"Run `{command}` to authenticate."
+            )
+        await self._mount_and_scroll(UserCommandMessage(message))
 
     def _process_initial_prompt(self) -> None:
         if self._teleport_on_start and self.commands.has_command("teleport"):
@@ -1044,21 +1064,11 @@ class VibeApp(App):  # noqa: PLR0904
             await self._remove_loading_widget()
 
     async def on_question_app_answered(self, message: QuestionApp.Answered) -> None:
-        if self._remote_manager.has_pending_input and self._remote_manager.is_active:
-            result = AskUserQuestionResult(answers=message.answers, cancelled=False)
-            await self._handle_remote_answer(result)
-            return
-
         if self._pending_question and not self._pending_question.done():
             result = AskUserQuestionResult(answers=message.answers, cancelled=False)
             self._pending_question.set_result(result)
 
     async def on_question_app_cancelled(self, message: QuestionApp.Cancelled) -> None:
-        if self._remote_manager.has_pending_input:
-            self._remote_manager.cancel_pending_input()
-            await self._switch_to_input_app()
-            return
-
         if self._pending_question and not self._pending_question.done():
             result = AskUserQuestionResult(answers=[], cancelled=True)
             self._pending_question.set_result(result)
@@ -1702,10 +1712,6 @@ class VibeApp(App):  # noqa: PLR0904
     async def _handle_user_message(
         self, message: str, *, title_source: str | None = None
     ) -> None:
-        if self._remote_manager.is_active:
-            await self._handle_remote_user_message(message)
-            return
-
         prompt_payload = build_path_prompt_payload(message, base_dir=Path.cwd())
         images = await self._prepare_images_or_abort(prompt_payload)
         if images is None:
@@ -1730,10 +1736,9 @@ class VibeApp(App):  # noqa: PLR0904
         await self._mount_and_scroll(user_message)
         if self._feedback_bar_manager.should_show(self.agent_loop):
             self._feedback_bar.show()
-            self._feedback_bar_manager.record_feedback_asked()
+            self._feedback_bar_manager.record_feedback_asked(self.agent_loop)
 
         if not self._agent_running:
-            await self._remote_manager.stop_stream()
             await self._remove_loading_widget()
             self._agent_task = asyncio.create_task(
                 self._handle_agent_loop_turn(
@@ -1744,40 +1749,6 @@ class VibeApp(App):  # noqa: PLR0904
                 )
             )
             self._queue.notify_busy_changed()
-
-    async def _handle_remote_user_message(self, message: str) -> None:
-        warning = self._remote_manager.validate_input()
-        if warning:
-            await self._mount_and_scroll(WarningMessage(warning))
-            return
-        try:
-            await self._remote_manager.send_prompt(message)
-        except Exception as e:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Failed to send message: {e}", collapsed=self._tools_collapsed
-                )
-            )
-            return
-        await self._ensure_loading_widget()
-
-    async def _handle_remote_waiting_input(self, event: WaitingForInputEvent) -> None:
-        self._remote_manager.set_pending_input(event)
-        if question_args := self._remote_manager.build_question_args(event):
-            await self._switch_to_question_app(question_args)
-            return
-        await self._switch_to_input_app()
-
-    async def _handle_remote_answer(self, result: AskUserQuestionResult) -> None:
-        if result.cancelled or not result.answers:
-            self._remote_manager.cancel_pending_input()
-            await self._switch_to_input_app()
-            return
-        await self._remote_manager.send_prompt(
-            result.answers[0].answer, require_source=False
-        )
-        await self._switch_to_input_app()
-        await self._ensure_loading_widget()
 
     def _reset_ui_state(self) -> None:
         self._windowing.reset()
@@ -1947,8 +1918,6 @@ class VibeApp(App):  # noqa: PLR0904
             self._narrator_manager.on_turn_event(event)
             if isinstance(event, WaitingForInputEvent):
                 await self._remove_loading_widget()
-                if self._remote_manager.is_active:
-                    await self._handle_remote_waiting_input(event)
             elif isinstance(event, HookStartEvent):
                 await self._ensure_loading_widget(f"Running hook {event.hook_name}")
             elif self._loading_widget is None and is_progress_event(event):
@@ -2135,29 +2104,54 @@ class VibeApp(App):  # noqa: PLR0904
     async def _teleport_command(self, **kwargs: Any) -> None:
         await self._handle_teleport_command(show_message=False)
 
+    def _teleport_unavailable_reason(self) -> str | None:
+        if not self.config.is_active_model_mistral():
+            return (
+                "Teleport requires an active Mistral model. Use /model to switch to "
+                "a Mistral model, then try again."
+            )
+        return check_teleport_eligibility(
+            self._plan_info, vibe_base_url=self.config.vibe_base_url
+        )
+
+    async def _fail_teleport_early(
+        self, *, stage: TeleportFailureStage, error_class: str, message: str
+    ) -> None:
+        send_teleport_early_failure_telemetry(
+            self.agent_loop.telemetry_client,
+            stage=stage,
+            error_class=error_class,
+            nb_session_messages=len(self.agent_loop.messages[1:]),
+        )
+        await self._mount_and_scroll(
+            ErrorMessage(message, collapsed=self._tools_collapsed)
+        )
+
     async def _handle_teleport_command(
         self, value: str | None = None, show_message: bool = True
     ) -> None:
         has_history = any(msg.role != Role.system for msg in self.agent_loop.messages)
-        if not value:
-            if show_message:
-                await self._mount_and_scroll(SlashCommandMessage("teleport"))
-            if not has_history:
-                send_teleport_early_failure_telemetry(
-                    self.agent_loop.telemetry_client,
-                    stage="no_history",
-                    error_class="TeleportNoHistoryError",
-                    nb_session_messages=len(self.agent_loop.messages[1:]),
-                )
-                await self._mount_and_scroll(
-                    ErrorMessage(
-                        "No conversation history to teleport.",
-                        collapsed=self._tools_collapsed,
-                    )
-                )
-                return
-        elif show_message:
-            await self._mount_and_scroll(TeleportUserMessage(value))
+        if show_message:
+            await self._mount_and_scroll(
+                TeleportUserMessage(value) if value else SlashCommandMessage("teleport")
+            )
+
+        if reason := self._teleport_unavailable_reason():
+            await self._fail_teleport_early(
+                stage="ineligible",
+                error_class="TeleportIneligibleError",
+                message=reason,
+            )
+            return
+
+        if not value and not has_history:
+            await self._fail_teleport_early(
+                stage="no_history",
+                error_class="TeleportNoHistoryError",
+                message="No conversation history to teleport.",
+            )
+            return
+
         self.run_worker(self._teleport(value), exclusive=False)
 
     async def _teleport(self, prompt: str | None = None) -> None:
@@ -2168,23 +2162,6 @@ class VibeApp(App):  # noqa: PLR0904
         # outcome is committed separately on completion/error (#4).
         teleport_msg = TeleportMessage()
         await self._live_surface.mount(teleport_msg)
-
-        if self._remote_manager.is_active:
-            send_teleport_early_failure_telemetry(
-                self.agent_loop.telemetry_client,
-                stage="remote_session",
-                error_class="TeleportRemoteSessionError",
-                nb_session_messages=len(self.agent_loop.messages[1:]),
-            )
-            await loading.remove()
-            await teleport_msg.remove()
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "Teleport is not available for remote sessions.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
 
         completed_url: str | None = None
         try:
@@ -2328,7 +2305,92 @@ class VibeApp(App):  # noqa: PLR0904
         self._refresh_banner()
         return "Refreshed."
 
+    async def _maybe_handle_mcp_subcommand(self, cmd_args: str) -> bool:
+        parts = cmd_args.strip().split(None, 1)
+        if not parts or parts[0] not in {"login", "logout", "status"}:
+            return False
+
+        subcommand = parts[0]
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        match subcommand:
+            case "status":
+                if arg:
+                    await self._mount_and_scroll(
+                        ErrorMessage("Usage: /mcp status", collapsed=True)
+                    )
+                    return True
+                await self._show_mcp_status()
+            case "login":
+                await self._mcp_login(arg)
+            case "logout":
+                await self._mcp_logout(arg)
+        return True
+
+    async def _show_mcp_status(self) -> None:
+        await self.agent_loop.wait_until_ready()
+        statuses = self.agent_loop.mcp_registry.status()
+        if not statuses:
+            await self._mount_and_scroll(
+                UserCommandMessage("No MCP servers configured.")
+            )
+            return
+        lines = ["### MCP auth status", ""]
+        for alias, status in sorted(statuses.items()):
+            lines.append(f"- `{alias}`: `{status.value}`")
+        await self._mount_and_scroll(UserCommandMessage("\n".join(lines)))
+
+    async def _mcp_login(self, alias: str) -> None:
+        if not alias:
+            await self._mount_and_scroll(
+                ErrorMessage("Usage: /mcp login <alias>", collapsed=True)
+            )
+            return
+
+        await self.agent_loop.wait_until_ready()
+
+        async def on_url(url: str) -> None:
+            await self._mount_and_scroll(
+                UserCommandMessage(f"Open this URL in your browser:\n\n  {url}")
+            )
+            try:
+                webbrowser.open(url)
+            except Exception as exc:
+                logger.debug("Failed to open MCP OAuth URL in browser: %s", exc)
+
+        try:
+            await self.agent_loop.mcp_registry.login(alias, on_url=on_url)
+            await self._refresh_mcp_browser()
+        except (MCPOAuthError, ValueError) as exc:
+            await self._mount_and_scroll(ErrorMessage(str(exc), collapsed=True))
+            return
+
+        await self._mount_and_scroll(
+            UserCommandMessage(f"MCP server `{alias}` authenticated.")
+        )
+
+    async def _mcp_logout(self, alias: str) -> None:
+        if not alias:
+            await self._mount_and_scroll(
+                ErrorMessage("Usage: /mcp logout <alias>", collapsed=True)
+            )
+            return
+
+        await self.agent_loop.wait_until_ready()
+        try:
+            await self.agent_loop.mcp_registry.logout(alias)
+            await self._refresh_mcp_browser()
+        except (MCPOAuthError, ValueError) as exc:
+            await self._mount_and_scroll(ErrorMessage(str(exc), collapsed=True))
+            return
+
+        await self._mount_and_scroll(
+            UserCommandMessage(f"MCP server `{alias}` logged out.")
+        )
+
     async def _show_mcp(self, cmd_args: str = "", **kwargs: Any) -> None:
+        if await self._maybe_handle_mcp_subcommand(cmd_args):
+            return
+
         mcp_servers = self.config.mcp_servers
         connector_registry = (
             self.agent_loop.connector_registry if self._connectors_enabled else None
@@ -2435,15 +2497,6 @@ class VibeApp(App):  # noqa: PLR0904
         return renamed_title
 
     async def _rename_session(self, cmd_args: str = "", **kwargs: Any) -> None:
-        if self._remote_manager.is_active:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "Renaming is only supported for local sessions.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-
         title = cmd_args.strip()
         if not title:
             await self._mount_and_scroll(
@@ -2474,96 +2527,26 @@ class VibeApp(App):  # noqa: PLR0904
             cwd=str(Path.cwd()),
         )
 
-    async def _merge_remote_into_picker(
-        self, picker: SessionPickerApp, remote_task: asyncio.Task[RemoteResumeResult]
-    ) -> None:
-        remote_sessions, remote_error = await remote_task
-        if not picker.is_mounted:
-            return
-        if remote_error is not None:
-            await self._mount_and_scroll(
-                ErrorMessage(remote_error, collapsed=self._tools_collapsed)
-            )
-        if remote_sessions:
-            picker.add_sessions(
-                remote_sessions, session_latest_messages(remote_sessions, self.config)
-            )
-
-    async def _cancel_resume_merge(self) -> None:
-        """Cancel the task that fetch and merges remote sessions into the picker, if it exists."""
-        if self._resume_merge_task is not None and not self._resume_merge_task.done():
-            self._resume_merge_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._resume_merge_task
-        self._resume_merge_task = None
-
-    async def _close_remote_resume(self) -> None:
-        """Close the remote resume connection and cancel any ongoing merge task.
-        Used to gracefully close the connection when the app is exiting
-        """
-        await self._cancel_resume_merge()
-        await self._remote_resume.aclose()
-
     async def _show_session_picker(self, **kwargs: Any) -> None:
-        await self._cancel_resume_merge()
-        remote_list_timeout = max(float(self.config.api_timeout), 10.0)
-        remote_task = self._remote_resume.start(remote_list_timeout)
-
-        # If there are no local sessions, show the remote picker directly
         if not self.config.session_logging.enabled or not (
             local_sessions := list_local_resume_sessions(self.config, str(Path.cwd()))
         ):
-            await self._show_session_picker_remote_only(remote_task)
-            return
-
-        picker = self._build_picker(local_sessions)
-        await self._switch_from_input(picker)
-        self._resume_merge_task = asyncio.create_task(
-            self._merge_remote_into_picker(picker, remote_task)
-        )
-
-    async def _show_session_picker_remote_only(
-        self, remote_task: asyncio.Task[RemoteResumeResult]
-    ) -> None:
-        await self._ensure_loading_widget("Loading sessions")
-        try:
-            remote_sessions, remote_error = await remote_task
-        except asyncio.CancelledError:
-            return
-        finally:
-            await self._remove_loading_widget()
-
-        if remote_error is not None:
-            await self._mount_and_scroll(
-                ErrorMessage(remote_error, collapsed=self._tools_collapsed)
-            )
-
-        if not remote_sessions:
             await self._mount_and_scroll(
                 UserCommandMessage("No sessions found for this directory.")
             )
             return
 
-        await self._switch_from_input(self._build_picker(remote_sessions))
+        await self._switch_from_input(self._build_picker(local_sessions))
 
     async def on_session_picker_app_session_selected(
         self, event: SessionPickerApp.SessionSelected
     ) -> None:
         await self._switch_to_input_app()
         session = ResumeSessionInfo(
-            session_id=event.session_id,
-            source=event.source,
-            cwd="",
-            title=None,
-            end_time=None,
+            session_id=event.session_id, cwd="", title=None, end_time=None
         )
         try:
-            if event.source == "local":
-                await self._resume_local_session(session)
-            elif event.source == "remote":
-                await self._resume_remote_session(session)
-            else:
-                raise ValueError(f"Unknown session source: {event.source}")
+            await self._resume_local_session(session)
         except Exception as e:
             await self._mount_and_scroll(
                 ErrorMessage(
@@ -2574,17 +2557,7 @@ class VibeApp(App):  # noqa: PLR0904
     async def on_session_picker_app_session_delete_requested(
         self, event: SessionPickerApp.SessionDeleteRequested
     ) -> None:
-        if not can_delete_resume_session_source(event.source):
-            self._clear_pending_session_delete(event.option_id)
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "Deleting remote sessions is not supported.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-
-        if event.source == "local" and event.session_id == self.agent_loop.session_id:
+        if event.session_id == self.agent_loop.session_id:
             self._clear_pending_session_delete(event.option_id)
             await self._mount_and_scroll(
                 ErrorMessage(
@@ -2639,7 +2612,6 @@ class VibeApp(App):  # noqa: PLR0904
         await self._mount_and_scroll(UserCommandMessage("Resume cancelled."))
 
     async def _resume_local_session(self, session: ResumeSessionInfo) -> None:
-        await self._remote_manager.detach()
         session_config = self.config.session_logging
         session_path = SessionLoader.find_session_by_id(
             session.session_id, session_config
@@ -2677,8 +2649,6 @@ class VibeApp(App):  # noqa: PLR0904
 
         await self._messages_area.remove_children()
 
-        if self.event_handler:
-            self.event_handler.is_remote = False
         await self._resume_history_from_messages()
         self._loop_runner.restore_from_session()
         await self._mount_and_scroll(
@@ -2686,85 +2656,6 @@ class VibeApp(App):  # noqa: PLR0904
                 f"Resumed session `{short_session_id(session.session_id)}`"
             )
         )
-
-    async def _resume_remote_session(self, session: ResumeSessionInfo) -> None:
-        self.agent_loop.telemetry_client.send_remote_resume_requested(
-            session_id=session.session_id
-        )
-        await self._remote_manager.attach(
-            session_id=session.session_id, config=self.config
-        )
-        self._emit_session_closed_for_active_session()
-        self.agent_loop.session_id = session.session_id
-        self._refresh_profile_widgets()
-        if self._chat_input_container:
-            self._chat_input_container.set_custom_border(None)
-
-        self._reset_ui_state()
-        await self._load_more.hide()
-
-        await self._messages_area.remove_children()
-
-        if self.event_handler:
-            self.event_handler.is_remote = True
-        self._remote_manager.start_stream(self)
-
-    async def on_remote_event(self, event: BaseEvent, loading_widget: Any) -> None:
-        if self._committer is not None:
-            # Native mode: route remote durable events through the same committer
-            # used for local turns; the legacy hidden EventHandler tree is
-            # bypassed. Live-only side effects (loading status, plan live owner)
-            # still apply.
-            self._apply_native_live_effects(event)
-            await self._apply_native_plan_effects(event)
-            if isinstance(event, UserMessageEvent):
-                self._committer.commit_remote_user_message(event.content)
-            else:
-                self._committer.handle_event(event)
-            return
-        if self.event_handler:
-            await self.event_handler.handle_event(event, loading_widget=loading_widget)
-
-    async def on_remote_waiting_input(self, event: WaitingForInputEvent) -> None:
-        await self._handle_remote_waiting_input(event)
-
-    async def on_remote_user_message_cleared_input(self) -> None:
-        await self._switch_to_input_app()
-
-    async def on_remote_stream_error(self, error: str) -> None:
-        await self._mount_and_scroll(
-            ErrorMessage(error, collapsed=self._tools_collapsed)
-        )
-
-    async def on_remote_stream_ended(self, msg_type: str, text: str) -> None:
-        if msg_type == "error":
-            widget = ErrorMessage(text, collapsed=self._tools_collapsed)
-        elif msg_type == "warning":
-            widget = WarningMessage(text)
-        else:
-            widget = UserCommandMessage(text)
-        await self._mount_and_scroll(widget)
-        if self._chat_input_container:
-            self._chat_input_container.set_custom_border("Remote session ended")
-
-    async def on_remote_finalize_streaming(self) -> None:
-        if self._committer is not None:
-            # Flush trailing buffered remote assistant/reasoning content, mirroring
-            # the local turn-end flush in _handle_agent_loop_events.
-            self._committer.flush()
-            return
-        if self.event_handler:
-            await self.event_handler.finalize_streaming()
-
-    async def remove_loading(self) -> None:
-        await self._remove_loading_widget()
-
-    async def ensure_loading(self, status: str = DEFAULT_LOADING_STATUS) -> None:
-        await self._ensure_loading_widget(status)
-
-    @property
-    def loading_widget(self) -> LoadingWidget | None:
-        return self._loading_widget
 
     async def _reload_config(
         self, *, notice: str = _CONFIG_RELOADED_NOTICE, **kwargs: Any
@@ -2842,11 +2733,6 @@ class VibeApp(App):  # noqa: PLR0904
     async def _clear_history(self, **kwargs: Any) -> None:
         try:
             self._reset_ui_state()
-            if self._remote_manager.is_active:
-                await self._remote_manager.detach()
-                self._refresh_profile_widgets()
-                if self.event_handler:
-                    self.event_handler.is_remote = False
             if self._chat_input_container:
                 self._chat_input_container.set_custom_border(None)
             await self.agent_loop.clear_history()
@@ -2964,8 +2850,6 @@ class VibeApp(App):  # noqa: PLR0904
             await compact_msg.remove()
 
     def _get_session_resume_info(self) -> str | None:
-        if self._remote_manager.is_active:
-            return None
         if not self.agent_loop.session_logger.enabled:
             return None
         if not self.agent_loop.session_logger.session_id:
@@ -2979,17 +2863,14 @@ class VibeApp(App):  # noqa: PLR0904
         return short_session_id(self.agent_loop.session_logger.session_id)
 
     async def _exit_app(self, **kwargs: Any) -> None:
-        self._emit_session_closed_for_active_session()
-        await self._loop_runner.stop()
-        self._log_reader.shutdown()
-        await self._voice_manager.close()
-        await self._narrator_manager.close()
-        await self._close_remote_resume()
-        await self.agent_loop.aclose()
         try:
-            await self.agent_loop.telemetry_client.aclose()
-        except Exception as exc:
-            logger.error("Failed to close telemetry client during exit", exc_info=exc)
+            self._emit_session_closed_for_active_session()
+            await self._begin_shutdown()
+            if self._agent_task and not self._agent_task.done():
+                self._agent_task.cancel()
+            if self._bash_task and not self._bash_task.done():
+                self._bash_task.cancel()
+            self._log_reader.shutdown()
         finally:
             self.exit(result=self._get_session_resume_info())
 
@@ -3583,14 +3464,7 @@ class VibeApp(App):  # noqa: PLR0904
         if self._chat_input_container:
             self._chat_input_container.set_safety(profile.safety)
             self._chat_input_container.set_agent_name(profile.display_name.lower())
-            if self._remote_manager.is_active:
-                session_id = self._remote_manager.session_id
-                self._chat_input_container.set_custom_border(
-                    f"Remote session {short_session_id(session_id, source='remote') if session_id else ''}",
-                    ChatInputContainer.REMOTE_BORDER_CLASS,
-                )
-            else:
-                self._chat_input_container.set_custom_border(None)
+            self._chat_input_container.set_custom_border(None)
 
     async def _cycle_agent(self) -> None:
         new_profile = self.agent_loop.agent_manager.next_agent(
@@ -3680,31 +3554,52 @@ class VibeApp(App):  # noqa: PLR0904
     def _emit_session_closed_for_active_session(self) -> None:
         self.agent_loop.emit_session_closed_telemetry()
 
+    async def _begin_shutdown(self) -> None:
+        await self._queue.shutdown()
+        await self._loop_runner.stop()
+
     def _force_quit(self) -> None:
         if self._force_quit_task is not None and not self._force_quit_task.done():
             return
         self._force_quit_task = asyncio.create_task(self._force_quit_async())
 
     async def _force_quit_async(self) -> None:
-        self._emit_session_closed_for_active_session()
-        if self._agent_task and not self._agent_task.done():
-            self._agent_task.cancel()
-        if self._bash_task and not self._bash_task.done():
-            self._bash_task.cancel()
-        self._remote_manager.cancel_stream_task()
+        try:
+            self._emit_session_closed_for_active_session()
+            await self._begin_shutdown()
+            if self._agent_task and not self._agent_task.done():
+                self._agent_task.cancel()
+            if self._bash_task and not self._bash_task.done():
+                self._bash_task.cancel()
+            self._log_reader.shutdown()
+            self._narrator_manager.cancel()
+        finally:
+            self.exit(result=self._get_session_resume_info())
 
-        self._log_reader.shutdown()
-        self._narrator_manager.cancel()
-        await self._close_remote_resume()
-        await self.agent_loop.aclose()
+    async def shutdown_cleanup(self) -> None:
+        with suppress(Exception):
+            await self._begin_shutdown()
+        for task in (self._agent_task, self._bash_task):
+            if task is None or task.done():
+                continue
+            task.cancel()
+        for task in (self._agent_task, self._bash_task):
+            if task is None or task.done():
+                continue
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        with suppress(Exception):
+            await self._voice_manager.close()
+        with suppress(Exception):
+            await self._narrator_manager.close()
+        with suppress(Exception):
+            await self.agent_loop.aclose()
         try:
             await self.agent_loop.telemetry_client.aclose()
         except Exception as exc:
             logger.error(
-                "Failed to close telemetry client during force quit", exc_info=exc
+                "Failed to close telemetry client during shutdown", exc_info=exc
             )
-        finally:
-            self.exit(result=self._get_session_resume_info())
 
     def action_scroll_chat_up(self) -> None:
         try:
@@ -3826,7 +3721,7 @@ class VibeApp(App):  # noqa: PLR0904
             # The committer refused it, so this widget mounts into the hidden
             # #chat tree and is invisible in native mode. That is only correct
             # for surfaces explicitly classified live-only/excluded in the UI map
-            # (resume/history and remote replay are Phase 6). Anything else is an
+            # (resume/history is handled separately). Anything else is an
             # unhandled durable surface: log it so the gap fails visibly instead
             # of disappearing silently.
             logger.warning(
@@ -3933,8 +3828,7 @@ class VibeApp(App):  # noqa: PLR0904
             self._chat_input_container.input_widget.set_app_focus(True)
 
     def action_open_plan_in_editor(self) -> None:
-        # Native mode owns plan review locally; the remote path (Phase 6) still
-        # tracks the plan file on the EventHandler.
+        # Native mode owns plan review locally.
         if self._native_plan_message is not None:
             self._native_plan_message.open_in_editor()
             return
@@ -4034,13 +3928,27 @@ class VibeApp(App):  # noqa: PLR0904
         )
 
 
+async def _run_app_with_cleanup(app: VibeApp) -> str | None:
+    from vibe.cli.stderr_guard import stderr_guard
+
+    try:
+        with stderr_guard():
+            return await app.run_async(inline=True, inline_no_clear=True)
+    finally:
+        sys.stderr.write("Closing\u2026\r")
+        sys.stderr.flush()
+        try:
+            await app.shutdown_cleanup()
+        finally:
+            sys.stderr.write("\033[2K\r")
+            sys.stderr.flush()
+
+
 def run_textual_ui(
     agent_loop: AgentLoop,
     update_cache_repository: UpdateCacheRepository,
     startup: StartupOptions | None = None,
 ) -> None:
-    from vibe.cli.stderr_guard import stderr_guard
-
     update_notifier = PyPIUpdateGateway(project_name="uvibe")
     plan_offer_gateway = HttpWhoAmIGateway(base_url=agent_loop.config.console_base_url)
     vscode_extension_promo_repository = FileSystemVscodeExtensionPromoRepository()
@@ -4049,16 +3957,15 @@ def run_textual_ui(
         initial_state=asyncio.run(vscode_extension_promo_repository.get()),
     )
 
-    with stderr_guard():
-        app = VibeApp(
-            agent_loop=agent_loop,
-            startup=startup,
-            update_notifier=update_notifier,
-            update_cache_repository=update_cache_repository,
-            plan_offer_gateway=plan_offer_gateway,
-            vscode_extension_promo=None,
-        )
-        session_id = app.run(inline=True, inline_no_clear=True)
+    app = VibeApp(
+        agent_loop=agent_loop,
+        startup=startup,
+        update_notifier=update_notifier,
+        update_cache_repository=update_cache_repository,
+        plan_offer_gateway=plan_offer_gateway,
+        vscode_extension_promo=None,
+    )
+    session_id = asyncio.run(_run_app_with_cleanup(app))
 
     print_session_resume_message(
         session_id, agent_loop.stats, agent_loop.config.session_logging
