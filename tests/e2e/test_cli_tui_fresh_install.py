@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 import pexpect
 import pytest
@@ -74,6 +75,12 @@ def test_fresh_wheel_install_can_spawn_cli_and_complete_happy_path(
     vibe_executable = _install_fresh_wheel(tmp_path, wheel_path)
 
     monkeypatch.delenv("PYTHONPATH", raising=False)
+    vibe_home = Path(os.environ["VIBE_HOME"])
+    uvibe_home = Path(os.environ["UVIBE_HOME"])
+    (vibe_home / "cache.toml").write_text(
+        '[update_cache]\nlatest_version = "9.9.9"\nstored_at_timestamp = 1800000000\n',
+        encoding="utf-8",
+    )
 
     captured = io.StringIO()
     child = pexpect.spawn(
@@ -110,4 +117,9 @@ def test_fresh_wheel_install_can_spawn_cli_and_complete_happy_path(
 
     output = captured.getvalue()
     assert "Welcome to Usable Vibe" not in output
+    assert "A new Vibe release is available" not in output
+    if (uvibe_home / "cache.toml").exists():
+        with (uvibe_home / "cache.toml").open("rb") as f:
+            fork_cache = tomllib.load(f)
+        assert fork_cache.get("update_cache", {}).get("latest_version") != "9.9.9"
     assert streaming_mock_server.requests[-1].get("model") == "mock-model"

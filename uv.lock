@@ -2048,7 +2048,7 @@ wheels = [
 
 [[package]]
 name = "uvibe"
-version = "2.16.1.post3"
+version = "2.16.1.4"
 source = { editable = "." }
 dependencies = [
     { name = "agent-client-protocol" },

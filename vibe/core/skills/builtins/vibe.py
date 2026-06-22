@@ -20,7 +20,14 @@ https://teeay.dev/oss/uvibe for human-readable docs.
 
 The user's Vibe home directory defaults to `~/.vibe` but can be overridden via
 the `VIBE_HOME` environment variable. All user-level configuration, skills, tools,
-agents, prompts, logs, and session data live here.
+agents, prompts, and session data live here.
+
+## UVIBE_HOME
+
+The fork runtime-state directory defaults to `~/.uvibe` but can be overridden via
+the `UVIBE_HOME` environment variable. Update cache, what's-new state, feedback
+timing, runtime logs, and ACP message logs live here so they do not interfere
+with an installed upstream Vibe.
 
 ### Directory Structure
 
@@ -36,9 +43,15 @@ agents, prompts, logs, and session data live here.
   skills/              # User-level skills (each skill is a subdirectory with SKILL.md)
   tools/               # Custom tool definitions
   logs/
-    vibe.log           # Main log file
     session/           # Session log files
   plans/               # Session plans
+
+~/.uvibe/
+  cache.toml           # Fork update, what's-new, and feedback state
+  logs/
+    vibe.log           # Main runtime log file
+    acp/
+      messages.jsonl   # ACP message log when enabled
 
 ~/.agents/
   skills/              # Additional user-level skills directory
@@ -648,10 +661,11 @@ Detailed instructions for the model...
 ## Environment Variables
 
 - `VIBE_HOME` - Override the Vibe home directory (default: `~/.vibe`)
+- `UVIBE_HOME` - Override the fork runtime-state directory (default: `~/.uvibe`)
 - `MISTRAL_API_KEY` - API key for Mistral provider
 - `VIBE_ACTIVE_MODEL` - Override active model
 - `VIBE_*` - Any config field can be overridden with the `VIBE_` prefix
-- `LOG_LEVEL` - Logging level for `$VIBE_HOME/logs/vibe.log`. One of `DEBUG`,
+- `LOG_LEVEL` - Logging level for `$UVIBE_HOME/logs/vibe.log`. One of `DEBUG`,
   `INFO`, `WARNING` (default), `ERROR`, `CRITICAL`. Invalid values fall back
   to `WARNING`.
 - `LOG_MAX_BYTES` - Max size in bytes of `vibe.log` before rotation

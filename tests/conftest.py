@@ -79,6 +79,11 @@ def config_dir(
     config_file.write_text(tomli_w.dumps(get_base_config()), encoding="utf-8")
 
     monkeypatch.setattr("vibe.core.paths._vibe_home._DEFAULT_VIBE_HOME", config_dir)
+    fork_state_dir = tmp_path / ".uvibe"
+    fork_state_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        "vibe.core.paths._vibe_home._DEFAULT_UVIBE_HOME", fork_state_dir
+    )
     agents_dir = tmp_path / ".agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr("vibe.core.paths._agents_home._DEFAULT_AGENTS_HOME", agents_dir)

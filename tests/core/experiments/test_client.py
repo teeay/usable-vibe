@@ -65,8 +65,8 @@ async def test_evaluate_happy_path() -> None:
 @pytest.fixture
 def _silence_vibe_logger(caplog: pytest.LogCaptureFixture) -> None:
     # Failure-path tests legitimately emit WARNING logs. Silence the vibe
-    # logger so they don't leak into ~/.vibe/logs/vibe.log (the file handler
-    # is bound to the real path at module import, before VIBE_HOME is
+    # logger so they don't leak into ~/.uvibe/logs/vibe.log (the file handler
+    # is bound to the real path at module import, before UVIBE_HOME is
     # monkeypatched in the conftest fixture).
     caplog.set_level(logging.CRITICAL, logger="vibe")
 

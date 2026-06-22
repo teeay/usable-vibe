@@ -19,6 +19,7 @@ def test_spawn_cli_shows_onboarding_when_api_key_missing(
     vibe_home.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setenv("VIBE_HOME", str(vibe_home))
+    monkeypatch.setenv("UVIBE_HOME", str(tmp_path / "uvibe-home-onboarding"))
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
 

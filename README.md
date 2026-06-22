@@ -1,4 +1,5 @@
-# Usable Vibe
+![Usable Vibe](usable-vibe.png)
+## Usable Vibe
 
 This is a fork and patched version of [Mistral AI's](https://mistral.ai) [Vibe](https://github.com/mistralai/mistral-vibe).
 
@@ -12,11 +13,28 @@ The two should be possible to install at the same time, the Usable version being
 
 Note that to allow ACP when Usable Vibe is running, `uvibe` will call itself `@mistralai/mistral-vibe`.
 
+### Installation
+
+UV:
+
+```shell
+uv tool install uvibe
+```
+
+Pip:
+
+```shell
+pip install uvibe
+```
+
+
+### Notices
+
 Vibe is copyright (c) Mistral AI, released under the Apache 2.0 license.
 
 The patches are public domain and Usable Vibe is released under Apache 2.0 as well.
 
-
+Scottish Wildcat logo by Modern Imagine &copy; 2026.
 
 
 # Mistral Vibe
@@ -44,36 +62,6 @@ Mistral Vibe is a command-line coding assistant powered by Mistral's models. It 
 
 > [!WARNING]
 > Mistral Vibe works on Windows, but we officially support and target UNIX environments.
-
-### One-line install (recommended)
-
-**Linux and macOS**
-
-```bash
-curl -LsSf https://mistral.ai/vibe/install.sh | bash
-```
-
-**Windows**
-
-First, install uv
-
-```bash
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-Then, use uv command below.
-
-### Using uv
-
-```bash
-uv tool install mistral-vibe
-```
-
-### Using pip
-
-```bash
-pip install mistral-vibe
-```
 
 ## Table of Contents
 
@@ -767,22 +755,32 @@ To disable notifications:
 enable_notifications = false
 ```
 
-### Custom Vibe Home Directory
+### Custom Vibe Home Directories
 
-By default, Vibe stores its configuration in `~/.vibe/`. You can override this by setting the `VIBE_HOME` environment variable:
+By default, Vibe stores user data in `~/.vibe/`. You can override this by setting the `VIBE_HOME` environment variable:
 
 ```bash
 export VIBE_HOME="/path/to/custom/vibe/home"
 ```
 
-This affects where Vibe looks for:
+This affects where Vibe looks for shared user data:
 
 - `config.toml` - Main configuration
 - `.env` - API keys
 - `agents/` - Custom agent configurations
 - `prompts/` - Custom system and compaction prompts
 - `tools/` - Custom tools
-- `logs/` - Session logs
+- `logs/session/` - Session logs
+
+Runtime state uses a separate home, `~/.uvibe/`, and can be overridden with
+`UVIBE_HOME`:
+
+```bash
+export UVIBE_HOME="/path/to/custom/uvibe/state"
+```
+
+This affects where Vibe writes update cache, what's-new state, feedback timing,
+runtime logs, and ACP message logs.
 
 ## Editors/IDEs
 

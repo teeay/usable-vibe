@@ -35,9 +35,11 @@ def setup_e2e_env(
     streaming_mock_server: StreamingMockServer,
 ) -> None:
     vibe_home = tmp_path / "vibe-home"
+    uvibe_home = tmp_path / "uvibe-home"
     write_e2e_config(vibe_home, streaming_mock_server.api_base)
     monkeypatch.setenv("MISTRAL_API_KEY", "fake-key")
     monkeypatch.setenv("VIBE_HOME", str(vibe_home))
+    monkeypatch.setenv("UVIBE_HOME", str(uvibe_home))
     monkeypatch.setenv("TERM", "xterm-256color")
 
 

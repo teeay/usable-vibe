@@ -1,6 +1,6 @@
 [project]
 name = "uvibe"
-version = "2.16.1-003"
+version = "2.16.1.4"
 description = "Usable Vibe - CLI coding agent fork of Mistral Vibe"
 readme = "README.md"
 requires-python = ">=3.12"

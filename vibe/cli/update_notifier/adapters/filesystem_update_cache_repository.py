@@ -9,15 +9,17 @@ from vibe.cli.update_notifier.ports.update_cache_repository import (
     UpdateCache,
     UpdateCacheRepository,
 )
-from vibe.core.paths import VIBE_HOME
+from vibe.core.paths import CACHE_FILE
 
 _CACHE_SECTION = "update_cache"
 
 
 class FileSystemUpdateCacheRepository(UpdateCacheRepository):
     def __init__(self, base_path: Path | str | None = None) -> None:
-        self._base_path = Path(base_path) if base_path is not None else VIBE_HOME.path
-        self._cache_file = self._base_path / "cache.toml"
+        self._cache_file = (
+            Path(base_path) / "cache.toml" if base_path is not None else CACHE_FILE.path
+        )
+        self._base_path = self._cache_file.parent
         self._legacy_json = self._base_path / "update_cache.json"
         self._cached: UpdateCache | None = None
         self._loaded = False

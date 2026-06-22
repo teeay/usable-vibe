@@ -63,6 +63,42 @@ async def test_returns_none_when_no_cache_exists(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_default_repository_uses_uvibe_home_not_vibe_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    vibe_home = tmp_path / ".vibe"
+    uvibe_home = tmp_path / ".uvibe"
+    vibe_home.mkdir()
+    uvibe_home.mkdir()
+    monkeypatch.setenv("VIBE_HOME", str(vibe_home))
+    monkeypatch.setenv("UVIBE_HOME", str(uvibe_home))
+    _write_cache_toml(
+        vibe_home,
+        {
+            "update_cache": {
+                "latest_version": "9.9.9",
+                "stored_at_timestamp": 1_700_000_000,
+            }
+        },
+    )
+    repository = FileSystemUpdateCacheRepository()
+
+    assert await repository.get() is None
+
+    await repository.set(
+        UpdateCache(latest_version="1.2.3", stored_at_timestamp=1_800_000_000)
+    )
+
+    with (uvibe_home / "cache.toml").open("rb") as f:
+        data = tomllib.load(f)
+    assert data["update_cache"]["latest_version"] == "1.2.3"
+
+    with (vibe_home / "cache.toml").open("rb") as f:
+        upstream_data = tomllib.load(f)
+    assert upstream_data["update_cache"]["latest_version"] == "9.9.9"
+
+
+@pytest.mark.asyncio
 async def test_returns_none_when_toml_is_corrupted(tmp_path: Path) -> None:
     (tmp_path / "cache.toml").write_text("{not-toml")
     repository = FileSystemUpdateCacheRepository(base_path=tmp_path)

@@ -17,6 +17,7 @@ class GlobalPath:
 
 
 _DEFAULT_VIBE_HOME = Path.home() / ".vibe"
+_DEFAULT_UVIBE_HOME = Path.home() / ".uvibe"
 
 
 def _get_vibe_home() -> Path:
@@ -25,14 +26,23 @@ def _get_vibe_home() -> Path:
     return _DEFAULT_VIBE_HOME
 
 
+def _get_uvibe_home() -> Path:
+    if uvibe_home := os.getenv("UVIBE_HOME"):
+        return Path(uvibe_home).expanduser().resolve()
+    return _DEFAULT_UVIBE_HOME
+
+
 VIBE_HOME = GlobalPath(_get_vibe_home)
+UVIBE_HOME = GlobalPath(_get_uvibe_home)
 GLOBAL_ENV_FILE = GlobalPath(lambda: VIBE_HOME.path / ".env")
 SESSION_LOG_DIR = GlobalPath(lambda: VIBE_HOME.path / "logs" / "session")
 TRUSTED_FOLDERS_FILE = GlobalPath(lambda: VIBE_HOME.path / "trusted_folders.toml")
-LOG_DIR = GlobalPath(lambda: VIBE_HOME.path / "logs")
-LOG_FILE = GlobalPath(lambda: VIBE_HOME.path / "logs" / "vibe.log")
-CACHE_FILE = GlobalPath(lambda: VIBE_HOME.path / "cache.toml")
 HISTORY_FILE = GlobalPath(lambda: VIBE_HOME.path / "vibehistory")
 PLANS_DIR = GlobalPath(lambda: VIBE_HOME.path / "plans")
+CACHE_FILE = GlobalPath(lambda: UVIBE_HOME.path / "cache.toml")
+LOG_DIR = GlobalPath(lambda: UVIBE_HOME.path / "logs")
+LOG_FILE = GlobalPath(lambda: UVIBE_HOME.path / "logs" / "vibe.log")
+ACP_LOG_DIR = GlobalPath(lambda: UVIBE_HOME.path / "logs" / "acp")
+ACP_LOG_FILE = GlobalPath(lambda: UVIBE_HOME.path / "logs" / "acp" / "messages.jsonl")
 
 DEFAULT_TOOL_DIR = GlobalPath(lambda: VIBE_ROOT / "core" / "tools" / "builtins")

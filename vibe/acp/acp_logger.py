@@ -5,17 +5,16 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
-from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
 from cachetools import TTLCache
 
+from vibe.core.paths import ACP_LOG_DIR, ACP_LOG_FILE
+
 if TYPE_CHECKING:
     from acp.connection import StreamEvent
 
-ACP_LOG_DIR = Path.home() / ".vibe" / "logs" / "acp"
-ACP_LOG_FILE = ACP_LOG_DIR / "messages.jsonl"
 MAX_LOG_SIZE_BYTES = 1_000_000
 BACKUP_COUNT = 3
 
@@ -40,14 +39,14 @@ def _get_logger() -> logging.Logger:
     if _logger is not None:
         return _logger
 
-    ACP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ACP_LOG_DIR.path.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("acp_messages")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
     handler = RotatingFileHandler(
-        ACP_LOG_FILE,
+        ACP_LOG_FILE.path,
         maxBytes=MAX_LOG_SIZE_BYTES,
         backupCount=BACKUP_COUNT,
         encoding="utf-8",
