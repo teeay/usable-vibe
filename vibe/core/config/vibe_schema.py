@@ -227,6 +227,13 @@ class VibeConfigSchema(ConfigSchema):
     enable_auto_update: Annotated[bool, WithReplaceMerge()] = True
     enable_notifications: Annotated[bool, WithReplaceMerge()] = True
     enable_system_trust_store: Annotated[bool, WithReplaceMerge()] = False
+    native_scroll_shorten_tool_output: Annotated[bool, WithReplaceMerge()] = True
+    native_scroll_tool_output_head_lines: Annotated[int, WithReplaceMerge()] = Field(
+        default=3, ge=0
+    )
+    native_scroll_tool_output_tail_lines: Annotated[int, WithReplaceMerge()] = Field(
+        default=3, ge=0
+    )
     api_timeout: Annotated[float, WithReplaceMerge()] = DEFAULT_API_TIMEOUT
     api_retry_max_elapsed_time: Annotated[float, WithReplaceMerge()] = (
         DEFAULT_API_RETRY_MAX_ELAPSED_TIME

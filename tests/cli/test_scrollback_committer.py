@@ -167,6 +167,58 @@ def test_bash_result_commits_output_body() -> None:
     assert "beta.txt" in text
 
 
+def test_bash_result_shortens_output_by_default() -> None:
+    from vibe.core.tools.builtins.bash import Bash, BashResult
+
+    committer = _committer()
+    committer.handle_event(
+        ToolResultEvent(
+            tool_name="bash",
+            tool_class=Bash,
+            result=BashResult(
+                command="ls",
+                stdout="\n".join(f"file-{i}" for i in range(1, 11)),
+                stderr="",
+                returncode=0,
+            ),
+            tool_call_id="b1",
+        )
+    )
+    text = _drain_text(committer)
+    assert "file-1" in text
+    assert "file-3" in text
+    assert "file-4" not in text
+    assert "file-7" not in text
+    assert "file-8" in text
+    assert "file-10" in text
+    assert "... 4 lines omitted ..." in text
+
+
+def test_bash_result_shortening_can_be_disabled() -> None:
+    from vibe.core.tools.builtins.bash import Bash, BashResult
+
+    committer = ScrollbackCommitter(
+        width_getter=lambda: 80, color_system=None, shorten_tool_output=lambda: False
+    )
+    committer.handle_event(
+        ToolResultEvent(
+            tool_name="bash",
+            tool_class=Bash,
+            result=BashResult(
+                command="ls",
+                stdout="\n".join(f"file-{i}" for i in range(1, 11)),
+                stderr="",
+                returncode=0,
+            ),
+            tool_call_id="b1",
+        )
+    )
+    text = _drain_text(committer)
+    assert "file-4" in text
+    assert "file-7" in text
+    assert "omitted" not in text
+
+
 def test_edit_result_commits_diff_body() -> None:
     from vibe.core.tools.builtins.edit import Edit, EditResult
 
@@ -508,6 +560,27 @@ def test_commit_manual_bash_renders_durable_block() -> None:
     text = _drain_text(committer)
     assert "$ echo hi" in text
     assert "hi" in text
+
+
+def test_commit_manual_bash_keeps_full_output_with_preview_config() -> None:
+    committer = ScrollbackCommitter(
+        width_getter=lambda: 80,
+        color_system=None,
+        shorten_tool_output=lambda: True,
+        tool_output_head_lines=lambda: 1,
+        tool_output_tail_lines=lambda: 2,
+    )
+    committer.commit_manual_bash(
+        "seq 6", "\n".join(f"line {i}" for i in range(1, 7)), 0
+    )
+    text = _drain_text(committer)
+    assert "$ seq 6" in text
+    assert "line 1" in text
+    assert "line 2" in text
+    assert "line 4" in text
+    assert "line 5" in text
+    assert "line 6" in text
+    assert "omitted" not in text
 
 
 def test_commit_manual_bash_flushes_streaming_buffer_first() -> None:

@@ -27,6 +27,37 @@ Pip:
 pip install uvibe
 ```
 
+### Versioning
+
+Upstream `vibe` versions are reflected in the three first numbers, the last is the fork version:
+2.17.1.6 is 2.17.1 upstream and version 6 of the fork.
+
+Since fork version 6, there are additional, fork-specific settings.
+
+### Additional Settings
+
+Options that are useful or meaningful in the terminal scrollback world of uvibe.
+
+**Shortened Tool Output**
+
+Long agent `bash`, `read`, and `grep` outputs are shortened in terminal
+scrollback by default: command/header, first 3 lines, omitted-lines marker, and
+last 3 lines. Manual `!` bash output is always shown in full. To keep full agent
+tool output, add this to `~/.vibe/config.toml`:
+
+```toml
+native_scroll_shorten_tool_output = false
+native_scroll_tool_output_head_lines = 3
+native_scroll_tool_output_tail_lines = 3
+```
+
+**Upgrades**
+
+As `uvibe` intends to be a drop-in replacement of `vibe` and also co-exist with it,
+it uses the settings, credentials etc. from the standard `~/.vibe/` directory.
+For managing the parallel upgrade paths, the runtime details are stored
+in `~/.uvibe/`.
+
 
 ### Notices
 

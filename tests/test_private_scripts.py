@@ -255,6 +255,40 @@ def test_release_removes_upstream_install_before_prepending_fork_readme() -> Non
     assert remove_index < prepend_index
 
 
+def test_release_pushes_internal_commits_and_tag_before_external_publish() -> None:
+    release_script = (REPO_ROOT / "private" / "scripts" / "release.sh").read_text(
+        encoding="utf-8"
+    )
+
+    master_commit_index = release_script.index(
+        'uv run git commit -m "release: ${DISPLAY_NAME} ${release_version}"'
+    )
+    tag_index = release_script.index(
+        'uv run git tag -a "${release_tag}" -m "${DISPLAY_NAME} ${release_version}"'
+    )
+    patch_commit_index = release_script.index(
+        'uv run git commit -m "release: prepare ${next_counter}"'
+    )
+    push_patches_index = release_script.index("uv run git push origin patches")
+    push_master_index = release_script.index(
+        'uv run git -C "${master_dir}" push origin master'
+    )
+    push_tag_index = release_script.index(
+        'uv run git -C "${master_dir}" push origin "${release_tag}"'
+    )
+    external_index = release_script.index("publish-external.sh")
+
+    assert (
+        master_commit_index
+        < tag_index
+        < patch_commit_index
+        < push_patches_index
+        < push_master_index
+        < push_tag_index
+        < external_index
+    )
+
+
 def test_rebrand_updates_all_e2e_resume_hint_regexes() -> None:
     rebrand_script = (REPO_ROOT / "private" / "scripts" / "rebrand.sh").read_text(
         encoding="utf-8"
@@ -350,9 +384,18 @@ def test_publish_external_commits_tags_and_pushes_release() -> None:
 
     assert "--push" not in publish_script
     assert "--message" not in publish_script
+    assert "prompt_commit_message()" in publish_script
+    assert "External repository commit message" in publish_script
+    assert "external commit message required" in publish_script
+    assert (
+        "printf '\\nExternal repository commit message [%s]: ' "
+        '"${default_commit_message}" >/dev/tty'
+    ) in publish_script
+    assert "read -r answer </dev/tty" in publish_script
     tag_guard_index = publish_script.index("refs/tags/${release_tag}")
     sync_index = publish_script.index("rsync -a --delete")
     add_index = publish_script.index('uv run git -C "${external_dir}" add -A')
+    prompt_index = publish_script.index('commit_message="$(prompt_commit_message)"')
     commit_index = publish_script.index('uv run git -C "${external_dir}" commit')
     tag_index = publish_script.index('uv run git -C "${external_dir}" tag -a')
     push_branch_index = publish_script.index(
@@ -365,6 +408,7 @@ def test_publish_external_commits_tags_and_pushes_release() -> None:
         tag_guard_index
         < sync_index
         < add_index
+        < prompt_index
         < commit_index
         < tag_index
         < push_branch_index

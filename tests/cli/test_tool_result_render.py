@@ -4,6 +4,7 @@ from io import StringIO
 
 from rich.console import Console, RenderableType
 
+from vibe.cli.textual_ui.native_scroll.tool_result_render import shorten_text_middle
 from vibe.cli.textual_ui.tool_result_render import (
     render_manual_bash_body,
     render_result_body,
@@ -41,6 +42,66 @@ def test_bash_body_includes_stdout_and_stderr() -> None:
     assert "line-err" in text
 
 
+def test_shorten_text_middle_keeps_short_content() -> None:
+    assert shorten_text_middle("a\nb\nc", head_lines=3, tail_lines=3) == "a\nb\nc"
+
+
+def test_shorten_text_middle_keeps_head_tail_and_marker() -> None:
+    text = shorten_text_middle(
+        "\n".join(f"line {i}" for i in range(1, 11)), head_lines=3, tail_lines=3
+    )
+    assert text.splitlines() == [
+        "line 1",
+        "line 2",
+        "line 3",
+        "... 4 lines omitted ...",
+        "line 8",
+        "line 9",
+        "line 10",
+    ]
+
+
+def test_shorten_text_middle_supports_zero_head_or_tail() -> None:
+    assert shorten_text_middle("a\nb\nc", head_lines=0, tail_lines=1) == (
+        "... 2 lines omitted ...\nc"
+    )
+    assert shorten_text_middle("a\nb\nc", head_lines=1, tail_lines=0) == (
+        "a\n... 2 lines omitted ..."
+    )
+
+
+def test_bash_body_shortens_long_output_by_default() -> None:
+    result = BashResult(
+        command="ls",
+        stdout="\n".join(f"file-{i}" for i in range(1, 11)),
+        stderr="",
+        returncode=0,
+    )
+    text = _plain(render_result_body("bash", result, dark=True, ansi=False))
+    assert "file-1" in text
+    assert "file-3" in text
+    assert "file-4" not in text
+    assert "file-7" not in text
+    assert "file-8" in text
+    assert "file-10" in text
+    assert "... 4 lines omitted ..." in text
+
+
+def test_bash_body_can_disable_shortening() -> None:
+    result = BashResult(
+        command="ls",
+        stdout="\n".join(f"file-{i}" for i in range(1, 11)),
+        stderr="",
+        returncode=0,
+    )
+    text = _plain(
+        render_result_body("bash", result, dark=True, ansi=False, shorten=False)
+    )
+    assert "file-4" in text
+    assert "file-7" in text
+    assert "omitted" not in text
+
+
 def test_bash_empty_output_renders_no_content() -> None:
     result = BashResult(command="true", stdout="", stderr="", returncode=0)
     text = _plain(render_result_body("bash", result, dark=True, ansi=False))
@@ -52,6 +113,19 @@ def test_manual_bash_body_success() -> None:
     assert "$ ls -a" in text
     assert "a" in text and "b" in text
     assert "exit" not in text
+
+
+def test_manual_bash_body_keeps_long_output_full() -> None:
+    output = "\n".join(f"line {i}" for i in range(1, 9))
+    text = _plain(render_manual_bash_body("seq 8", output, 0))
+    assert "$ seq 8" in text
+    assert "line 1" in text
+    assert "line 3" in text
+    assert "line 4" in text
+    assert "line 5" in text
+    assert "line 6" in text
+    assert "line 8" in text
+    assert "omitted" not in text
 
 
 def test_manual_bash_body_failure_shows_exit_code() -> None:
@@ -167,6 +241,17 @@ def test_write_file_body_includes_content() -> None:
     assert "print('hi')" in text
 
 
+def test_write_file_body_does_not_shorten() -> None:
+    content = "\n".join(f"line {i}" for i in range(1, 11))
+    result = WriteFileResult(
+        path="hello.py", bytes_written=len(content), content=content
+    )
+    text = _plain(render_result_body("write_file", result, dark=True, ansi=False))
+    assert "line 4" in text
+    assert "line 7" in text
+    assert "omitted" not in text
+
+
 def test_write_file_empty_content_renders_no_content() -> None:
     result = WriteFileResult(path="empty.txt", bytes_written=0, content="")
     text = _plain(render_result_body("write_file", result, dark=True, ansi=False))
@@ -187,6 +272,20 @@ def test_read_body_strips_line_number_prefixes() -> None:
     assert "2→" not in text
 
 
+def test_read_body_shortens_after_stripping_line_numbers() -> None:
+    content = "\n".join(f"{i:4d}→value {i}" for i in range(1, 11))
+    result = ReadResult(file_path="a.py", content=content, num_lines=10, start_line=1)
+    text = _plain(render_result_body("read", result, dark=True, ansi=False))
+    assert "value 1" in text
+    assert "value 3" in text
+    assert "value 4" not in text
+    assert "value 7" not in text
+    assert "value 8" in text
+    assert "value 10" in text
+    assert "1→" not in text
+    assert "... 4 lines omitted ..." in text
+
+
 def test_read_empty_content_renders_no_content() -> None:
     result = ReadResult(file_path="a.py", content="", num_lines=0, start_line=1)
     text = _plain(render_result_body("read", result, dark=True, ansi=False))
@@ -200,6 +299,19 @@ def test_grep_body_includes_matches() -> None:
     text = _plain(render_result_body("grep", result, dark=True, ansi=False))
     assert "src/a.py:1:hit" in text
     assert "src/b.py:5:hit" in text
+
+
+def test_grep_body_shortens_long_matches_by_default() -> None:
+    matches = "\n".join(f"src/file_{i}.py:1:hit" for i in range(1, 11))
+    result = GrepResult(matches=matches, match_count=10, was_truncated=False)
+    text = _plain(render_result_body("grep", result, dark=True, ansi=False))
+    assert "src/file_1.py:1:hit" in text
+    assert "src/file_3.py:1:hit" in text
+    assert "src/file_4.py:1:hit" not in text
+    assert "src/file_7.py:1:hit" not in text
+    assert "src/file_8.py:1:hit" in text
+    assert "src/file_10.py:1:hit" in text
+    assert "... 4 lines omitted ..." in text
 
 
 def test_grep_empty_matches_renders_no_matches() -> None:

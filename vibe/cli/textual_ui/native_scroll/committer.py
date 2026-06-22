@@ -128,6 +128,12 @@ class ScrollbackCommitter:
         ansi: Returns whether the terminal is restricted to ANSI colors; used to
             pick the ANSI syntax theme and dim removed diff lines. Defaults to
             ``False``.
+        shorten_tool_output: Returns whether disposable native tool output
+            should be shortened before it is committed to terminal scrollback.
+        tool_output_head_lines: Returns how many leading lines to keep when
+            shortening disposable native tool output.
+        tool_output_tail_lines: Returns how many trailing lines to keep when
+            shortening disposable native tool output.
     """
 
     def __init__(
@@ -138,12 +144,24 @@ class ScrollbackCommitter:
         color_system: str | None = "truecolor",
         dark: Callable[[], bool] | None = None,
         ansi: Callable[[], bool] | None = None,
+        shorten_tool_output: Callable[[], bool] | None = None,
+        tool_output_head_lines: Callable[[], int] | None = None,
+        tool_output_tail_lines: Callable[[], int] | None = None,
     ) -> None:
         self._width_getter = width_getter
         self._refresh: Callable[[], object] = refresh or (lambda: None)
         self._color_system = color_system
         self._dark: Callable[[], bool] = dark or (lambda: True)
         self._ansi: Callable[[], bool] = ansi or (lambda: False)
+        self._shorten_tool_output: Callable[[], bool] = shorten_tool_output or (
+            lambda: True
+        )
+        self._tool_output_head_lines: Callable[[], int] = tool_output_head_lines or (
+            lambda: 3
+        )
+        self._tool_output_tail_lines: Callable[[], int] = tool_output_tail_lines or (
+            lambda: 3
+        )
         self._queue: list[RenderableType] = []
         self._assistant_buffer = ""
         self._reasoning_buffer = ""
@@ -403,7 +421,13 @@ class ScrollbackCommitter:
                 message=event.error or event.skip_reason or "Done",
             )
         body = render_result_body(
-            event.tool_name, event.result, dark=self._dark(), ansi=self._ansi()
+            event.tool_name,
+            event.result,
+            dark=self._dark(),
+            ansi=self._ansi(),
+            shorten=self._shorten_tool_output(),
+            head_lines=self._tool_output_head_lines(),
+            tail_lines=self._tool_output_tail_lines(),
         )
         self._enqueue(self._tool_block(event.tool_name, call, result, body))
 
@@ -462,7 +486,12 @@ class ScrollbackCommitter:
         """
         self.flush()
         for block in render_history_blocks(
-            messages, tool_call_map, omitted_count=omitted_count
+            messages,
+            tool_call_map,
+            omitted_count=omitted_count,
+            shorten_tool_output=self._shorten_tool_output(),
+            tool_output_head_lines=self._tool_output_head_lines(),
+            tool_output_tail_lines=self._tool_output_tail_lines(),
         ):
             self._enqueue(block)
 

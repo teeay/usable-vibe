@@ -76,6 +76,63 @@ def test_render_history_blocks_skips_injected() -> None:
     assert "injected one" not in text
 
 
+def test_render_history_blocks_shortens_disposable_tool_output_by_default() -> None:
+    messages = [
+        LLMMessage(
+            role=Role.tool,
+            content="\n".join(f"line {i}" for i in range(1, 11)),
+            name="bash",
+        )
+    ]
+    committer = _committer()
+    for block in render_history_blocks(messages, {}, omitted_count=0):
+        committer._enqueue(block)
+    text = _lines(committer)
+    assert "line 1" in text
+    assert "line 3" in text
+    assert "line 4" not in text
+    assert "line 7" not in text
+    assert "line 8" in text
+    assert "line 10" in text
+    assert "... 4 lines omitted ..." in text
+
+
+def test_render_history_blocks_can_disable_tool_output_shortening() -> None:
+    messages = [
+        LLMMessage(
+            role=Role.tool,
+            content="\n".join(f"line {i}" for i in range(1, 11)),
+            name="bash",
+        )
+    ]
+    committer = _committer()
+    for block in render_history_blocks(
+        messages, {}, omitted_count=0, shorten_tool_output=False
+    ):
+        committer._enqueue(block)
+    text = _lines(committer)
+    assert "line 4" in text
+    assert "line 7" in text
+    assert "omitted" not in text
+
+
+def test_render_history_blocks_keeps_work_product_tool_output_full() -> None:
+    messages = [
+        LLMMessage(
+            role=Role.tool,
+            content="\n".join(f"diff line {i}" for i in range(1, 11)),
+            name="edit",
+        )
+    ]
+    committer = _committer()
+    for block in render_history_blocks(messages, {}, omitted_count=0):
+        committer._enqueue(block)
+    text = _lines(committer)
+    assert "diff line 4" in text
+    assert "diff line 7" in text
+    assert "omitted" not in text
+
+
 # -- committer commit methods ----------------------------------------------
 
 

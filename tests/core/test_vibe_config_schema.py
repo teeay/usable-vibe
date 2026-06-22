@@ -8,6 +8,27 @@ from vibe.core.config._settings import VibeConfig
 from vibe.core.config.vibe_schema import VibeConfigSchema
 
 
+def test_native_scroll_tool_output_config_defaults() -> None:
+    config = VibeConfig()
+    assert config.native_scroll_shorten_tool_output is True
+    assert config.native_scroll_tool_output_head_lines == 3
+    assert config.native_scroll_tool_output_tail_lines == 3
+
+
+def test_native_scroll_tool_output_env_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VIBE_NATIVE_SCROLL_SHORTEN_TOOL_OUTPUT", "false")
+    monkeypatch.setenv("VIBE_NATIVE_SCROLL_TOOL_OUTPUT_HEAD_LINES", "4")
+    monkeypatch.setenv("VIBE_NATIVE_SCROLL_TOOL_OUTPUT_TAIL_LINES", "2")
+
+    config = VibeConfig()
+
+    assert config.native_scroll_shorten_tool_output is False
+    assert config.native_scroll_tool_output_head_lines == 4
+    assert config.native_scroll_tool_output_tail_lines == 2
+
+
 def test_vibe_config_schema_covers_all_vibe_config_fields() -> None:
     legacy_fields = set(VibeConfig.model_fields.keys())
     schema_fields = set(VibeConfigSchema.model_fields.keys())
@@ -33,6 +54,9 @@ disabled_tools = ["bash"]
 default_agent = "plan"
 enabled_skills = ["search"]
 enable_otel = true
+native_scroll_shorten_tool_output = false
+native_scroll_tool_output_head_lines = 4
+native_scroll_tool_output_tail_lines = 2
 
 [[models]]
 alias = "codestral"
@@ -62,3 +86,6 @@ provider = "mistral"
     assert config.default_agent == "plan"
     assert "search" in config.enabled_skills
     assert config.enable_otel is True
+    assert config.native_scroll_shorten_tool_output is False
+    assert config.native_scroll_tool_output_head_lines == 4
+    assert config.native_scroll_tool_output_tail_lines == 2

@@ -2,19 +2,22 @@
 
 Where the full-screen UI renders tool result bodies as Textual widgets
 (``get_result_widget`` in ``tool_widgets.py``), native scroll commits the same
-semantic content as Rich renderables straight into the host terminal's
+semantic inputs as Rich renderables straight into the host terminal's
 scrollback. These renderers build from the typed result models
 (:class:`BashResult`, :class:`EditResult`, :class:`AskUserQuestionResult`),
 never by scraping a completed widget, so they are the durable rendering
-architecture for tool output. They are pure and Rich-only -- no Textual, no app
-state -- so the terminal output can be unit-tested directly, mirroring
-``inline_inject.py``.
+architecture for tool output. Disposable agent tool output (bash/read/grep) is
+shortened by default for terminal readability; manual ``!`` bash and
+work-product/structured tools keep full result bodies. The renderers are pure
+and Rich-only -- no Textual, no app state -- so the terminal output can be
+unit-tested directly, mirroring ``inline_inject.py``.
 
 Every tool with a dedicated full-screen result widget (``RESULT_WIDGETS`` in
-``tool_widgets.py``) is covered here: bash output, edit diffs, ask_user_question
-answers, write_file/read content (syntax-highlighted), grep matches, and todo
-lists. :func:`render_result_body` returns ``None`` for any other tool -- the
-builtins rendered by the generic ``ToolResultWidget`` (``webfetch``,
+``tool_widgets.py``) is covered here: shortened agent bash output, full manual
+``!`` bash output, full edit diffs, full ask_user_question answers, full
+write_file content, shortened read content, shortened grep matches, and full
+todo lists. :func:`render_result_body` returns ``None`` for any other tool --
+the builtins rendered by the generic ``ToolResultWidget`` (``webfetch``,
 ``websearch``, ``task``, ``skill``, ``exit_plan_mode``) and any future or
 non-builtin tool -- so the committer keeps its ``format_result_display`` summary
 line. Those are intentionally summary-only: their bodies are large model-facing
@@ -55,7 +58,14 @@ _TODO_STATUS_ICONS = {
 
 
 def render_result_body(
-    tool_name: str, result: BaseModel | None, *, dark: bool, ansi: bool
+    tool_name: str,
+    result: BaseModel | None,
+    *,
+    dark: bool,
+    ansi: bool,
+    shorten: bool = True,
+    head_lines: int = 3,
+    tail_lines: int = 3,
 ) -> RenderableType | None:
     """Render a durable Rich result body for a tool, or ``None`` if unhandled.
 
@@ -66,7 +76,9 @@ def render_result_body(
     body: RenderableType | None
     match (tool_name, result):
         case ("bash", BashResult()):
-            body = _render_bash_result(result)
+            body = _render_bash_result(
+                result, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
+            )
         case ("edit", EditResult()):
             body = _render_edit_result(result, dark=dark, ansi=ansi)
         case ("ask_user_question", AskUserQuestionResult()):
@@ -74,9 +86,18 @@ def render_result_body(
         case ("write_file", WriteFileResult()):
             body = _render_write_file_result(result, dark=dark, ansi=ansi)
         case ("read", ReadResult()):
-            body = _render_read_result(result, dark=dark, ansi=ansi)
+            body = _render_read_result(
+                result,
+                dark=dark,
+                ansi=ansi,
+                shorten=shorten,
+                head_lines=head_lines,
+                tail_lines=tail_lines,
+            )
         case ("grep", GrepResult()):
-            body = _render_grep_result(result)
+            body = _render_grep_result(
+                result, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
+            )
         case ("todo", TodoResult()):
             body = _render_todo_result(result)
         case _:
@@ -107,7 +128,9 @@ def render_manual_bash_body(
     return Group(*rows)
 
 
-def _render_bash_result(result: BashResult) -> RenderableType:
+def _render_bash_result(
+    result: BashResult, *, shorten: bool, head_lines: int, tail_lines: int
+) -> RenderableType:
     parts: list[str] = []
     if result.stdout:
         parts.append(result.stdout.strip("\n"))
@@ -116,7 +139,31 @@ def _render_bash_result(result: BashResult) -> RenderableType:
     output = "\n".join(part for part in parts if part)
     if not output:
         return Text("(no content)", style="dim")
+    if shorten:
+        output = shorten_text_middle(
+            output, head_lines=head_lines, tail_lines=tail_lines
+        )
     return Text(output)
+
+
+def shorten_text_middle(text: str, *, head_lines: int, tail_lines: int) -> str:
+    """Return ``text`` shortened to a head/tail preview with an omitted marker."""
+    head_lines = max(0, head_lines)
+    tail_lines = max(0, tail_lines)
+    lines = text.splitlines()
+    kept = head_lines + tail_lines
+    if not lines or len(lines) <= kept:
+        return text
+
+    omitted = len(lines) - kept
+    marker = f"... {omitted} {'line' if omitted == 1 else 'lines'} omitted ..."
+    preview: list[str] = []
+    if head_lines:
+        preview.extend(lines[:head_lines])
+    preview.append(marker)
+    if tail_lines:
+        preview.extend(lines[-tail_lines:])
+    return "\n".join(preview)
 
 
 def _render_ask_user_question_result(result: AskUserQuestionResult) -> RenderableType:
@@ -146,20 +193,36 @@ def _render_write_file_result(
 
 
 def _render_read_result(
-    result: ReadResult, *, dark: bool, ansi: bool
+    result: ReadResult,
+    *,
+    dark: bool,
+    ansi: bool,
+    shorten: bool,
+    head_lines: int,
+    tail_lines: int,
 ) -> RenderableType:
     content = _strip_line_numbers(result.content).strip("\n")
     if not content:
         return Text("(no content)", style="dim")
+    if shorten:
+        content = shorten_text_middle(
+            content, head_lines=head_lines, tail_lines=tail_lines
+        )
     return _highlighted_block(
         content, _language_for_path(result.file_path), dark=dark, ansi=ansi
     )
 
 
-def _render_grep_result(result: GrepResult) -> RenderableType:
+def _render_grep_result(
+    result: GrepResult, *, shorten: bool, head_lines: int, tail_lines: int
+) -> RenderableType:
     matches = result.matches.strip("\n")
     if not matches:
         return Text("(no matches)", style="dim")
+    if shorten:
+        matches = shorten_text_middle(
+            matches, head_lines=head_lines, tail_lines=tail_lines
+        )
     return Text(matches)
 
 

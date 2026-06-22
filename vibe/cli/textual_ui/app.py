@@ -749,6 +749,13 @@ class VibeApp(App):  # noqa: PLR0904
             refresh=self.refresh,
             dark=lambda: self.current_theme.dark,
             ansi=lambda: self.native_ansi_color,
+            shorten_tool_output=lambda: self.config.native_scroll_shorten_tool_output,
+            tool_output_head_lines=lambda: (
+                self.config.native_scroll_tool_output_head_lines
+            ),
+            tool_output_tail_lines=lambda: (
+                self.config.native_scroll_tool_output_tail_lines
+            ),
         )
         # The full animated Banner stays in the hidden #chat; commit a compact
         # durable header so scrollback opens with session context (#14).

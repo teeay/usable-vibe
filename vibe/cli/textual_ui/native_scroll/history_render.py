@@ -17,13 +17,22 @@ from rich.console import RenderableType
 from rich.markdown import Markdown
 from rich.text import Text
 
+from vibe.cli.textual_ui.native_scroll.tool_result_render import shorten_text_middle
 from vibe.cli.textual_ui.native_scroll.widget_render import render_user_prompt
 from vibe.cli.textual_ui.widgets.messages import UserMessage
 from vibe.core.types import LLMMessage, Role
 
+_SHORTENABLE_TOOL_NAMES = {"bash", "read", "grep"}
+
 
 def render_history_blocks(
-    messages: Sequence[LLMMessage], tool_call_map: dict[str, str], *, omitted_count: int
+    messages: Sequence[LLMMessage],
+    tool_call_map: dict[str, str],
+    *,
+    omitted_count: int,
+    shorten_tool_output: bool = True,
+    tool_output_head_lines: int = 3,
+    tool_output_tail_lines: int = 3,
 ) -> list[RenderableType]:
     """Render resumed history messages to durable scrollback blocks.
 
@@ -58,7 +67,14 @@ def render_history_blocks(
             case Role.tool:
                 name = msg.name or tool_call_map.get(msg.tool_call_id or "", "tool")
                 if msg.content:
-                    blocks.append(_tool_result_block(name, msg.content))
+                    content = msg.content
+                    if shorten_tool_output and name in _SHORTENABLE_TOOL_NAMES:
+                        content = shorten_text_middle(
+                            content,
+                            head_lines=tool_output_head_lines,
+                            tail_lines=tool_output_tail_lines,
+                        )
+                    blocks.append(_tool_result_block(name, content))
             case _:
                 continue
     return blocks

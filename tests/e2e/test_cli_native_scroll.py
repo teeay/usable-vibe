@@ -4,12 +4,15 @@ import json
 import time
 
 import pexpect
+import pyte
 import pytest
 
 from tests.e2e.common import strip_ansi, wait_for_rendered_text, wait_for_request_count
 from tests.e2e.mock_server import ChatCompletionsRequestPayload, StreamingMockServer
 
 _ALT_SCREEN = "\x1b[?1049h"
+_PTY_COLUMNS = 120
+_PTY_ROWS = 36
 _MANUAL_BASH_OUTPUT = "__NATIVE_MANUAL_BASH_OK__"
 _QUEUED_REPLY = "NATIVE QUEUED REPLY"
 
@@ -27,6 +30,20 @@ def _pump(child: pexpect.spawn, seconds: float) -> None:
 
 def _assert_native_terminal_contract(raw: str) -> None:
     assert _ALT_SCREEN not in raw
+
+
+def _terminal_lines(raw: str) -> list[str]:
+    screen = pyte.HistoryScreen(_PTY_COLUMNS, _PTY_ROWS, history=5000)
+    stream = pyte.ByteStream(screen)
+    stream.feed(raw.encode("utf-8", "ignore"))
+
+    def render_row(row) -> str:
+        return "".join(row[x].data for x in range(_PTY_COLUMNS)).rstrip()
+
+    return [
+        *(render_row(row) for row in screen.history.top),
+        *(screen.display[y].rstrip() for y in range(_PTY_ROWS)),
+    ]
 
 
 def _slow_queue_factory(
@@ -226,6 +243,40 @@ def test_native_scroll_manual_bash_commits_output(
         child.sendcontrol("d")
         _pump(child, 3.0)
 
+    assert not child.isalive()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("setup_e2e_env")
+def test_native_scroll_manual_bash_keeps_long_output_full(
+    e2e_workdir, spawned_vibe_process
+) -> None:
+    with spawned_vibe_process(e2e_workdir) as (child, captured):
+        wait_for_rendered_text(child, captured, "> ", timeout=15)
+
+        child.send(
+            "! for i in 01 02 03 04 05 06 07 08 09 10; do "
+            "printf '__NATIVE_LONG_BASH_LINE_%s__\\n' \"$i\"; done"
+        )
+        child.send("\r")
+
+        wait_for_rendered_text(
+            child, captured, "__NATIVE_LONG_BASH_LINE_10__", timeout=15
+        )
+
+        child.sendcontrol("d")
+        _pump(child, 3.0)
+
+    raw = captured.getvalue()
+    terminal_text = "\n".join(_terminal_lines(raw))
+    _assert_native_terminal_contract(raw)
+    assert "__NATIVE_LONG_BASH_LINE_01__" in terminal_text
+    assert "__NATIVE_LONG_BASH_LINE_03__" in terminal_text
+    assert "__NATIVE_LONG_BASH_LINE_04__" in terminal_text
+    assert "__NATIVE_LONG_BASH_LINE_07__" in terminal_text
+    assert "__NATIVE_LONG_BASH_LINE_08__" in terminal_text
+    assert "__NATIVE_LONG_BASH_LINE_10__" in terminal_text
+    assert "lines omitted" not in terminal_text
     assert not child.isalive()
 
 

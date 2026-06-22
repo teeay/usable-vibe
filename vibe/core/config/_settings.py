@@ -641,6 +641,9 @@ class VibeConfig(BaseSettings):
     enable_update_checks: bool = True
     enable_notifications: bool = True
     enable_system_trust_store: bool = False
+    native_scroll_shorten_tool_output: bool = True
+    native_scroll_tool_output_head_lines: int = Field(default=3, ge=0)
+    native_scroll_tool_output_tail_lines: int = Field(default=3, ge=0)
     api_timeout: float = DEFAULT_API_TIMEOUT
     api_retry_max_elapsed_time: float = DEFAULT_API_RETRY_MAX_ELAPSED_TIME
     auto_compact_threshold: int = DEFAULT_AUTO_COMPACT_THRESHOLD
