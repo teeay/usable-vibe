@@ -466,6 +466,10 @@ def _default_alias_to_name(data: Any) -> Any:
 ThinkingLevel = Literal["off", "low", "medium", "high", "max"]
 THINKING_LEVELS: list[str] = list(get_args(ThinkingLevel))
 
+# Shape of the inline input caret in native-scroll mode. "block" is a full-cell
+# block; "underscore" is a thin underline. Default is "block".
+NativeScrollCursorShape = Literal["block", "underscore"]
+
 DEFAULT_AUTO_COMPACT_THRESHOLD = 200_000
 DEFAULT_API_TIMEOUT = 720.0
 DEFAULT_API_RETRY_MAX_ELAPSED_TIME = 300.0
@@ -644,6 +648,7 @@ class VibeConfig(BaseSettings):
     native_scroll_shorten_tool_output: bool = True
     native_scroll_tool_output_head_lines: int = Field(default=3, ge=0)
     native_scroll_tool_output_tail_lines: int = Field(default=3, ge=0)
+    native_scroll_cursor_shape: NativeScrollCursorShape = "block"
     api_timeout: float = DEFAULT_API_TIMEOUT
     api_retry_max_elapsed_time: float = DEFAULT_API_RETRY_MAX_ELAPSED_TIME
     auto_compact_threshold: int = DEFAULT_AUTO_COMPACT_THRESHOLD

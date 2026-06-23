@@ -43,8 +43,8 @@ def test_render_history_blocks_covers_each_role() -> None:
         LLMMessage(role=Role.tool, content="file body", name="read", tool_call_id="c1"),
     ]
     committer = _committer()
-    for block in render_history_blocks(messages, {}, omitted_count=0):
-        committer._enqueue(block)
+    for block, is_full_width in render_history_blocks(messages, {}, omitted_count=0):
+        committer._enqueue(block, is_full_width=is_full_width)
     text = _lines(committer)
     assert "ping" in text
     assert "pong" in text
@@ -54,10 +54,10 @@ def test_render_history_blocks_covers_each_role() -> None:
 
 def test_render_history_blocks_omitted_marker() -> None:
     committer = _committer()
-    for block in render_history_blocks(
+    for block, is_full_width in render_history_blocks(
         [LLMMessage(role=Role.user, content="tail")], {}, omitted_count=7
     ):
-        committer._enqueue(block)
+        committer._enqueue(block, is_full_width=is_full_width)
     text = _lines(committer)
     assert "7 earlier messages omitted" in text
     assert "tail" in text
@@ -69,8 +69,8 @@ def test_render_history_blocks_skips_injected() -> None:
         LLMMessage(role=Role.user, content="injected one", injected=True),
     ]
     committer = _committer()
-    for block in render_history_blocks(messages, {}, omitted_count=0):
-        committer._enqueue(block)
+    for block, is_full_width in render_history_blocks(messages, {}, omitted_count=0):
+        committer._enqueue(block, is_full_width=is_full_width)
     text = _lines(committer)
     assert "visible" in text
     assert "injected one" not in text
@@ -85,8 +85,8 @@ def test_render_history_blocks_shortens_disposable_tool_output_by_default() -> N
         )
     ]
     committer = _committer()
-    for block in render_history_blocks(messages, {}, omitted_count=0):
-        committer._enqueue(block)
+    for block, is_full_width in render_history_blocks(messages, {}, omitted_count=0):
+        committer._enqueue(block, is_full_width=is_full_width)
     text = _lines(committer)
     assert "line 1" in text
     assert "line 3" in text
@@ -106,10 +106,10 @@ def test_render_history_blocks_can_disable_tool_output_shortening() -> None:
         )
     ]
     committer = _committer()
-    for block in render_history_blocks(
+    for block, is_full_width in render_history_blocks(
         messages, {}, omitted_count=0, shorten_tool_output=False
     ):
-        committer._enqueue(block)
+        committer._enqueue(block, is_full_width=is_full_width)
     text = _lines(committer)
     assert "line 4" in text
     assert "line 7" in text
@@ -125,8 +125,8 @@ def test_render_history_blocks_keeps_work_product_tool_output_full() -> None:
         )
     ]
     committer = _committer()
-    for block in render_history_blocks(messages, {}, omitted_count=0):
-        committer._enqueue(block)
+    for block, is_full_width in render_history_blocks(messages, {}, omitted_count=0):
+        committer._enqueue(block, is_full_width=is_full_width)
     text = _lines(committer)
     assert "diff line 4" in text
     assert "diff line 7" in text

@@ -152,7 +152,9 @@ def shorten_text_middle(text: str, *, head_lines: int, tail_lines: int) -> str:
     tail_lines = max(0, tail_lines)
     lines = text.splitlines()
     kept = head_lines + tail_lines
-    if not lines or len(lines) <= kept:
+    # If we would omit 0 or 1 lines, return the original text to avoid
+    # replacing a single line with a "1 line omitted" marker.
+    if not lines or len(lines) <= kept + 1:
         return text
 
     omitted = len(lines) - kept

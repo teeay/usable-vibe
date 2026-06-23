@@ -117,10 +117,13 @@ def test_spawn_cli_asks_bash_permission_and_shows_tool_output_after_approval(
     assert _ALT_SCREEN not in raw
     assert "Approved bash" in rendered
     assert PREDICTABLE_OUTPUT in rendered
+    # Durable non-assistant blocks (approval outcome, tool call/result) render
+    # with the interim-event indentation of 8 columns left.
+    indent = " " * 8
     assert [line for line in terminal_lines if "Approved bash" in line] == [
-        "✓ Approved bash"
+        f"{indent}✓ Approved bash"
     ]
     assert [line for line in terminal_lines if PREDICTABLE_OUTPUT in line] == [
-        f'✓ bash: printf "{PREDICTABLE_OUTPUT}\\n"',
-        PREDICTABLE_OUTPUT,
+        f'{indent}✓ bash: printf "{PREDICTABLE_OUTPUT}\\n"',
+        f"{indent}{PREDICTABLE_OUTPUT}",
     ]

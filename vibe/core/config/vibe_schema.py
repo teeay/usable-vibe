@@ -27,6 +27,7 @@ from vibe.core.config._settings import (
     ExperimentsConfig,
     MCPServer,
     ModelConfig,
+    NativeScrollCursorShape,
     ProjectContextConfig,
     ProviderConfig,
     SessionLoggingConfig,
@@ -234,6 +235,9 @@ class VibeConfigSchema(ConfigSchema):
     native_scroll_tool_output_tail_lines: Annotated[int, WithReplaceMerge()] = Field(
         default=3, ge=0
     )
+    native_scroll_cursor_shape: Annotated[
+        NativeScrollCursorShape, WithReplaceMerge()
+    ] = "block"
     api_timeout: Annotated[float, WithReplaceMerge()] = DEFAULT_API_TIMEOUT
     api_retry_max_elapsed_time: Annotated[float, WithReplaceMerge()] = (
         DEFAULT_API_RETRY_MAX_ELAPSED_TIME

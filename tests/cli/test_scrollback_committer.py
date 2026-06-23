@@ -632,13 +632,34 @@ def test_render_widget_user_message() -> None:
     assert text.lstrip().startswith(">")
 
 
-def test_user_message_commits_trailing_separator_rule() -> None:
+def test_user_message_renders_band_without_rule() -> None:
     committer = _committer()
     committer.render_widget(UserMessage("first prompt"))
     text = _drain_text(committer)
     assert "first prompt" in text
-    # A horizontal rule (ExpandingSeparator equivalent) follows the prompt.
-    assert "─" in text
+    # The prompt band replaces the old ExpandingSeparator rule: no horizontal
+    # rule follows the prompt anymore.
+    assert "─" not in text
+
+
+def test_user_message_band_uses_dark_background() -> None:
+    committer = ScrollbackCommitter(
+        width_getter=lambda: 80, color_system="truecolor", dark=lambda: True
+    )
+    committer.render_widget(UserMessage("dark prompt"))
+    text = _drain_text(committer)
+    # The warm gray-red dark band (#4a3c3c) is emitted as a truecolor background.
+    assert "48;2;74;60;60" in text
+
+
+def test_user_message_band_uses_light_background() -> None:
+    committer = ScrollbackCommitter(
+        width_getter=lambda: 80, color_system="truecolor", dark=lambda: False
+    )
+    committer.render_widget(UserMessage("light prompt"))
+    text = _drain_text(committer)
+    # The light band (#e3d4d4) is emitted as a truecolor background.
+    assert "48;2;227;212;212" in text
 
 
 def test_user_message_attachment_carries_file_hyperlink(tmp_path: Path) -> None:

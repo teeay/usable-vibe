@@ -1,5 +1,8 @@
 ![Usable Vibe](usable-vibe.png)
 ## Usable Vibe
+[![PyPI Version](https://img.shields.io/pypi/v/uvibe)](https://pypi.org/project/uvibe)
+[![Python Version](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/release/python-3120/)
+[![License](https://img.shields.io/github/license/teeay/usable-vibe)](https://github.com/teeay/usable-vibe/blob/main/LICENSE)
 
 This is a fork and patched version of [Mistral AI's](https://mistral.ai) [Vibe](https://github.com/mistralai/mistral-vibe).
 
@@ -37,18 +40,26 @@ Since fork version 6, there are additional, fork-specific settings.
 ### Additional Settings
 
 Options that are useful or meaningful in the terminal scrollback world of uvibe.
+Set them in `~/.vibe/config.toml`:
 
 **Shortened Tool Output**
 
 Long agent `bash`, `read`, and `grep` outputs are shortened in terminal
 scrollback by default: command/header, first 3 lines, omitted-lines marker, and
-last 3 lines. Manual `!` bash output is always shown in full. To keep full agent
-tool output, add this to `~/.vibe/config.toml`:
+last 3 lines. Manual `!` bash output is always shown in full.
 
 ```toml
 native_scroll_shorten_tool_output = false
 native_scroll_tool_output_head_lines = 3
 native_scroll_tool_output_tail_lines = 3
+```
+
+**Input Cursor Shape**
+
+Default cursor shape is block, can be set to underscore:
+
+```toml
+native_scroll_cursor_shape = "underscore"  # or "block" (default)
 ```
 
 **Upgrades**

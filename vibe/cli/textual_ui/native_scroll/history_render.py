@@ -24,6 +24,8 @@ from vibe.core.types import LLMMessage, Role
 
 _SHORTENABLE_TOOL_NAMES = {"bash", "read", "grep"}
 
+HistoryBlock = tuple[RenderableType, bool]
+
 
 def render_history_blocks(
     messages: Sequence[LLMMessage],
@@ -33,19 +35,21 @@ def render_history_blocks(
     shorten_tool_output: bool = True,
     tool_output_head_lines: int = 3,
     tool_output_tail_lines: int = 3,
-) -> list[RenderableType]:
+    dark: bool = True,
+) -> list[HistoryBlock]:
     """Render resumed history messages to durable scrollback blocks.
 
     ``omitted_count`` is the number of earlier (backfill) messages dropped before
     the committed tail; when non-zero a leading marker records that they exist,
     since native mode does not offer the interactive load-more affordance.
     """
-    blocks: list[RenderableType] = []
+    blocks: list[HistoryBlock] = []
     if omitted_count > 0:
         noun = "message" if omitted_count == 1 else "messages"
-        blocks.append(
-            Text(f"↑ {omitted_count} earlier {noun} omitted", style="dim italic")
-        )
+        blocks.append((
+            Text(f"↑ {omitted_count} earlier {noun} omitted", style="dim italic"),
+            False,
+        ))
 
     for msg in messages:
         if msg.injected:
@@ -53,17 +57,24 @@ def render_history_blocks(
         match msg.role:
             case Role.user:
                 if msg.content or msg.images:
-                    blocks.append(
+                    blocks.append((
                         render_user_prompt(
-                            UserMessage.PROMPT_CHAR, msg.content or "", msg.images
-                        )
-                    )
+                            UserMessage.PROMPT_CHAR,
+                            msg.content or "",
+                            msg.images,
+                            dark=dark,
+                        ),
+                        True,
+                    ))
             case Role.assistant:
                 if msg.content:
-                    blocks.append(Markdown(msg.content))
+                    blocks.append((Markdown(msg.content), True))
                 for tool_call in msg.tool_calls or []:
                     name = tool_call.function.name or "unknown"
-                    blocks.append(Text.assemble(("⚙ ", "cyan"), (name, "bold")))
+                    blocks.append((
+                        Text.assemble(("⚙ ", "cyan"), (name, "bold")),
+                        False,
+                    ))
             case Role.tool:
                 name = msg.name or tool_call_map.get(msg.tool_call_id or "", "tool")
                 if msg.content:
@@ -74,7 +85,7 @@ def render_history_blocks(
                             head_lines=tool_output_head_lines,
                             tail_lines=tool_output_tail_lines,
                         )
-                    blocks.append(_tool_result_block(name, content))
+                    blocks.append((_tool_result_block(name, content), False))
             case _:
                 continue
     return blocks

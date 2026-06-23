@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -31,6 +32,14 @@ def _make_app(
     return ConnectorAuthApp(
         connector_name=connector_name, connector_registry=reg, tool_manager=mgr
     )
+
+
+def _run_worker_mock() -> MagicMock:
+    def run_worker(work: Any, *args: Any, **kwargs: Any) -> None:
+        if inspect.iscoroutine(work):
+            work.close()
+
+    return MagicMock(side_effect=run_worker)
 
 
 class TestConnectorAuthAppInit:
@@ -251,7 +260,7 @@ class TestCloseAndRefresh:
     @pytest.mark.asyncio
     async def test_action_refresh_dispatches_worker(self) -> None:
         app = _make_app()
-        app.run_worker = MagicMock()
+        app.run_worker = _run_worker_mock()
         app.query_one = MagicMock()
 
         await app.action_refresh()

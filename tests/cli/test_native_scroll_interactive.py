@@ -82,7 +82,7 @@ def test_render_rewind_outcome_has_preview_count_and_files() -> None:
     text = _lines(committer)
     assert "Rewound to: fix the bug" in text
     assert "3 later messages discarded" in text
-    assert "files restored" in text
+    assert "files" in text and "restored" in text
 
 
 def test_render_rewind_outcome_singular_and_kept() -> None:

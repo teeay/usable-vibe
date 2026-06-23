@@ -24,6 +24,7 @@ import re
 
 from rich.console import Console, Group, RenderableType
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.text import Text
 from textual.widget import Widget
 
@@ -162,9 +163,11 @@ class ScrollbackCommitter:
         self._tool_output_tail_lines: Callable[[], int] = tool_output_tail_lines or (
             lambda: 3
         )
-        self._queue: list[RenderableType] = []
+        self._queue: list[tuple[RenderableType, bool]] = []
         self._assistant_buffer = ""
         self._reasoning_buffer = ""
+        self._indent_left = 8
+        self._indent_right = 4
         # The reasoning header ("✻ Thinking") is emitted once per reasoning run;
         # subsequent committed paragraphs of the same run omit it so a streamed
         # multi-paragraph reasoning block is not repeatedly re-headed.
@@ -182,10 +185,10 @@ class ScrollbackCommitter:
     def has_pending(self) -> bool:
         return bool(self._queue)
 
-    def _enqueue(self, block: RenderableType) -> None:
+    def _enqueue(self, block: RenderableType, *, is_full_width: bool = False) -> None:
         if self._closed:
             return
-        self._queue.append(block)
+        self._queue.append((block, is_full_width))
         self._refresh()
 
     def drain_lines(self) -> list[str]:
@@ -200,7 +203,9 @@ class ScrollbackCommitter:
         self._queue = []
         width = max(1, self._width_getter())
         lines: list[str] = []
-        for block in blocks:
+        for block, is_full_width in blocks:
+            if not is_full_width:
+                block = Padding(block, (0, self._indent_right, 0, self._indent_left))
             lines.extend(self._render_block(block, width))
             lines.append("")
         return lines
@@ -237,13 +242,13 @@ class ScrollbackCommitter:
             self._assistant_buffer
         )
         if commit.strip():
-            self._enqueue(Markdown(commit))
+            self._enqueue(Markdown(commit), is_full_width=True)
 
     def _flush_assistant(self) -> None:
         buffer = self._assistant_buffer
         self._assistant_buffer = ""
         if buffer.strip():
-            self._enqueue(Markdown(buffer))
+            self._enqueue(Markdown(buffer), is_full_width=True)
 
     def _commit_ready_reasoning(self) -> None:
         commit, self._reasoning_buffer = self._split_committable_blocks(
@@ -485,15 +490,16 @@ class ScrollbackCommitter:
         a leading marker records any earlier messages dropped before the tail.
         """
         self.flush()
-        for block in render_history_blocks(
+        for block, is_full_width in render_history_blocks(
             messages,
             tool_call_map,
             omitted_count=omitted_count,
             shorten_tool_output=self._shorten_tool_output(),
             tool_output_head_lines=self._tool_output_head_lines(),
             tool_output_tail_lines=self._tool_output_tail_lines(),
+            dark=self._dark(),
         ):
-            self._enqueue(block)
+            self._enqueue(block, is_full_width=is_full_width)
 
     def commit_startup_header(self, *, version: str, model: str, cwd: str) -> None:
         """Commit the compact durable session header once at startup."""
@@ -599,9 +605,13 @@ class ScrollbackCommitter:
         """
         if self._closed:
             return False
-        block = render_widget_block(widget)
+        block = render_widget_block(widget, dark=self._dark())
         if block is None:
             return False
         self.flush()
-        self._enqueue(block)
+        # User prompts render at full width
+        from vibe.cli.textual_ui.widgets.messages import UserMessage
+
+        is_full_width_flag = isinstance(widget, UserMessage) and not widget.pending
+        self._enqueue(block, is_full_width=is_full_width_flag)
         return True

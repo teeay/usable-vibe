@@ -14,7 +14,7 @@ from collections.abc import Sequence
 
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown
-from rich.rule import Rule
+from rich.padding import Padding
 from rich.style import Style
 from rich.text import Text
 from textual.widget import Widget
@@ -34,13 +34,23 @@ from vibe.cli.textual_ui.widgets.messages import (
 from vibe.core.hooks.models import HookMessageSeverity, HookType
 from vibe.core.types import FileImageSource, ImageAttachment, InlineImageSource
 
+# User-prompt band: a warm gray-red background that sets prompts apart from the
+# response transcript without a separator rule. These are deliberate RGB values,
+# not ANSI-palette colors — the 16-color ANSI set has no desaturated red-gray, so
+# this is the one fixed color in the prompt block even under ANSI themes. The
+# light/dark variants are chosen by the active theme's darkness.
+_PROMPT_BAND_DARK = Style(color="bright_white", bgcolor="#4a3c3c")
+_PROMPT_BAND_LIGHT = Style(color="black", bgcolor="#e3d4d4")
 
-def render_widget_block(widget: Widget) -> RenderableType | None:  # noqa: PLR0911
+
+def render_widget_block(  # noqa: PLR0911
+    widget: Widget, *, dark: bool = True
+) -> RenderableType | None:
     if isinstance(widget, UserMessage):
         if widget.pending:
             return None  # Queued prompts stay live until drained.
         return render_user_prompt(
-            widget.PROMPT_CHAR, widget.get_content(), widget._images
+            widget.PROMPT_CHAR, widget.get_content(), widget._images, dark=dark
         )
     if isinstance(widget, UserCommandMessage):
         return Markdown(widget._content)
@@ -98,16 +108,24 @@ def _hook_run_header(scope: HookType, tool_name: str | None) -> str:
 
 
 def render_user_prompt(
-    prompt_char: str, content: str, images: list[ImageAttachment] | None = None
+    prompt_char: str,
+    content: str,
+    images: list[ImageAttachment] | None = None,
+    *,
+    dark: bool = True,
 ) -> RenderableType:
-    prompt = Text.assemble((f"{prompt_char} ", "bold cyan"), (content, "bold"))
+    # The prompt marker stays bold; color comes from the band so the text reads
+    # white on the dark band and black on the light band, per the band style.
+    prompt = Text.assemble((f"{prompt_char} ", "bold"), (content, ""))
     rows: list[RenderableType] = [prompt]
     if images:
         rows.append(_attachments_line(images))
-    # Mirror the widget's ExpandingSeparator so consecutive prompts stay
-    # visually delimited in native scrollback.
-    rows.append(Rule(style="dim", characters="─"))
-    return Group(*rows)
+    body: RenderableType = Group(*rows) if len(rows) > 1 else prompt
+    # A full-width warm gray-red band sets the prompt apart from the response
+    # transcript; it replaces the previous ExpandingSeparator rule. ``expand``
+    # fills the band to the terminal width so the background spans the whole row.
+    band = _PROMPT_BAND_DARK if dark else _PROMPT_BAND_LIGHT
+    return Padding(body, (0, 1), style=band, expand=True)
 
 
 def _attachments_line(images: list[ImageAttachment]) -> RenderableType:

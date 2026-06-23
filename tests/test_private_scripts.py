@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shlex
 import stat
@@ -76,6 +77,64 @@ def test_private_run_reports_shared_and_fork_homes(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert f"VIBE_HOME: {tmp_path / 'shared'}" in result.stderr
     assert f"UVIBE_HOME: {tmp_path / 'fork-state'}" in result.stderr
+
+
+def test_patch_pyproject_adds_release_project_icon_url(tmp_path: Path) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        dedent(
+            """\
+            [project]
+            name = "mistral-vibe"
+            version = "2.17.1"
+            description = "Minimal CLI coding agent by Mistral"
+            authors = [{ name = "Mistral AI" }]
+            keywords = ["ai", "mistral", "developer-tools"]
+
+            [project.urls]
+            Homepage = "https://github.com/mistralai/mistral-vibe"
+
+            [project.scripts]
+            vibe = "vibe.cli.entrypoint:main"
+            vibe-acp = "vibe.acp.entrypoint:main"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(REPO_ROOT),
+            "--directory",
+            str(tmp_path),
+            "python",
+            str(REPO_ROOT / "private/scripts/patch_pyproject.py"),
+        ],
+        capture_output=True,
+        check=False,
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "DIST_NAME": "uvibe",
+            "SCRIPT_NAME": "uvibe",
+            "DISPLAY_NAME": "Usable Vibe",
+            "AUTHOR_NAME": "Mistral AI, edited by TeeAy",
+            "REPO_URL": "https://github.com/teeay/usable-vibe",
+            "DOCS_URL": "https://teeay.dev/oss/uvibe",
+            "ICON_URL": "https://teeay.dev/images/oss/usable-vibe-icon.png",
+            "UPSTREAM_DISPLAY": "Mistral Vibe",
+            "FORK_VERSION": "2.17.1.6",
+        },
+        text=True,
+    )
+
+    assert result.returncode == 0
+    rendered = pyproject.read_text(encoding="utf-8")
+    assert 'name = "uvibe"' in rendered
+    assert 'Icon = "https://teeay.dev/images/oss/usable-vibe-icon.png"' in rendered
 
 
 def test_remove_upstream_readme_install_section_preserves_surrounding_content(

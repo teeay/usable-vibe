@@ -29,6 +29,17 @@ def test_native_scroll_tool_output_env_overrides(
     assert config.native_scroll_tool_output_tail_lines == 2
 
 
+def test_native_scroll_cursor_shape_defaults_to_block() -> None:
+    assert VibeConfig().native_scroll_cursor_shape == "block"
+
+
+def test_native_scroll_cursor_shape_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VIBE_NATIVE_SCROLL_CURSOR_SHAPE", "underscore")
+    assert VibeConfig().native_scroll_cursor_shape == "underscore"
+
+
 def test_vibe_config_schema_covers_all_vibe_config_fields() -> None:
     legacy_fields = set(VibeConfig.model_fields.keys())
     schema_fields = set(VibeConfigSchema.model_fields.keys())

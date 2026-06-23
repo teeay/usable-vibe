@@ -70,6 +70,18 @@ def test_shorten_text_middle_supports_zero_head_or_tail() -> None:
     )
 
 
+def test_shorten_text_middle_keeps_full_text_when_only_one_line_omitted() -> None:
+    # With 7 lines and head=3, tail=3, we would omit 1 line.
+    # The function should return the full text instead of replacing 1 line with a marker.
+    text = "\n".join(f"line {i}" for i in range(1, 8))
+    result = shorten_text_middle(text, head_lines=3, tail_lines=3)
+    assert result == text
+    # Also test with head=0, tail=6 (7 lines total, would omit 1)
+    assert shorten_text_middle(text, head_lines=0, tail_lines=6) == text
+    # And head=6, tail=0
+    assert shorten_text_middle(text, head_lines=6, tail_lines=0) == text
+
+
 def test_bash_body_shortens_long_output_by_default() -> None:
     result = BashResult(
         command="ls",

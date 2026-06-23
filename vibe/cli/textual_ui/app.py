@@ -25,6 +25,7 @@ from textual._compositor import InlineUpdate
 from textual.app import WINDOWS, App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalGroup, VerticalScroll
+from textual.css.query import NoMatches
 from textual.driver import Driver
 from textual.events import AppBlur, AppFocus, MouseUp, Resize
 from textual.geometry import Offset
@@ -744,6 +745,15 @@ class VibeApp(App):  # noqa: PLR0904
         # internal chat scroll. Collapse it so the inline render is only the
         # live control region (loading/status, input, bottom bar).
         self._chat_widget.display = False
+        # The Banner lives in the hidden #chat and is never shown in native
+        # mode, but its PetitChat intro animation runs a 0.16s timer that keeps
+        # repainting the inline live region (~6 frames/second) indefinitely,
+        # which is a constant idle redraw. Upstream only freezes the animation on
+        # the first prompt submit; in native mode we freeze it immediately so an
+        # idle session produces no inline frames at all.
+        if self._banner is not None:
+            self._banner.freeze_animation()
+        self._apply_caret_shape()
         self._committer = ScrollbackCommitter(
             width_getter=lambda: self.size.width,
             refresh=self.refresh,
@@ -817,6 +827,14 @@ class VibeApp(App):  # noqa: PLR0904
 
         gc.collect()
         gc.freeze()
+
+    def _apply_caret_shape(self) -> None:
+        """Apply the configured input caret shape (block / underscore)."""
+        try:
+            text_area = self.query_one(ChatTextArea)
+        except NoMatches:
+            return
+        text_area.caret_shape = self.config.native_scroll_cursor_shape
 
     def _show_config_issues(self) -> None:
         for issue in (
@@ -2689,6 +2707,7 @@ class VibeApp(App):  # noqa: PLR0904
                     plan_description=plan_title(self._plan_info),
                 )
             self._show_config_issues()
+            self._apply_caret_shape()
             # Single durable outcome line: callers that have a specific outcome
             # (model/thinking/config changes) pass it so the reload does not also
             # commit the generic notice (one outcome per action).

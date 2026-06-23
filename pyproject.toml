@@ -1,7 +1,7 @@
 [project]
 name = "uvibe"
-version = "2.17.1.6"
-description = "Usable Vibe - CLI coding agent fork of Mistral Vibe"
+version = "2.17.1.7"
+description = "Usable Vibe - fork of Mistral Vibe with terminal scrollback"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -123,6 +123,7 @@ Homepage = "https://github.com/teeay/usable-vibe"
 Repository = "https://github.com/teeay/usable-vibe"
 Issues = "https://github.com/teeay/usable-vibe/issues"
 Documentation = "https://teeay.dev/oss/uvibe"
+Icon = "https://teeay.dev/images/oss/usable-vibe-icon.png"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs", "editables"]

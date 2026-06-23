@@ -6,6 +6,7 @@ from typing import Any, ClassVar, Literal
 from textual import events
 from textual.binding import Binding
 from textual.message import Message
+from textual.reactive import Reactive, reactive
 from textual.widgets import TextArea
 
 from vibe.cli.autocompletion.base import CompletionResult
@@ -24,11 +25,53 @@ from vibe.cli.voice_manager.voice_manager_port import (
     TranscribeState,
     VoiceManagerPort,
 )
+from vibe.core.config._settings import NativeScrollCursorShape
 
 InputMode = Literal["!", "/", ">", "&"]
 
 
 class ChatTextArea(TextArea):
+    # The base TextArea draws its caret by reverse-styling the cell under the
+    # cursor. Under the fork's ansi themes that resolves to `reverse` over a
+    # default/ANSI-black pair, which on the usual end-of-line (blank) caret cell
+    # renders as the terminal's default background — invisible. Override the
+    # caret so it is actually visible without relying on the host terminal
+    # cursor. The shape is configurable (``native_scroll_cursor_shape``): the
+    # default is a full block (a solid `$block-cursor-*` cell, no reverse), and
+    # the alternate is a plain underscore (underline), selected by the
+    # ``-caret-underscore`` class via the ``caret_shape`` reactive.
+    DEFAULT_CSS = """
+    ChatTextArea {
+        & .text-area--cursor {
+            background: $block-cursor-background;
+            color: $block-cursor-foreground;
+            text-style: none;
+        }
+        &.-caret-underscore .text-area--cursor {
+            background: transparent;
+            color: $foreground;
+            text-style: underline;
+        }
+        &:ansi {
+            & .text-area--cursor {
+                background: $block-cursor-background;
+                color: $block-cursor-foreground;
+                text-style: none;
+            }
+            &.-caret-underscore .text-area--cursor {
+                background: transparent;
+                text-style: underline;
+            }
+        }
+    }
+    """
+
+    # Caret shape, driven by config; see VibeApp wiring. Default is a full block.
+    caret_shape: Reactive[NativeScrollCursorShape] = reactive("block")
+
+    def watch_caret_shape(self, shape: NativeScrollCursorShape) -> None:
+        self.set_class(shape == "underscore", "-caret-underscore")
+
     BINDINGS: ClassVar[list[Binding]] = [
         Binding(
             "shift+enter,ctrl+j",
@@ -43,6 +86,21 @@ class ChatTextArea(TextArea):
     ]
 
     DEFAULT_MODE: ClassVar[Literal[">"]] = ">"
+
+    # Native-scroll patch point: the chat input never uses Textual's blinking
+    # caret. The base TextArea blink timer (``_toggle_cursor_blink_visible``,
+    # fired every 0.5s while focused) refreshes the input line, and in inline
+    # mode each such refresh emits a full ``InlineUpdate`` frame, which repaints
+    # the whole live region twice a second at idle. Forcing ``cursor_blink`` off
+    # pauses the timer (no idle frames) and keeps the underscore caret above
+    # steadily visible. The ``False`` default covers the initial on-mount focus
+    # so the timer never starts; ``validate_cursor_blink`` coerces every later
+    # assignment so no caller (``set_app_focus``, recording start/stop) can
+    # re-enable blinking.
+    cursor_blink: Reactive[bool] = reactive(False, init=False)
+
+    def validate_cursor_blink(self, value: bool) -> bool:
+        return False
 
     class Submitted(Message):
         def __init__(self, value: str) -> None:

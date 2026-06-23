@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+import inspect
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -60,6 +61,14 @@ def _make_tool_manager(
     mgr.registered_tools = all_tools
     mgr.available_tools = available_tools if available_tools is not None else all_tools
     return mgr
+
+
+def _run_worker_mock() -> MagicMock:
+    def run_worker(work: Any, *args: Any, **kwargs: Any) -> None:
+        if inspect.iscoroutine(work):
+            work.close()
+
+    return MagicMock(side_effect=run_worker)
 
 
 class TestCollectMcpToolIndex:
@@ -180,7 +189,7 @@ class TestMCPAppInit:
         )
         app._viewing_server = "srv"
         app._set_help_text = MagicMock()
-        app.run_worker = MagicMock()
+        app.run_worker = _run_worker_mock()
 
         await app.action_refresh()
 

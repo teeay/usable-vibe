@@ -130,6 +130,7 @@ file_watcher_for_autocomplete = false
 native_scroll_shorten_tool_output = true       # Shorten long agent bash/read/grep output
 native_scroll_tool_output_head_lines = 3       # Leading output lines to keep
 native_scroll_tool_output_tail_lines = 3       # Trailing output lines to keep
+native_scroll_cursor_shape = "block"           # Input caret shape: "block" or "underscore"
 
 # Behavior
 bypass_tool_permissions = false    # Skip tool approval prompts
