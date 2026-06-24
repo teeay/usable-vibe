@@ -127,11 +127,21 @@ class LoadingWidget(SpinnerMixin, Static):
     def pause_timer(self) -> None:
         if self._pause_start is None:
             self._pause_start = time()
+            # Native-scroll patch point: while a dialog waits on user input the
+            # agent is effectively paused, so freeze the spinner animation too.
+            # In inline mode each 0.1s spinner frame refresh emits a full
+            # ``InlineUpdate`` frame that repaints the whole live region (and the
+            # active approval/question form). Pausing the timer freezes the
+            # current frame with no idle redraws; ``resume_timer`` restarts it.
+            if self._spinner_timer is not None:
+                self._spinner_timer.pause()
 
     def resume_timer(self) -> None:
         if self._pause_start is not None:
             self._paused_total += time() - self._pause_start
             self._pause_start = None
+            if self._spinner_timer is not None:
+                self._spinner_timer.resume()
 
     def set_status(self, status: str) -> None:
         self.status = self._apply_easter_egg(status)

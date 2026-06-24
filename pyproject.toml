@@ -1,6 +1,6 @@
 [project]
 name = "uvibe"
-version = "2.17.1.7"
+version = "2.17.1.8"
 description = "Usable Vibe - fork of Mistral Vibe with terminal scrollback"
 readme = "README.md"
 requires-python = ">=3.12"
