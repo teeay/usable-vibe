@@ -116,7 +116,10 @@ def render_user_prompt(
 ) -> RenderableType:
     # The prompt marker stays bold; color comes from the band so the text reads
     # white on the dark band and black on the light band, per the band style.
-    prompt = Text.assemble((f"{prompt_char} ", "bold"), (content, ""))
+    band = _PROMPT_BAND_DARK if dark else _PROMPT_BAND_LIGHT
+    prompt = Text.assemble(
+        (f"{prompt_char} ", band + Style(bold=True)), (content, band)
+    )
     rows: list[RenderableType] = [prompt]
     if images:
         rows.append(_attachments_line(images))
@@ -124,7 +127,6 @@ def render_user_prompt(
     # A full-width warm gray-red band sets the prompt apart from the response
     # transcript; it replaces the previous ExpandingSeparator rule. ``expand``
     # fills the band to the terminal width so the background spans the whole row.
-    band = _PROMPT_BAND_DARK if dark else _PROMPT_BAND_LIGHT
     return Padding(body, (0, 1), style=band, expand=True)
 
 

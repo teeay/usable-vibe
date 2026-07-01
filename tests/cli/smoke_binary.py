@@ -35,6 +35,7 @@ def _fail(msg: str) -> NoReturn:
 def _isolated_env(vibe_home: Path, uvibe_home: Path | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env["VIBE_HOME"] = str(vibe_home)
+    env["VIBE_TEST_DISABLE_KEYRING"] = "1"
     env["UVIBE_HOME"] = str(uvibe_home or vibe_home.parent / "uvibe-home")
     env["TERM"] = env.get("TERM") or "xterm-256color"
     env.pop("MISTRAL_API_KEY", None)

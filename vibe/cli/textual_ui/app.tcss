@@ -4,6 +4,10 @@ $mistral_orange: #FF8205;
     scrollbar-size: 1 1;
 }
 
+*:ansi {
+    link-color-hover: $ansi-background;
+}
+
 Screen {
     background: transparent;
     border: none;
@@ -357,6 +361,21 @@ Markdown {
     &:ansi {
         text-style: dim;
     }
+}
+
+.user-message-attachment-line {
+    width: 100%;
+    height: auto;
+}
+
+.user-message-attachment-label {
+    width: auto;
+    height: auto;
+}
+
+.user-message-attachment-link {
+    width: auto;
+    height: auto;
 }
 
 .user-message-prompt {
@@ -726,6 +745,14 @@ StatusMessage {
     &.error {
         color: $error;
     }
+
+    &.muted {
+        color: $text-muted;
+
+        &:ansi {
+            text-style: dim;
+        }
+    }
 }
 
 .status-indicator-text {
@@ -750,6 +777,15 @@ StatusMessage {
     width: 100%;
     height: auto;
     margin-top: 1;
+}
+
+.tool-call-header .status-indicator-text {
+    width: 1fr;
+    text-wrap: wrap;
+}
+
+.tool-call-header .status-indicator-suffix {
+    width: auto;
 }
 
 .tool-call.no-gap {
@@ -865,20 +901,35 @@ StatusMessage {
     color: $warning;
 }
 
+.diff-scroll {
+    width: 1fr;
+    height: auto;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-size-horizontal: 1;
+
+    .collapsible-section,
+    VerticalGroup {
+        width: auto;
+    }
+}
+
 .diff-removed,
 .diff-added,
 .diff-context {
-    width: 100%;
-    height: auto;
+    width: auto;
+    min-width: 100%;
+    height: 1;
 
     .diff-gutter {
         width: auto;
-        height: auto;
+        height: 1;
     }
 
     .diff-body {
-        width: 1fr;
-        height: auto;
+        width: auto;
+        height: 1;
+        text-wrap: nowrap;
     }
 }
 
@@ -1015,7 +1066,7 @@ StatusMessage {
 
 }
 
-#config-app, #voice-app, #mcp-app, #connectorauth-app {
+#config-app, #voice-app, #mcp-app, #connectorauth-app, #mcpoauth-app {
     width: 100%;
     height: auto;
     background: transparent;
@@ -1024,7 +1075,7 @@ StatusMessage {
     margin: 0;
 }
 
-#config-content, #voice-content, #mcp-content, #connectorauth-content {
+#config-content, #voice-content, #mcp-content, #connectorauth-content, #mcpoauth-content {
     width: 100%;
     height: auto;
 }
@@ -1035,17 +1086,17 @@ StatusMessage {
     color: $primary;
 }
 
-#config-options, #mcp-options, #connectorauth-options {
+#config-options, #mcp-options, #connectorauth-options, #mcpoauth-options {
     width: 100%;
     max-height: 50vh;
     border: none;
 }
 
-#config-options:focus, #mcp-options:focus, #connectorauth-options:focus {
+#config-options:focus, #mcp-options:focus, #connectorauth-options:focus, #mcpoauth-options:focus {
     border: none;
 }
 
-#connectorauth-detail {
+#connectorauth-detail, #mcpoauth-detail {
     margin: 1 0;
 }
 
@@ -1398,11 +1449,6 @@ NarratorStatus {
             content-align: left middle;
         }
     }
-
-    link-style: none;
-    link-background-hover: transparent;
-    link-style-hover: underline;
-    link-color-hover: $mistral_orange;
 }
 
 .whats-new-message.after-history {
@@ -1425,11 +1471,6 @@ NarratorStatus {
             margin-bottom: 0;
         }
     }
-
-    link-style: none;
-    link-background-hover: transparent;
-    link-style-hover: underline;
-    link-color-hover: $mistral_orange;
 }
 
 #sessionpicker-app {

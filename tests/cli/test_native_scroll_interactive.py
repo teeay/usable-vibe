@@ -23,6 +23,7 @@ from vibe.cli.textual_ui.native_scroll.app_surfaces import (
 from vibe.cli.textual_ui.scrollback_committer import ScrollbackCommitter
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.connector_auth_app import ConnectorAuthApp
+from vibe.cli.textual_ui.widgets.mcp_oauth_app import MCPOAuthApp
 from vibe.cli.textual_ui.widgets.model_picker import ModelPickerApp
 from vibe.cli.textual_ui.widgets.rewind_app import RewindApp
 from vibe.cli.textual_ui.widgets.theme_picker import ThemePickerApp
@@ -321,6 +322,26 @@ async def test_connector_auth_refresh_commits_outcome(
         # UserCommandMessage renders Markdown, so the inline-code backticks around
         # the connector name are not present in the rendered text.
         assert "Connector github authenticated." in _plain(app._committer)
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_refresh_commits_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_vibe_app()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._committer is not None
+        app._committer.drain_lines()
+        monkeypatch.setattr(app, "_refresh_mcp_browser", AsyncMock())
+        monkeypatch.setattr(app, "_show_mcp", AsyncMock())
+
+        await app.on_mcpoauth_app_mcpoauth_closed(
+            MCPOAuthApp.MCPOAuthClosed(refreshed=True, server_name="linear")
+        )
+        await pilot.pause()
+
+        assert "MCP server linear authenticated." in _plain(app._committer)
 
 
 # -- integration: index-based rewind ---------------------------------------

@@ -1,39 +1,20 @@
 from __future__ import annotations
 
-from vibe.core.config._settings import (
+from vibe.core.config._defaults import (
     DEFAULT_CONSOLE_BASE_URL,
     DEFAULT_MISTRAL_API_ENV_KEY,
+    DEFAULT_MISTRAL_SERVER_URL,
+    DEFAULT_THEME,
+    DEFAULT_VIBE_BASE_URL,
+)
+from vibe.core.config._settings import (
     DEFAULT_MODELS,
     DEFAULT_PROVIDERS,
-    DEFAULT_THEME,
     DEFAULT_TRANSCRIBE_MODELS,
     DEFAULT_TRANSCRIBE_PROVIDERS,
     DEFAULT_TTS_MODELS,
     DEFAULT_TTS_PROVIDERS,
-    DEFAULT_VIBE_BASE_URL,
-    THINKING_LEVELS,
-    ConnectorConfig,
-    ExperimentsConfig,
-    MCPHttp,
-    MCPOAuth,
-    MCPServer,
-    MCPStaticAuth,
-    MCPStdio,
-    MCPStreamableHttp,
-    MissingAPIKeyError,
-    ModelConfig,
-    OtelSpanExporterConfig,
-    ProjectContextConfig,
-    ProviderConfig,
-    SessionLoggingConfig,
-    ThinkingLevel,
     TomlFileSettingsSource,
-    TranscribeClient,
-    TranscribeModelConfig,
-    TranscribeProviderConfig,
-    TTSClient,
-    TTSModelConfig,
-    TTSProviderConfig,
     VibeConfig,
     load_dotenv_values,
     resolve_api_key,
@@ -50,6 +31,30 @@ from vibe.core.config.layer import (
     TrustNotResolvedError,
     TrustResolutionError,
     UntrustedLayerError,
+)
+from vibe.core.config.models import (
+    THINKING_LEVELS,
+    ConnectorConfig,
+    ExperimentsConfig,
+    MCPHttp,
+    MCPOAuth,
+    MCPServer,
+    MCPStaticAuth,
+    MCPStdio,
+    MCPStreamableHttp,
+    MissingAPIKeyError,
+    ModelConfig,
+    OtelSpanExporterConfig,
+    ProjectContextConfig,
+    ProviderConfig,
+    SessionLoggingConfig,
+    ThinkingLevel,
+    TranscribeClient,
+    TranscribeModelConfig,
+    TranscribeProviderConfig,
+    TTSClient,
+    TTSModelConfig,
+    TTSProviderConfig,
 )
 from vibe.core.config.patch import (
     AddOperationPatch,
@@ -70,13 +75,19 @@ from vibe.core.config.schema import (
     WithShallowMerge,
     WithUnionMerge,
 )
-from vibe.core.config.types import MISSING_CONFIG_FILE_FINGERPRINT, LayerConfigSnapshot
+from vibe.core.config.types import (
+    MISSING_BACKING_STORE_DATA_FINGERPRINT,
+    ConfigChangeCallback,
+    ConfigChangeEvent,
+    LayerConfigSnapshot,
+)
 from vibe.core.config.vibe_schema import VibeConfigSchema
 from vibe.core.prompts import MissingPromptFileError
 
 __all__ = [
     "DEFAULT_CONSOLE_BASE_URL",
     "DEFAULT_MISTRAL_API_ENV_KEY",
+    "DEFAULT_MISTRAL_SERVER_URL",
     "DEFAULT_MODELS",
     "DEFAULT_PROVIDERS",
     "DEFAULT_THEME",
@@ -85,9 +96,11 @@ __all__ = [
     "DEFAULT_TTS_MODELS",
     "DEFAULT_TTS_PROVIDERS",
     "DEFAULT_VIBE_BASE_URL",
-    "MISSING_CONFIG_FILE_FINGERPRINT",
+    "MISSING_BACKING_STORE_DATA_FINGERPRINT",
     "THINKING_LEVELS",
     "AddOperationPatch",
+    "ConfigChangeCallback",
+    "ConfigChangeEvent",
     "ConfigDefinitionError",
     "ConfigFragment",
     "ConfigLayer",

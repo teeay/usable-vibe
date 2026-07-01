@@ -16,10 +16,10 @@ from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 from vibe.core import agent_loop as agent_loop_module
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.config import MCPStdio
-from vibe.core.telemetry.types import TerminalEmulator
+from vibe.core.telemetry.types import LaunchContext, TerminalEmulator
 from vibe.core.tools.manager import ToolManager
 from vibe.core.tools.mcp import AuthStatus
-from vibe.core.tools.mcp.tools import RemoteTool
+from vibe.core.tools.remote import RemoteTool
 
 
 def _build_uninitiated_loop(**kwargs):
@@ -67,8 +67,8 @@ class TestCompleteInit:
         loop = _build_uninitiated_loop(config=config)
 
         with patch.object(
-            loop.tool_manager._mcp_registry,
-            "get_tools_async",
+            loop.tool_manager,
+            "integrate_all",
             side_effect=RuntimeError("mcp discovery boom"),
         ):
             _run_init(loop)
@@ -76,6 +76,20 @@ class TestCompleteInit:
         assert loop.is_initialized
         assert isinstance(loop._init_error, RuntimeError)
         assert str(loop._init_error) == "mcp discovery boom"
+
+    def test_delays_connector_registry_until_deferred_init(self) -> None:
+        config = build_test_vibe_config(enable_connectors=True)
+        with patch.object(AgentLoop, "_start_deferred_init"):
+            loop = AgentLoop(
+                config=config, backend=FakeBackend(), defer_heavy_init=True
+            )
+
+        assert loop.connector_registry is None
+
+        with patch.object(loop.tool_manager, "integrate_all"):
+            _run_init(loop)
+
+        assert loop.connector_registry is not None
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +247,27 @@ class TestDeferredInitPublicMethods:
         assert loop.is_initialized
 
     @pytest.mark.asyncio
+    async def test_reload_creates_shared_mcp_registry_after_servers_are_added(
+        self,
+    ) -> None:
+        loop = build_test_agent_loop(defer_heavy_init=True, mcp_registry=None)
+        await loop.wait_until_ready()
+        assert loop.mcp_registry is None
+
+        mcp_server = MCPStdio(name="srv", transport="stdio", command="echo")
+        config = build_test_vibe_config(mcp_servers=[mcp_server])
+        registry = FakeMCPRegistry()
+
+        with (
+            patch.object(AgentLoop, "_create_mcp_registry", return_value=registry),
+            patch.object(ToolManager, "integrate_all"),
+        ):
+            await loop.reload_with_initial_messages(base_config=config)
+
+        assert loop.mcp_registry is registry
+        assert loop.tool_manager._mcp_registry is registry
+
+    @pytest.mark.asyncio
     async def test_switch_agent_waits_for_deferred_init(self) -> None:
         loop = build_test_agent_loop(defer_heavy_init=True)
 
@@ -336,7 +371,15 @@ class TestStartInitializeExperiments:
 
     @pytest.mark.asyncio
     async def test_refreshes_system_prompt_when_experiments_update(self) -> None:
-        loop = build_test_agent_loop(terminal_emulator=TerminalEmulator.VSCODE)
+        loop = build_test_agent_loop(
+            launch_context=LaunchContext(
+                agent_entrypoint="cli",
+                agent_version="1.0.0",
+                client_name="vibe_cli",
+                client_version="1.0.0",
+                terminal_emulator=TerminalEmulator.VSCODE,
+            )
+        )
         refresh_mock = AsyncMock()
         init_mock = AsyncMock(return_value=True)
 
@@ -352,21 +395,31 @@ class TestStartInitializeExperiments:
         init_mock.assert_awaited_once()
         init_args = init_mock.await_args
         assert init_args is not None
-        assert init_args.kwargs["terminal_emulator"] is TerminalEmulator.VSCODE
+        assert (
+            init_args.kwargs["launch_context"].terminal_emulator
+            is TerminalEmulator.VSCODE
+        )
 
     def test_new_session_telemetry_uses_provided_terminal_emulator(self) -> None:
-        loop = build_test_agent_loop(terminal_emulator=TerminalEmulator.VSCODE)
-        send_new_session = MagicMock()
+        loop = build_test_agent_loop(
+            launch_context=LaunchContext(
+                agent_entrypoint="cli",
+                agent_version="1.0.0",
+                client_name="vibe_cli",
+                client_version="1.0.0",
+                terminal_emulator=TerminalEmulator.VSCODE,
+            )
+        )
+        send_event = MagicMock()
 
         with patch.object(
-            loop.telemetry_client, "send_new_session", new=send_new_session
+            loop.telemetry_client, "send_telemetry_event", new=send_event
         ):
             loop.emit_new_session_telemetry()
 
-        assert (
-            send_new_session.call_args.kwargs["terminal_emulator"]
-            is TerminalEmulator.VSCODE
-        )
+        payload = send_event.call_args.args[1]
+        assert payload["terminal_emulator"] == "vscode"
+        assert type(payload["terminal_emulator"]) is str
 
     @pytest.mark.asyncio
     async def test_does_not_refresh_system_prompt_when_experiments_unchanged(

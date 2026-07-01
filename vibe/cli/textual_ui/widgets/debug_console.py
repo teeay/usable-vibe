@@ -28,6 +28,7 @@ LOG_LEVEL_COLORS: dict[str, str] = {
 }
 
 DEFAULT_LOG_PAGE_SIZE = 30
+_EMPTY_STYLE = Style()
 
 
 class _LogView(ScrollView, can_focus=True):
@@ -132,7 +133,7 @@ class _LogView(ScrollView, can_focus=True):
             segments = [
                 seg
                 if seg.style is not None
-                else Segment(seg.text, Style.null(), seg.control)
+                else Segment(seg.text, _EMPTY_STYLE, seg.control)
                 for seg in line_text.render(self.app.console)
             ]
             strip = Strip(segments, line_text.cell_len)

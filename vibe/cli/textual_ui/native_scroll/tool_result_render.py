@@ -264,14 +264,16 @@ def _strip_line_numbers(content: str) -> str:
 def _render_edit_result(
     result: EditResult, *, dark: bool, ansi: bool
 ) -> RenderableType:
-    rows = _diff_rows(
-        result.old_string,
-        result.new_string,
-        _language_for_path(result.file),
-        result.ui_start_lines,
-        dark=dark,
-        ansi=ansi,
-    )
+    language = _language_for_path(result.file)
+    rows: list[RenderableType] = []
+    for index, (start_line, old_string, new_string) in enumerate(result.ui_occurrences):
+        if index:
+            rows.append(Text("⋯", style="dim"))  # gap between occurrences
+        rows.extend(
+            _diff_rows(
+                old_string, new_string, language, start_line, dark=dark, ansi=ansi
+            )
+        )
     return Group(*rows) if len(rows) != 1 else rows[0]
 
 
@@ -279,7 +281,7 @@ def _diff_rows(
     old_string: str,
     new_string: str,
     language: str,
-    start_lines: list[int] | None,
+    start_line: int | None,
     *,
     dark: bool,
     ansi: bool,
@@ -294,15 +296,7 @@ def _diff_rows(
         )
     )[2:]  # drop the ``--- / +++`` file headers; the gutter carries position.
 
-    if not start_lines:
-        return _diff_occurrence_rows(diff_lines, None, syntax, ansi=ansi)
-
-    rows: list[RenderableType] = []
-    for index, start_line in enumerate(start_lines):
-        if index:
-            rows.append(Text("⋯", style="dim"))  # gap between occurrences
-        rows.extend(_diff_occurrence_rows(diff_lines, start_line, syntax, ansi=ansi))
-    return rows
+    return _diff_occurrence_rows(diff_lines, start_line, syntax, ansi=ansi)
 
 
 def _diff_occurrence_rows(

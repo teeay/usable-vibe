@@ -216,6 +216,7 @@ class ScrollbackCommitter:
             file=StringIO(),
             force_terminal=True,
             color_system=self._color_system,  # type: ignore[arg-type]
+            no_color=self._color_system is None,
             highlight=False,
             soft_wrap=False,
         )

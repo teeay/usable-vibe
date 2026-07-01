@@ -38,6 +38,7 @@ with an installed upstream Vibe.
   .env                 # API keys and credentials (dotenv format)
   vibehistory          # Command history
   trusted_folders.toml # Trust database for project folders
+  connector_bootstrap_cache.json # Short-lived connector discovery cache
   agents/              # Custom agent profiles (*.toml)
   prompts/             # Custom prompts (*.md)
   skills/              # User-level skills (each skill is a subdirectory with SKILL.md)
@@ -75,7 +76,9 @@ When in a trusted folder, Vibe also looks for project-local configuration:
 Chat input (case-insensitive): `/exit`, `exit`, `quit`, `:q`, `:quit`.
 Keyboard: `Ctrl+C` / `Ctrl+D` — press twice within ~1s to quit. For `Ctrl+C`,
 the first press instead interrupts the running job or clears the input if either
-is present. `Ctrl+Z` suspends on POSIX (resume with `fg`).
+is present. Set `ask_confirmation_on_exit = false` to make `Ctrl+D` quit on the
+first press (also toggleable in `/config`); `Ctrl+C` always requires a second
+press. `Ctrl+Z` suspends on POSIX (resume with `fg`).
 
 ### Update
 
@@ -123,10 +126,10 @@ from `~/.vibe/prompts/`, and finally from the built-in bundled prompts.
 active_model = "mistral-medium-3.5"  # Model alias to use (see [[models]])
 
 # UI preferences
-vim_keybindings = false
 disable_welcome_banner_animation = false
 autocopy_to_clipboard = true
 file_watcher_for_autocomplete = false
+ask_confirmation_on_exit = true  # Require a second Ctrl+D to quit (Ctrl+C always confirms)
 native_scroll_shorten_tool_output = true       # Shorten long agent bash/read/grep output
 native_scroll_tool_output_head_lines = 3       # Leading output lines to keep
 native_scroll_tool_output_tail_lines = 3       # Trailing output lines to keep
@@ -275,6 +278,20 @@ default_agent = "plan"
 ```
 
 ### MCP Servers
+
+Hosted OAuth MCP servers can be added from inside Vibe:
+
+```text
+/mcp add https://mcp.linear.app/mcp
+/mcp add https://mcp.example.com/mcp --name docs --scope read --transport http --no-login
+```
+
+`/mcp add` is OAuth-only. It writes `auth.type = "oauth"` with optional
+scopes and starts login by default. It uses `transport = "streamable-http"`
+unless you pass `--transport http`. Pass `--no-login` to add the server without
+starting OAuth login. The shortcut supports `streamable-http` and `http`
+transports. For API-key/static auth, edit `config.toml` using the static auth
+example below.
 
 ```toml
 [[mcp_servers]]
@@ -539,9 +556,9 @@ Tool, skill, and agent names support three matching modes:
 vibe [PROMPT]                       # Start interactive session with optional prompt
 vibe -p TEXT / --prompt TEXT         # Programmatic mode using `default_agent`, one-shot, exit
 vibe -p TEXT --auto-approve          # Programmatic mode with all tool calls approved
-vibe -p TEXT --yolo                  # Alias for `--auto-approve`
+vibe -p TEXT --agent lean --yolo      # Lean mode with all tool calls approved
 vibe --agent NAME                   # Select agent profile (falls back to `default_agent` config)
-vibe --auto-approve / --yolo         # Shortcut for `--agent auto-approve`
+vibe --auto-approve / --yolo         # Approve all tool calls for the selected agent
 vibe --workdir DIR                  # Change working directory
 vibe --add-dir DIR                  # Extra working dir loaded for context (repeatable). Implicitly trusted.
 vibe --trust                        # Trust cwd for this invocation only (not persisted)
@@ -572,7 +589,8 @@ There are two kinds of agents:
 - **accept-edits**: Auto-approves file edits but asks for other tools
 - **auto-approve**: Auto-approves all tool calls
 - **lean**: Specialized Lean 4 proof assistant. Not available by default — must be
-  installed with `/leanstall` (removed with `/unleanstall`)
+  installed with `/leanstall` (removed with `/unleanstall`). Use `--agent lean
+  --auto-approve` or `--agent lean --yolo` to run Lean mode without tool prompts.
 
 ### Subagents
 
@@ -595,13 +613,18 @@ Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
 - `/compact` - Compact conversation history by summarizing
 - `/status` - Display agent statistics
 - `/voice` - Configure voice settings
-- `/mcp` - Display available MCP servers (pass a server name to list its tools)
+- `/mcp` - Display MCP servers and connector status; pass a server or connector
+  name to list its tools or open its auth panel when authentication is required
+- `/mcp add <url>` - Add a hosted OAuth MCP server. Supports `--name <alias>`,
+  repeatable `--scope <scope>`, `--transport <http|streamable-http>`, and
+  `--no-login`. Starts OAuth login by default. OAuth-only; use `config.toml`
+  for API-key/static auth.
 - `/mcp status` - Display MCP auth state (`ok`, `needs_auth`, `static`, `stdio`)
 - `/mcp login <alias>` - Start OAuth login for an MCP server
 - `/mcp logout <alias>` - Log out from an MCP server and delete stored OAuth
   secrets
 - `/resume` (or `/continue`) - Browse and resume past sessions for the current
-  folder. The picker header shows the folder being listed. Press `D` twice to
+  folder. The picker header shows the folder being listed. Press `d` twice to
   delete a saved session; the active session cannot be deleted here.
 - `/rewind` - Rewind to a previous message
 - `/loop <interval> <prompt>` - Schedule a recurring prompt (e.g. `/loop 30s ping`).
@@ -642,7 +665,7 @@ Image attachments:
   not added to the conversation.
 - Snapshotted into `<session_dir>/attachments/<sha1>.<ext>` so that
   resumed sessions stay reproducible even if the source file is moved.
-- Capped at 10 MB per image and 8 images per message.
+- Capped at 10 MiB per image and 8 images per message.
 - Out-of-project paths work via `@/abs/path/to.png` (the picker only
   suggests project files, but the `@`-parser accepts absolute paths).
   Drag-and-drop from Finder into Terminal, iTerm2, or Ghostty is
@@ -651,9 +674,19 @@ Image attachments:
   automatically prepends `@` (and quotes paths containing spaces).
   Non-image paths are pasted verbatim so non-image use cases are not
   affected.
-- Rendered in the chat bubble as a dim footer line linking each
-  attachment to its snapshot. Clicking opens the file with the OS
-  default image viewer.
+- **Image copy/paste from the clipboard** (**macOS only** for now):
+  writes the image to `<session_dir>/attachments/clipboard-<ts>.png`
+  (or the system temp dir when no session is active) and inserts an
+  `@<path>` token at the cursor. Two entry points:
+  1. `Ctrl+V` keybinding inside the prompt.
+  2. `/paste-image` slash command.
+
+  Uses `osascript` with a TIFF→PNG fallback via `sips`. On Linux and
+  Windows the binding and the slash command are not registered at all,
+  so the feature is invisible to users on those platforms.
+- Rendered in the chat bubble as one dim `attached image:` footer line
+  per image, linking each attachment to its snapshot. Clicking opens the
+  file with the OS default image viewer.
 
 ## Input Queue
 

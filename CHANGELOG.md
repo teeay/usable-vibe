@@ -5,6 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.4] - 2026-07-01
+
+### Changed
+
+- Whole-line content now shown in the edit diff
+- Declined or skipped tool calls now render as a muted square
+- Auto-approve now works in lean mode
+
+### Fixed
+
+- Session resume with `--continue` now matches the resolved working directory
+- Long tool call titles now wrap instead of being cropped
+- Duplicate `mcp_servers` names in config are now rejected
+- MarkupError crash when a tool error contained square brackets
+- Teleport now uses the matched GitHub remote
+- Raw compaction user messages are now preserved
+- ACP now honors `default_agent` on new and resumed sessions
+- Ambiguous teleport session creates are now retried
+
+
+## [2.18.3] - 2026-06-30
+
+### Added
+
+- `j`/`k` navigation in selectable lists across the TUI (questions, theme picker, rewind, voice, MCP panels)
+- `ask_confirmation_on_exit` config option to prompt before quitting
+- Project-level `.vibe/config.toml` now persists config option changes
+
+### Changed
+
+- Consistent styling and casing for keyboard shortcut hints across the TUI
+- `ask_user_question` now supports more than 4 options and questions
+
+### Fixed
+
+- No longer prompts to log in for disabled MCP servers
+- Teleport diff no longer mutates the real git index
+
+
+## [2.18.2] - 2026-06-29
+
+### Added
+
+- Sentry crash reporting for unhandled exceptions in the TUI (gated by `enable_telemetry`; off when telemetry is disabled)
+
+### Changed
+
+- Recoverable tool-call errors are now muted in the UI; only terminal errors render as a hard failure
+
+### Fixed
+
+- MarkupError crash when tool output contained square brackets
+- OpenTelemetry chat/LLM spans missing after Mistral Python SDK 2.4.10+ telemetry opt-in gate
+
+
+## [2.18.1] - 2026-06-26
+
+### Added
+
+- `/mcp add` slash command for adding OAuth MCP servers
+- Petit chat animation idle pauses
+
+### Changed
+
+- Bare exit synonyms (exit, quit, :q, :quit) now treated as slash commands instead of prompts
+
+### Fixed
+
+- MCP OAuth login crash when keyring backend is un-loadable
+
+
+## [2.18.0] - 2026-06-25
+
+### Added
+
+- Clickable URLs in web fetch and web search tool output
+- Context window usage display in tokens at the bottom of the TUI
+- Clipboard image paste support in the TUI (macOS)
+- Max generated tokens set_config_option in ACP
+
+### Changed
+
+- MCP OAuth authentication UX improvements in `/mcp` panel
+- Diff gutter and body split into separate widgets
+- Faster UI startup with lazy heavy imports
+- Improved connector performance with bootstrap caching
+
+### Fixed
+
+- macOS keychain access for Vibe credentials
+- Standalone denylist incorrectly blocking commands with heredocs
+- Copy selected text from prompt input and text areas
+- Repeated keyring requests in Vibe Code
+- Brew upgrade now always runs even when uv upgrade succeeds
+- Terminal kill/release bounding for ACP to prevent hangs
+
+
 ## [2.17.1] - 2026-06-19
 
 ### Changed

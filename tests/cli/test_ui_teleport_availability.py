@@ -13,11 +13,14 @@ from tests.conftest import (
     committed_scrollback,
 )
 from tests.constants import OPENAI_BASE_URL
+from vibe import __version__
 from vibe.cli.plan_offer.ports.whoami_gateway import WhoAmIPlanType, WhoAmIResponse
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.messages import ErrorMessage
+from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.core.config import ModelConfig, ProviderConfig, VibeConfig
 from vibe.core.types import Backend
+from vibe.core.utils import get_platform_id, get_platform_version
 
 
 def _chat_plan_gateway(*, prompt_switching_to_pro_plan: bool) -> FakeWhoAmIGateway:
@@ -41,6 +44,24 @@ async def _wait_until(pause, predicate, timeout: float = 2.0) -> None:
             return
         await pause(0.02)
     raise AssertionError("Condition was not met within the timeout")
+
+
+async def _wait_until_teleport_ready(pause, app) -> None:
+    await _wait_until(
+        pause,
+        lambda: (
+            app.commands.get_command_name("/teleport") == "teleport"
+            and "[Subscription] Pro"
+            in str(app.query_one("#banner-user-plan", NoMarkupStatic).content)
+        ),
+    )
+
+
+def _expected_system_metadata() -> dict[str, Any]:
+    metadata: dict[str, Any] = {"os": get_platform_id(), "version": __version__}
+    if os_version := get_platform_version():
+        metadata["os_version"] = os_version
+    return metadata
 
 
 def _teleport_failed_events(
@@ -69,16 +90,30 @@ async def test_teleport_command_visible_for_paid_chat_users() -> None:
     )
 
     async with app.run_test() as pilot:
-        await _wait_until(
-            pilot.pause,
-            lambda: app.commands.get_command_name("/teleport") == "teleport",
-        )
+        await _wait_until_teleport_ready(pilot.pause, app)
 
         assert app.commands.get_command_name("/teleport") == "teleport"
         assert "/teleport" in app.commands.get_help_text()
         input_widget = app.query_one(ChatInputContainer).input_widget
         assert input_widget is not None
         assert "&" in input_widget.mode_characters
+
+
+@pytest.mark.asyncio
+async def test_plan_resolution_updates_subscription_banner() -> None:
+    app = build_test_vibe_app(
+        config=_vibe_code_enabled_config(),
+        plan_offer_gateway=_chat_plan_gateway(prompt_switching_to_pro_plan=False),
+    )
+
+    async with app.run_test() as pilot:
+        await _wait_until(
+            pilot.pause,
+            lambda: (
+                "[Subscription] Pro"
+                in str(app.query_one("#banner-user-plan", NoMarkupStatic).content)
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -91,10 +126,7 @@ async def test_teleport_command_without_history_sends_early_failure_telemetry(
     )
 
     async with app.run_test() as pilot:
-        await _wait_until(
-            pilot.pause,
-            lambda: app.commands.get_command_name("/teleport") == "teleport",
-        )
+        await _wait_until_teleport_ready(pilot.pause, app)
 
         await app.on_chat_input_container_submitted(
             ChatInputContainer.Submitted("/teleport")
@@ -104,6 +136,7 @@ async def test_teleport_command_without_history_sends_early_failure_telemetry(
         {
             "event_name": "vibe.teleport_failed",
             "properties": {
+                **_expected_system_metadata(),
                 "stage": "no_history",
                 "error_class": "TeleportNoHistoryError",
                 "push_required": False,
@@ -124,10 +157,7 @@ async def test_teleport_command_visible_but_errors_when_key_not_eligible(
     )
 
     async with app.run_test() as pilot:
-        await _wait_until(
-            pilot.pause,
-            lambda: app.commands.get_command_name("/teleport") == "teleport",
-        )
+        await _wait_until_teleport_ready(pilot.pause, app)
 
         assert "/teleport" in app.commands.get_help_text()
         input_widget = app.query_one(ChatInputContainer).input_widget
@@ -145,6 +175,7 @@ async def test_teleport_command_visible_but_errors_when_key_not_eligible(
         {
             "event_name": "vibe.teleport_failed",
             "properties": {
+                **_expected_system_metadata(),
                 "stage": "ineligible",
                 "error_class": "TeleportIneligibleError",
                 "push_required": False,
@@ -163,10 +194,7 @@ async def test_teleport_command_errors_instead_of_user_text_when_not_eligible() 
     )
 
     async with app.run_test() as pilot:
-        await _wait_until(
-            pilot.pause,
-            lambda: app.commands.get_command_name("/teleport") == "teleport",
-        )
+        await _wait_until_teleport_ready(pilot.pause, app)
 
         app._handle_user_message = AsyncMock()
 
@@ -188,10 +216,7 @@ async def test_ampersand_teleport_shortcut_errors_when_not_eligible() -> None:
     )
 
     async with app.run_test() as pilot:
-        await _wait_until(
-            pilot.pause,
-            lambda: app.commands.get_command_name("/teleport") == "teleport",
-        )
+        await _wait_until_teleport_ready(pilot.pause, app)
 
         app._handle_user_message = AsyncMock()
 
@@ -250,10 +275,7 @@ async def test_teleport_command_errors_after_switching_to_non_mistral_model(
         app.agent_loop.agent_manager.invalidate_config()
 
     async with app.run_test() as pilot:
-        await _wait_until(
-            pilot.pause,
-            lambda: app.commands.get_command_name("/teleport") == "teleport",
-        )
+        await _wait_until_teleport_ready(pilot.pause, app)
 
         with (
             patch(

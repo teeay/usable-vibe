@@ -13,7 +13,7 @@ import shutil
 import signal
 import sys
 import time
-from typing import Any, ClassVar, assert_never, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 import webbrowser
@@ -34,12 +34,12 @@ from textual.theme import BUILTIN_THEMES
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Static
+from textual.worker import Worker, WorkerFailed, WorkerState
 
 from vibe import __version__ as CORE_VERSION
 from vibe.cli.clipboard import copy_selection_to_clipboard, copy_text_to_clipboard
 from vibe.cli.commands import CommandRegistry
-from vibe.cli.narrator_manager import (
-    NarratorManager,
+from vibe.cli.narrator_manager.narrator_manager_port import (
     NarratorManagerPort,
     NarratorState,
 )
@@ -55,6 +55,16 @@ from vibe.cli.plan_offer.decide_plan_offer import (
 from vibe.cli.plan_offer.ports.whoami_gateway import WhoAmIGateway, WhoAmIPlanType
 from vibe.cli.terminal_detect import Terminal, detect_terminal
 from vibe.cli.textual_ui.handlers.event_handler import EventHandler
+from vibe.cli.textual_ui.lazy_audio_managers import (
+    create_default_narrator_manager,
+    create_default_voice_manager,
+)
+from vibe.cli.textual_ui.mcp_commands import (
+    MCP_ADD_HELP,
+    is_mcp_add_help_request,
+    parse_mcp_add_args,
+    parse_mcp_subcommand,
+)
 from vibe.cli.textual_ui.message_queue import MessageQueue, QueueController, QueuePorts
 from vibe.cli.textual_ui.native_scroll import (
     ScrollbackCommitter,
@@ -81,11 +91,13 @@ from vibe.cli.textual_ui.widgets.chat_input.input_kinds import (
     Teleport,
     classify,
 )
+from vibe.cli.textual_ui.widgets.chat_input.paste_image import (
+    handle_clipboard_image_paste,
+)
 from vibe.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from vibe.cli.textual_ui.widgets.collapsible import CollapsibleSection
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
 from vibe.cli.textual_ui.widgets.config_app import ConfigApp
-from vibe.cli.textual_ui.widgets.connector_auth_app import ConnectorAuthApp
 from vibe.cli.textual_ui.widgets.context_progress import ContextProgress, TokenState
 from vibe.cli.textual_ui.widgets.debug_console import DebugConsole
 from vibe.cli.textual_ui.widgets.feedback_bar import FeedbackBar
@@ -96,7 +108,6 @@ from vibe.cli.textual_ui.widgets.loading import (
     LoadingWidget,
     paused_timer,
 )
-from vibe.cli.textual_ui.widgets.mcp_app import MCPApp, MCPSourceKind
 from vibe.cli.textual_ui.widgets.messages import (
     VSCODE_EXTENSION_PROMO_WHATS_NEW_SUFFIX,
     AssistantMessage,
@@ -153,7 +164,7 @@ from vibe.cli.update_notifier import (
     mark_version_as_seen,
     should_show_whats_new,
 )
-from vibe.cli.voice_manager import VoiceManager, VoiceManagerPort
+from vibe.cli.voice_manager import VoiceManagerPort
 from vibe.cli.voice_manager.voice_manager_port import TranscribeState
 from vibe.cli.vscode_extension_promo import (
     FileSystemVscodeExtensionPromoRepository,
@@ -161,11 +172,7 @@ from vibe.cli.vscode_extension_promo import (
     VscodeExtensionPromoState,
     should_show_promo,
 )
-from vibe.core.agent_loop import AgentLoop, TeleportError
 from vibe.core.agents import AgentProfile
-from vibe.core.audio_player.audio_player import AudioPlayer
-from vibe.core.audio_recorder import AudioRecorder
-from vibe.core.auth import MCPOAuthError
 from vibe.core.autocompletion.path_prompt import (
     PathPromptPayload,
     PathResource,
@@ -183,6 +190,7 @@ from vibe.core.log_reader import LogReader
 from vibe.core.logger import logger
 from vibe.core.paths import HISTORY_FILE
 from vibe.core.rewind import RewindError
+from vibe.core.sentry import capture_sentry_exception
 from vibe.core.session.image_snapshot import ImageSnapshotError, snapshot_image
 from vibe.core.session.resume_sessions import (
     ResumeSessionInfo,
@@ -213,12 +221,14 @@ from vibe.core.tools.builtins.ask_user_question import (
     Choice,
     Question,
 )
-from vibe.core.tools.connectors import compute_connector_counts
-from vibe.core.tools.mcp import AuthStatus
-from vibe.core.tools.mcp_settings import persist_mcp_toggle
+from vibe.core.tools.connectors.counts import compute_connector_counts
+from vibe.core.tools.mcp_settings import (
+    MCPServerAddError,
+    persist_mcp_toggle,
+    persist_oauth_mcp_server,
+)
 from vibe.core.tools.permissions import RequiredPermission
 from vibe.core.tools.ui import ToolUIDataAdapter
-from vibe.core.transcribe import make_transcribe_client
 from vibe.core.types import (
     MAX_IMAGE_BYTES,
     MAX_IMAGES_PER_MESSAGE,
@@ -249,6 +259,30 @@ from vibe.core.utils import (
 
 _VSCODE_FAMILY_TERMINALS = {Terminal.VSCODE, Terminal.VSCODE_INSIDERS, Terminal.CURSOR}
 
+if TYPE_CHECKING:
+    from vibe.cli.textual_ui.widgets.connector_auth_app import ConnectorAuthApp
+    from vibe.cli.textual_ui.widgets.mcp_app import MCPApp
+    from vibe.cli.textual_ui.widgets.mcp_oauth_app import MCPOAuthApp
+    from vibe.core.agent_loop import AgentLoop
+
+
+def _get_connector_auth_app_class() -> type[ConnectorAuthApp]:
+    from vibe.cli.textual_ui.widgets.connector_auth_app import ConnectorAuthApp
+
+    return ConnectorAuthApp
+
+
+def _get_mcp_app_class() -> type[MCPApp]:
+    from vibe.cli.textual_ui.widgets.mcp_app import MCPApp
+
+    return MCPApp
+
+
+def _get_mcp_oauth_app_class() -> type[MCPOAuthApp]:
+    from vibe.cli.textual_ui.widgets.mcp_oauth_app import MCPOAuthApp
+
+    return MCPOAuthApp
+
 
 def is_progress_event(event: object) -> bool:
     return isinstance(
@@ -273,6 +307,7 @@ class BottomApp(StrEnum):
     ConnectorAuth = auto()
     Input = auto()
     MCP = auto()
+    MCPOAuth = auto()
     ModelPicker = auto()
     ProxySetup = auto()
     Question = auto()
@@ -542,6 +577,8 @@ class VibeApp(App):  # noqa: PLR0904
         )
         self._show_resume_picker = opts.show_resume_picker
         self._is_resuming_session = opts.is_resuming_session
+        self._startup_prompt_processed = False
+        self._startup_command_availability_ready = asyncio.Event()
 
     @property
     def config(self) -> VibeConfig:
@@ -641,6 +678,10 @@ class VibeApp(App):  # noqa: PLR0904
 
     def _refresh_command_registry(self) -> None:
         self.commands.refresh(self.agent_loop.base_config.vibe_code_enabled)
+
+    def _refresh_config_from_disk(self) -> None:
+        self.agent_loop.refresh_config()
+        self._narrator_manager.sync()
 
     def compose(self) -> ComposeResult:
         with ChatScroll(id="chat"):
@@ -745,12 +786,8 @@ class VibeApp(App):  # noqa: PLR0904
         # internal chat scroll. Collapse it so the inline render is only the
         # live control region (loading/status, input, bottom bar).
         self._chat_widget.display = False
-        # The Banner lives in the hidden #chat and is never shown in native
-        # mode, but its PetitChat intro animation runs a 0.16s timer that keeps
-        # repainting the inline live region (~6 frames/second) indefinitely,
-        # which is a constant idle redraw. Upstream only freezes the animation on
-        # the first prompt submit; in native mode we freeze it immediately so an
-        # idle session produces no inline frames at all.
+        # The hidden banner's intro animation would otherwise keep repainting
+        # the inline live region even though the banner is not visible.
         if self._banner is not None:
             self._banner.freeze_animation()
         self._apply_caret_shape()
@@ -803,18 +840,16 @@ class VibeApp(App):  # noqa: PLR0904
 
         chat_input_container = self.query_one(ChatInputContainer)
         chat_input_container.focus_input()
-        await self._resolve_plan()
         await self._show_dangerous_directory_warning()
         await self._resume_history_from_messages()
         self._loop_runner.restore_from_session()
         self._loop_runner.start()
-        await self._check_and_show_whats_new()
-        self._schedule_update_notification()
         if self._is_resuming_session:
             await self.agent_loop.hydrate_experiments_from_session()
         else:
             self.agent_loop.start_initialize_experiments()
 
+        self.call_after_refresh(self._start_post_ready_startup)
         self.call_after_refresh(self._refresh_banner)
         self._show_config_issues()
 
@@ -822,8 +857,6 @@ class VibeApp(App):  # noqa: PLR0904
 
         if self._show_resume_picker:
             self.run_worker(self._show_session_picker(), exclusive=False)
-        elif self._initial_prompt or self._teleport_on_start:
-            self.call_after_refresh(self._process_initial_prompt)
 
         gc.collect()
         gc.freeze()
@@ -835,6 +868,31 @@ class VibeApp(App):  # noqa: PLR0904
         except NoMatches:
             return
         text_area.caret_shape = self.config.native_scroll_cursor_shape
+
+    def _start_post_ready_startup(self) -> None:
+        self.run_worker(self._complete_post_ready_startup(), exclusive=False)
+
+    async def _complete_post_ready_startup(self) -> None:
+        try:
+            await self._resolve_plan()
+        finally:
+            self._startup_command_availability_ready.set()
+        await self._check_and_show_whats_new()
+        self._schedule_update_notification()
+        if self._show_resume_picker:
+            return
+        self._process_startup_prompt()
+
+    async def _process_startup_prompt_when_available(self) -> None:
+        await self._startup_command_availability_ready.wait()
+        self._process_startup_prompt()
+
+    def _process_startup_prompt(self) -> None:
+        if self._startup_prompt_processed:
+            return
+        self._startup_prompt_processed = True
+        if self._initial_prompt or self._teleport_on_start:
+            self._process_initial_prompt()
 
     def _show_config_issues(self) -> None:
         for issue in (
@@ -876,16 +934,23 @@ class VibeApp(App):  # noqa: PLR0904
                 await self._remove_loading_widget()
             self._refresh_banner()
             try:
-                self.query_one(MCPApp).refresh_index()
+                self.query_one(_get_mcp_app_class()).refresh_index()
             except Exception:
                 pass
 
     async def _show_mcp_auth_required_notice(self) -> None:
-        statuses = self.agent_loop.mcp_registry.status()
+        """Show a notice if any enabled MCP servers require OAuth authentication."""
+        registry = self.agent_loop.mcp_registry
+        if registry is None:
+            return
+        from vibe.core.tools.mcp import AuthStatus
+
+        statuses = registry.status()
+        disabled = registry.disabled_aliases()
         aliases = sorted(
             alias
             for alias, status in statuses.items()
-            if status is AuthStatus.NEEDS_AUTH
+            if status is AuthStatus.NEEDS_AUTH and alias not in disabled
         )
         if not aliases:
             return
@@ -1197,6 +1262,19 @@ class VibeApp(App):  # noqa: PLR0904
         except ImageSnapshotError as e:
             return f"Failed to attach image {resource.alias}: {e}"
 
+    def on_chat_text_area_clipboard_image_pasted(
+        self, message: ChatTextArea.ClipboardImagePasted
+    ) -> None:
+        self.run_worker(
+            handle_clipboard_image_paste(
+                self, notify_when_empty=message.notify_when_empty
+            ),
+            exclusive=False,
+        )
+
+    async def _paste_clipboard_image_command(self, **_kwargs: Any) -> None:
+        await handle_clipboard_image_paste(self, notify_when_empty=True)
+
     async def on_config_app_open_model_picker(
         self, _message: ConfigApp.OpenModelPicker
     ) -> None:
@@ -1272,11 +1350,11 @@ class VibeApp(App):  # noqa: PLR0904
                 self.agent_loop.telemetry_client.send_telemetry_event(
                     "vibe.voice_mode_toggled", {"enabled": desired}
                 )
-                self.agent_loop.refresh_config()
+                self._refresh_config_from_disk()
                 if desired:
                     await self._mount_and_scroll(
                         UserCommandMessage(
-                            "Voice mode enabled. Press ctrl+r to start recording."
+                            "Voice mode enabled. Press **Ctrl+R** to start recording."
                         )
                     )
                 else:
@@ -1289,8 +1367,7 @@ class VibeApp(App):  # noqa: PLR0904
         }
         if non_voice_changes:
             VibeConfig.save_updates(non_voice_changes)
-            self.agent_loop.refresh_config()
-            self._narrator_manager.sync()
+            self._refresh_config_from_disk()
 
     async def on_model_picker_app_model_selected(
         self, message: ModelPickerApp.ModelSelected
@@ -1353,6 +1430,8 @@ class VibeApp(App):  # noqa: PLR0904
         await self._switch_to_input_app()
 
     async def on_mcpapp_mcptoggled(self, message: MCPApp.MCPToggled) -> None:
+        from vibe.cli.textual_ui.widgets.mcp_app import MCPSourceKind
+
         persist_mcp_toggle(
             self.agent_loop.config,
             name=message.name,
@@ -1360,19 +1439,30 @@ class VibeApp(App):  # noqa: PLR0904
             disabled=message.disabled,
             tool_name=message.tool_name,
         )
-        self.agent_loop.refresh_config()
-        self.query_one(MCPApp).refresh_index()
+        self._refresh_config_from_disk()
+        self.query_one(_get_mcp_app_class()).refresh_index()
         self._refresh_banner()
 
     async def on_mcpapp_connector_auth_requested(
         self, message: MCPApp.ConnectorAuthRequested
     ) -> None:
+        connector_auth_app_class = _get_connector_auth_app_class()
         await self._switch_to_input_app()
         await self._switch_from_input(
-            ConnectorAuthApp(
+            connector_auth_app_class(
                 connector_name=message.connector_name,
                 connector_registry=message.connector_registry,
                 tool_manager=message.tool_manager,
+            )
+        )
+
+    async def on_mcpapp_mcpoauth_requested(
+        self, message: MCPApp.MCPOAuthRequested
+    ) -> None:
+        await self._switch_to_input_app()
+        await self._switch_from_input(
+            _get_mcp_oauth_app_class()(
+                server_name=message.server_name, mcp_registry=message.mcp_registry
             )
         )
 
@@ -1389,6 +1479,17 @@ class VibeApp(App):  # noqa: PLR0904
             )
         await self._switch_to_input_app()
         await self._show_mcp(cmd_args=message.connector_name)
+
+    async def on_mcpoauth_app_mcpoauth_closed(
+        self, message: MCPOAuthApp.MCPOAuthClosed
+    ) -> None:
+        if message.refreshed:
+            await self._refresh_mcp_browser()
+            await self._mount_and_scroll(
+                UserCommandMessage(f"MCP server `{message.server_name}` authenticated.")
+            )
+        await self._switch_to_input_app()
+        await self._show_mcp(cmd_args=message.server_name)
 
     async def on_proxy_setup_app_proxy_setup_closed(
         self, message: ProxySetupApp.ProxySetupClosed
@@ -1919,13 +2020,15 @@ class VibeApp(App):  # noqa: PLR0904
                 self._pending_question = None
                 await self._switch_to_input_app()
 
-    async def _handle_turn_error(self) -> None:
+    async def _handle_turn_error(self, *, cancelled: bool = False) -> None:
         if self._loading_widget and self._loading_widget.parent:
             await self._loading_widget.remove()
         if self._committer is not None:
             self._committer.flush()
         if self.event_handler:
-            self.event_handler.stop_current_tool_call(success=False)
+            self.event_handler.stop_current_tool_call(
+                success=False, cancelled=cancelled
+            )
 
     async def _handle_agent_loop_init(self) -> None:
         show_init_spinner = not self.agent_loop.is_initialized
@@ -2055,7 +2158,7 @@ class VibeApp(App):  # noqa: PLR0904
             ) as events:
                 await self._handle_agent_loop_events(events)
         except asyncio.CancelledError:
-            await self._handle_turn_error()
+            await self._handle_turn_error(cancelled=True)
             self._narrator_manager.on_turn_cancel()
             raise
         except Exception as e:
@@ -2082,6 +2185,7 @@ class VibeApp(App):  # noqa: PLR0904
             self._loading_widget = None
             if self.event_handler:
                 await self.event_handler.finalize_streaming()
+                self.event_handler.escalate_unresolved_errors()
             self._queue.notify_busy_changed()
             self._queue.start_drain_if_needed()
             await self._refresh_windowing_from_history()
@@ -2188,6 +2292,8 @@ class VibeApp(App):  # noqa: PLR0904
         teleport_msg = TeleportMessage()
         await self._live_surface.mount(teleport_msg)
 
+        from vibe.core.agent_loop import TeleportError
+
         completed_url: str | None = None
         try:
             gen = self.agent_loop.teleport_to_vibe_code(prompt)
@@ -2286,7 +2392,7 @@ class VibeApp(App):  # noqa: PLR0904
         if self._committer is not None:
             self._committer.flush()
         if self.event_handler:
-            self.event_handler.stop_current_tool_call(success=False)
+            self.event_handler.stop_current_tool_call(cancelled=True)
             self.event_handler.stop_current_compact()
             await self.event_handler.finalize_streaming()
 
@@ -2331,29 +2437,30 @@ class VibeApp(App):  # noqa: PLR0904
         return "Refreshed."
 
     async def _maybe_handle_mcp_subcommand(self, cmd_args: str) -> bool:
-        parts = cmd_args.strip().split(None, 1)
-        if not parts or parts[0] not in {"login", "logout", "status"}:
+        parsed = parse_mcp_subcommand(cmd_args)
+        if parsed is None:
             return False
 
-        subcommand = parts[0]
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        match subcommand:
+        match parsed.name:
+            case "add":
+                await self._mcp_add(parsed.args)
             case "status":
-                if arg:
+                if parsed.args:
                     await self._mount_and_scroll(
                         ErrorMessage("Usage: /mcp status", collapsed=True)
                     )
                     return True
                 await self._show_mcp_status()
             case "login":
-                await self._mcp_login(arg)
+                await self._mcp_login(parsed.args)
             case "logout":
-                await self._mcp_logout(arg)
+                await self._mcp_logout(parsed.args)
         return True
 
     async def _show_mcp_status(self) -> None:
         await self.agent_loop.wait_until_ready()
-        statuses = self.agent_loop.mcp_registry.status()
+        registry = self.agent_loop.mcp_registry
+        statuses = registry.status() if registry is not None else {}
         if not statuses:
             await self._mount_and_scroll(
                 UserCommandMessage("No MCP servers configured.")
@@ -2372,6 +2479,12 @@ class VibeApp(App):  # noqa: PLR0904
             return
 
         await self.agent_loop.wait_until_ready()
+        registry = self.agent_loop.mcp_registry
+        if registry is None:
+            await self._mount_and_scroll(
+                ErrorMessage("No MCP servers configured.", collapsed=True)
+            )
+            return
 
         async def on_url(url: str) -> None:
             await self._mount_and_scroll(
@@ -2382,8 +2495,10 @@ class VibeApp(App):  # noqa: PLR0904
             except Exception as exc:
                 logger.debug("Failed to open MCP OAuth URL in browser: %s", exc)
 
+        from vibe.core.auth import MCPOAuthError
+
         try:
-            await self.agent_loop.mcp_registry.login(alias, on_url=on_url)
+            await registry.login(alias, on_url=on_url)
             await self._refresh_mcp_browser()
         except (MCPOAuthError, ValueError) as exc:
             await self._mount_and_scroll(ErrorMessage(str(exc), collapsed=True))
@@ -2401,8 +2516,17 @@ class VibeApp(App):  # noqa: PLR0904
             return
 
         await self.agent_loop.wait_until_ready()
+        registry = self.agent_loop.mcp_registry
+        if registry is None:
+            await self._mount_and_scroll(
+                ErrorMessage("No MCP servers configured.", collapsed=True)
+            )
+            return
+
+        from vibe.core.auth import MCPOAuthError
+
         try:
-            await self.agent_loop.mcp_registry.logout(alias)
+            await registry.logout(alias)
             await self._refresh_mcp_browser()
         except (MCPOAuthError, ValueError) as exc:
             await self._mount_and_scroll(ErrorMessage(str(exc), collapsed=True))
@@ -2411,6 +2535,49 @@ class VibeApp(App):  # noqa: PLR0904
         await self._mount_and_scroll(
             UserCommandMessage(f"MCP server `{alias}` logged out.")
         )
+
+    async def _mcp_add(self, raw_args: str) -> None:
+        if is_mcp_add_help_request(raw_args):
+            await self._mount_and_scroll(UserCommandMessage(MCP_ADD_HELP))
+            return
+
+        try:
+            args = parse_mcp_add_args(raw_args)
+        except ValueError as exc:
+            await self._mount_and_scroll(ErrorMessage(str(exc), collapsed=True))
+            return
+
+        try:
+            result = persist_oauth_mcp_server(
+                self.agent_loop.config,
+                url=args.url,
+                name=args.name,
+                scopes=args.scopes,
+                transport=args.transport,
+            )
+        except MCPServerAddError as exc:
+            await self._mount_and_scroll(ErrorMessage(str(exc), collapsed=True))
+            return
+
+        self.agent_loop.refresh_config()
+        await self._refresh_mcp_browser()
+        head = (
+            f"Added OAuth MCP server `{result.name}`."
+            if result.created
+            else f"OAuth MCP server `{result.name}` is already configured."
+        )
+        tail = (
+            "Starting OAuth login..."
+            if args.login
+            else (
+                f"Run `/mcp login {result.name}` to authenticate, "
+                "or `/mcp status` to inspect it."
+            )
+        )
+        await self._mount_and_scroll(UserCommandMessage(f"{head}\n{tail}"))
+
+        if args.login:
+            await self._mcp_login(result.name)
 
     async def _show_mcp(self, cmd_args: str = "", **kwargs: Any) -> None:
         if await self._maybe_handle_mcp_subcommand(cmd_args):
@@ -2449,13 +2616,15 @@ class VibeApp(App):  # noqa: PLR0904
                 )
             )
             return
+        mcp_app_class = _get_mcp_app_class()
         await self._mount_and_scroll(UserCommandMessage("MCP servers opened..."))
         await self._switch_from_input(
-            MCPApp(
+            mcp_app_class(
                 mcp_servers=mcp_servers,
                 tool_manager=self.agent_loop.tool_manager,
                 initial_server=name,
                 connector_registry=connector_registry,
+                mcp_registry=self.agent_loop.mcp_registry,
                 get_vibe_config=lambda: self.agent_loop.config,
                 refresh_callback=self._refresh_mcp_browser,
             )
@@ -2559,6 +2728,9 @@ class VibeApp(App):  # noqa: PLR0904
             await self._mount_and_scroll(
                 UserCommandMessage("No sessions found for this directory.")
             )
+            if self._show_resume_picker:
+                self._show_resume_picker = False
+                await self._process_startup_prompt_when_available()
             return
 
         await self._switch_from_input(self._build_picker(local_sessions))
@@ -2573,11 +2745,19 @@ class VibeApp(App):  # noqa: PLR0904
         try:
             await self._resume_local_session(session)
         except Exception as e:
+            if self._show_resume_picker:
+                self._show_resume_picker = False
+                self._startup_prompt_processed = True
             await self._mount_and_scroll(
                 ErrorMessage(
                     f"Failed to load session: {e}", collapsed=self._tools_collapsed
                 )
             )
+            return
+
+        if self._show_resume_picker:
+            self._show_resume_picker = False
+            await self._process_startup_prompt_when_available()
 
     async def on_session_picker_app_session_delete_requested(
         self, event: SessionPickerApp.SessionDeleteRequested
@@ -2633,6 +2813,9 @@ class VibeApp(App):  # noqa: PLR0904
         self, event: SessionPickerApp.Cancelled
     ) -> None:
         await self._switch_to_input_app()
+        if self._show_resume_picker:
+            self._show_resume_picker = False
+            self._startup_prompt_processed = True
 
         await self._mount_and_scroll(UserCommandMessage("Resume cancelled."))
 
@@ -2900,23 +3083,9 @@ class VibeApp(App):  # noqa: PLR0904
         finally:
             self.exit(result=self._get_session_resume_info())
 
-    def _make_default_voice_manager(self) -> VoiceManager:
-        try:
-            model = self.config.get_active_transcribe_model()
-            provider = self.config.get_transcribe_provider_for_model(model)
-            transcribe_client = make_transcribe_client(provider, model)
-        except (ValueError, KeyError) as exc:
-            logger.error(
-                "Failed to initialize transcription, check transcribe model configuration",
-                exc_info=exc,
-            )
-            transcribe_client = None
-
-        return VoiceManager(
-            lambda: self.config,
-            audio_recorder=AudioRecorder(),
-            transcribe_client=transcribe_client,
-            telemetry_client=self.agent_loop.telemetry_client,
+    def _make_default_voice_manager(self) -> VoiceManagerPort:
+        return create_default_voice_manager(
+            lambda: self.config, self.agent_loop.telemetry_client
         )
 
     async def _show_voice_settings(self, **kwargs: Any) -> None:
@@ -3043,36 +3212,26 @@ class VibeApp(App):  # noqa: PLR0904
                 self.call_after_refresh(self._chat_widget.anchor)
 
     def _focus_current_bottom_app(self) -> None:
+        focus_widget_by_app: dict[BottomApp, type[Widget]] = {
+            BottomApp.Config: ConfigApp,
+            BottomApp.ModelPicker: ModelPickerApp,
+            BottomApp.ThemePicker: ThemePickerApp,
+            BottomApp.ThinkingPicker: ThinkingPickerApp,
+            BottomApp.ProxySetup: ProxySetupApp,
+            BottomApp.Approval: ApprovalApp,
+            BottomApp.Question: QuestionApp,
+            BottomApp.SessionPicker: SessionPickerApp,
+            BottomApp.MCP: _get_mcp_app_class(),
+            BottomApp.ConnectorAuth: _get_connector_auth_app_class(),
+            BottomApp.MCPOAuth: _get_mcp_oauth_app_class(),
+            BottomApp.Rewind: RewindApp,
+            BottomApp.Voice: VoiceApp,
+        }
         try:
-            match self._current_bottom_app:
-                case BottomApp.Input:
-                    self.query_one(ChatInputContainer).focus_input()
-                case BottomApp.Config:
-                    self.query_one(ConfigApp).focus()
-                case BottomApp.ModelPicker:
-                    self.query_one(ModelPickerApp).focus()
-                case BottomApp.ThemePicker:
-                    self.query_one(ThemePickerApp).focus()
-                case BottomApp.ThinkingPicker:
-                    self.query_one(ThinkingPickerApp).focus()
-                case BottomApp.ProxySetup:
-                    self.query_one(ProxySetupApp).focus()
-                case BottomApp.Approval:
-                    self.query_one(ApprovalApp).focus()
-                case BottomApp.Question:
-                    self.query_one(QuestionApp).focus()
-                case BottomApp.SessionPicker:
-                    self.query_one(SessionPickerApp).focus()
-                case BottomApp.MCP:
-                    self.query_one(MCPApp).focus()
-                case BottomApp.ConnectorAuth:
-                    self.query_one(ConnectorAuthApp).focus()
-                case BottomApp.Rewind:
-                    self.query_one(RewindApp).focus()
-                case BottomApp.Voice:
-                    self.query_one(VoiceApp).focus()
-                case app:
-                    assert_never(app)
+            if self._current_bottom_app == BottomApp.Input:
+                self.query_one(ChatInputContainer).focus_input()
+                return
+            self.query_one(focus_widget_by_app[self._current_bottom_app]).focus()
         except Exception:
             pass
 
@@ -3314,11 +3473,9 @@ class VibeApp(App):  # noqa: PLR0904
         self.agent_loop.telemetry_client.send_user_cancelled_action("interrupt_agent")
         self.run_worker(self._interrupt_agent_loop(), exclusive=False)
 
-    def _handle_bottom_app_close_escape(
-        self, widget_type: type[MCPApp] | type[ProxySetupApp] | type[ConnectorAuthApp]
-    ) -> None:
+    def _handle_bottom_app_close_escape(self, widget_type: type[Widget]) -> None:
         try:
-            self.query_one(widget_type).action_close()
+            cast(Any, self.query_one(widget_type)).action_close()
         except Exception:
             pass
         self._last_escape_time = None
@@ -3329,9 +3486,11 @@ class VibeApp(App):  # noqa: PLR0904
         elif self._current_bottom_app == BottomApp.Voice:
             self._handle_voice_app_escape()
         elif self._current_bottom_app == BottomApp.MCP:
-            self._handle_bottom_app_close_escape(MCPApp)
+            self._handle_bottom_app_close_escape(_get_mcp_app_class())
         elif self._current_bottom_app == BottomApp.ConnectorAuth:
-            self._handle_bottom_app_close_escape(ConnectorAuthApp)
+            self._handle_bottom_app_close_escape(_get_connector_auth_app_class())
+        elif self._current_bottom_app == BottomApp.MCPOAuth:
+            self._handle_bottom_app_close_escape(_get_mcp_oauth_app_class())
         elif self._current_bottom_app == BottomApp.ProxySetup:
             self._handle_bottom_app_close_escape(ProxySetupApp)
         elif self._current_bottom_app == BottomApp.Approval:
@@ -3570,6 +3729,10 @@ class VibeApp(App):  # noqa: PLR0904
                 container.input_widget.action_delete_right()
             return
 
+        if not self.config.ask_confirmation_on_exit:
+            self._force_quit()
+            return
+
         if self._quit_manager.is_confirmed("Ctrl+D"):
             self._force_quit()
             return
@@ -3734,6 +3897,7 @@ class VibeApp(App):  # noqa: PLR0904
             self._plan_info = None
         finally:
             self._refresh_command_registry()
+            self._refresh_banner()
 
     async def _mount_and_scroll(
         self, widget: Widget, after: Widget | None = None, before: Widget | None = None
@@ -3946,21 +4110,56 @@ class VibeApp(App):  # noqa: PLR0904
         # re-anchor it on the next inline frame.
         self._inline_anchored = False
 
-    def _make_default_narrator_manager(self) -> NarratorManager:
-        return NarratorManager(
+    def _make_default_narrator_manager(self) -> NarratorManagerPort:
+        return create_default_narrator_manager(
             config_getter=lambda: self.config,
-            audio_player=AudioPlayer(),
             telemetry_client=self.agent_loop.telemetry_client,
         )
+
+    def _handle_exception(self, error: Exception) -> None:
+        if not isinstance(error, WorkerFailed):
+            capture_sentry_exception(
+                error, fatal=True, tags={"vibe_boundary": "textual_app"}
+            )
+        return super()._handle_exception(error)
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        error = event.worker.error
+        if event.state == WorkerState.ERROR and error:
+            capture_sentry_exception(
+                error,
+                fatal=False,
+                tags={
+                    "vibe_boundary": "textual_worker",
+                    "worker_name": event.worker.name or "",
+                },
+            )
 
 
 async def _run_app_with_cleanup(app: VibeApp) -> str | None:
     from vibe.cli.stderr_guard import stderr_guard
 
+    loop = asyncio.get_running_loop()
+    if not WINDOWS:
+        try:
+
+            def _sigterm_handler() -> None:
+                loop.remove_signal_handler(signal.SIGTERM)
+                app._force_quit()
+
+            loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
+        except (NotImplementedError, OSError):
+            pass
+
     try:
         with stderr_guard():
             return await app.run_async(inline=True, inline_no_clear=True)
     finally:
+        if not WINDOWS:
+            try:
+                loop.remove_signal_handler(signal.SIGTERM)
+            except (NotImplementedError, OSError):
+                pass
         sys.stderr.write("Closing\u2026\r")
         sys.stderr.flush()
         try:

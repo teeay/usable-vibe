@@ -101,6 +101,7 @@ async def test_acp_initialize(binary: Path) -> None:
         env["VIBE_HOME"] = str(vibe_home)
         env["UVIBE_HOME"] = str(uvibe_home)
         env["MISTRAL_API_KEY"] = "smoke-test-mock-key"
+        env["VIBE_TEST_DISABLE_KEYRING"] = "1"
 
         proc = await asyncio.create_subprocess_exec(
             str(binary),

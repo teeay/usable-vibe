@@ -28,18 +28,18 @@ def _run_private_script(script: str) -> subprocess.CompletedProcess[str]:
 def test_release_version_uses_integer_fourth_segment() -> None:
     script = (
         "source private/scripts/_lib.sh\n"
-        "release_version_for_counter v2.17.1 5\n"
-        "next_release_counter 5\n"
+        "release_version_for_counter v2.18.4 9\n"
+        "next_release_counter 9\n"
     )
 
     result = _run_private_script(script)
 
     assert result.returncode == 0
-    assert result.stdout.splitlines() == ["2.17.1.5", "6"]
+    assert result.stdout.splitlines() == ["2.18.4.9", "10"]
 
 
 def test_release_version_rejects_zero_padded_counter() -> None:
-    script = "source private/scripts/_lib.sh\nrelease_version_for_counter v2.17.1 005\n"
+    script = "source private/scripts/_lib.sh\nrelease_version_for_counter v2.18.4 005\n"
 
     result = _run_private_script(script)
 
@@ -86,7 +86,7 @@ def test_patch_pyproject_adds_release_project_icon_url(tmp_path: Path) -> None:
             """\
             [project]
             name = "mistral-vibe"
-            version = "2.17.1"
+            version = "2.18.4"
             description = "Minimal CLI coding agent by Mistral"
             authors = [{ name = "Mistral AI" }]
             keywords = ["ai", "mistral", "developer-tools"]
@@ -126,7 +126,7 @@ def test_patch_pyproject_adds_release_project_icon_url(tmp_path: Path) -> None:
             "DOCS_URL": "https://teeay.dev/oss/uvibe",
             "ICON_URL": "https://teeay.dev/images/oss/usable-vibe-icon.png",
             "UPSTREAM_DISPLAY": "Mistral Vibe",
-            "FORK_VERSION": "2.17.1.6",
+            "FORK_VERSION": "2.18.4.10",
         },
         text=True,
     )
@@ -374,6 +374,15 @@ def test_rebrand_updates_all_e2e_resume_hint_regexes() -> None:
             assert released_regex in content
 
     assert files_with_resume_hint
+
+
+def test_rebrand_rewrites_existing_prompt_markdown_dynamically() -> None:
+    rebrand_script = (REPO_ROOT / "private" / "scripts" / "rebrand.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "find vibe/core/prompts -maxdepth 1 -type f -name '*.md'" in rebrand_script
+    assert "cli_2026-06_emoji.md" not in rebrand_script
 
 
 def test_publish_pypi_rewrites_readme_only_for_build() -> None:
