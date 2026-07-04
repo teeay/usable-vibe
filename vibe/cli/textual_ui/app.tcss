@@ -53,7 +53,7 @@ TextArea > .text-area--cursor {
     height: auto;
     width: 100%;
     background: transparent;
-    padding: 1 0 0 0;
+    padding: 1 0 1 0;
     layout: horizontal;
     align: left middle;
 }
@@ -121,8 +121,12 @@ TextArea > .text-area--cursor {
     border-bottom: none;
 }
 
+/* Fixed gap, not 1fr: a stretch spacer paints interior spaces out to the
+   right edge, making the bottom bar a full-width terminal row that emulators
+   rewrap into scrollback fragments on narrow resize. Left-adjacent chrome
+   keeps the bar's painted width at content size. */
 #spacer {
-    width: 1fr;
+    width: 2;
     height: auto;
     background: transparent;
 }
@@ -195,47 +199,69 @@ OptionList, OptionList:focus {
 #input-box {
     height: auto;
     width: 100%;
-    background: transparent;
+    background: $foreground-muted 16%;
     border: none;
-    border-top: solid $foreground-muted;
-    border-bottom: solid $foreground-muted;
-    border-title-align: right;
-    border-title-color: $text-muted;
+    padding: 0 1;
 
     &.border-warning {
-        border-top: solid $warning;
-        border-bottom: solid $warning;
-        border-title-color: $warning;
+        background: $warning 18%;
     }
 
     &.border-safe {
-        border-top: solid $success;
-        border-bottom: solid $success;
-        border-title-color: $success;
+        background: $success 16%;
     }
 
     &.border-error {
-        border-top: solid $error;
-        border-bottom: solid $error;
-        border-title-color: $error;
+        background: $error 18%;
     }
 
     &.border-recording {
-        border-top: solid $mistral_orange;
-        border-bottom: solid $mistral_orange;
-        border-title-color: $mistral_orange;
+        background: $mistral_orange 18%;
     }
 }
 
 #input-body {
     height: auto;
+    background: $foreground-muted 16%;
+}
+
+#input-box.border-warning #input-body,
+#input-box.border-warning #prompt,
+#input-box.border-warning #prompt-spinner,
+#input-box.border-warning #recording-indicator,
+#input-box.border-warning #input {
+    background: $warning 18%;
+}
+
+#input-box.border-safe #input-body,
+#input-box.border-safe #prompt,
+#input-box.border-safe #prompt-spinner,
+#input-box.border-safe #recording-indicator,
+#input-box.border-safe #input {
+    background: $success 16%;
+}
+
+#input-box.border-error #input-body,
+#input-box.border-error #prompt,
+#input-box.border-error #prompt-spinner,
+#input-box.border-error #recording-indicator,
+#input-box.border-error #input {
+    background: $error 18%;
+}
+
+#input-box.border-recording #input-body,
+#input-box.border-recording #prompt,
+#input-box.border-recording #prompt-spinner,
+#input-box.border-recording #recording-indicator,
+#input-box.border-recording #input {
+    background: $mistral_orange 18%;
 }
 
 #prompt,
 #prompt-spinner,
 #recording-indicator {
     width: auto;
-    background: transparent;
+    background: $foreground-muted 16%;
     color: $mistral_orange;
     text-style: bold;
     padding: 0 1 0 0;
@@ -246,7 +272,7 @@ OptionList, OptionList:focus {
     height: auto;
     min-height: 3;
     max-height: 50vh;
-    background: transparent;
+    background: $foreground-muted 16%;
     color: $foreground;
     border: none;
     padding: 0;
@@ -1351,6 +1377,33 @@ ContextProgress {
 
     &:ansi {
         text-style: dim;
+    }
+}
+
+#bottom-agent-label {
+    width: auto;
+    max-width: 22;
+    height: auto;
+    background: transparent;
+    padding: 0;
+    margin: 0 1 0 0;
+    color: $text-muted;
+    text-overflow: ellipsis;
+
+    &:ansi {
+        text-style: dim;
+    }
+
+    &.agent-label-safe {
+        color: $success;
+    }
+
+    &.agent-label-warning {
+        color: $warning;
+    }
+
+    &.agent-label-error {
+        color: $error;
     }
 }
 

@@ -25,6 +25,19 @@ def _run_private_script(script: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _fork_env() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in (
+        (REPO_ROOT / "private" / "fork.env").read_text(encoding="utf-8").splitlines()
+    ):
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        parsed = shlex.split(raw_value)
+        values[key] = parsed[0] if parsed else ""
+    return values
+
+
 def test_release_version_uses_integer_fourth_segment() -> None:
     script = (
         "source private/scripts/_lib.sh\n"
@@ -348,16 +361,43 @@ def test_release_pushes_internal_commits_and_tag_before_external_publish() -> No
     )
 
 
+def test_rebrand_covers_e2e_local_spawn_and_display_literals() -> None:
+    rebrand_script = (REPO_ROOT / "private" / "scripts" / "rebrand.sh").read_text(
+        encoding="utf-8"
+    )
+    fork_env = _fork_env()
+    script_name = fork_env["SCRIPT_NAME"]
+    display_name = fork_env["DISPLAY_NAME"]
+    upstream_display = fork_env["UPSTREAM_DISPLAY"]
+    required_command_literals = {
+        "tests/e2e/test_cli_native_scroll.py": (
+            '["run", "vibe", "--workdir", str(e2e_workdir)]',
+            f'["run", "{script_name}", "--workdir", str(e2e_workdir)]',
+        ),
+        "tests/e2e/test_tmux_reflow.py": (
+            "uv run vibe --workdir",
+            f"uv run {script_name} --workdir",
+        ),
+    }
+
+    for relative_path, (
+        upstream_command_literal,
+        released_command_literal,
+    ) in required_command_literals.items():
+        source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        assert upstream_display in source or display_name in source
+        assert upstream_command_literal in source or released_command_literal in source
+        if upstream_display in source or upstream_command_literal in source:
+            assert relative_path in rebrand_script
+        if upstream_command_literal in source:
+            assert upstream_command_literal in rebrand_script
+
+
 def test_rebrand_updates_all_e2e_resume_hint_regexes() -> None:
     rebrand_script = (REPO_ROOT / "private" / "scripts" / "rebrand.sh").read_text(
         encoding="utf-8"
     )
-    fork_env = (REPO_ROOT / "private" / "fork.env").read_text(encoding="utf-8")
-    script_name = next(
-        line.removeprefix("SCRIPT_NAME=")
-        for line in fork_env.splitlines()
-        if line.startswith("SCRIPT_NAME=")
-    )
+    script_name = _fork_env()["SCRIPT_NAME"]
     upstream_regex = 'r"Or: vibe --resume ([0-9a-f-]+)"'
     released_regex = f'r"Or: {script_name} --resume ([0-9a-f-]+)"'
     files_with_resume_hint: list[Path] = []

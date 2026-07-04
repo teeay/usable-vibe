@@ -28,7 +28,7 @@ from textual.containers import Horizontal, VerticalGroup, VerticalScroll
 from textual.css.query import NoMatches
 from textual.driver import Driver
 from textual.events import AppBlur, AppFocus, MouseUp, Resize
-from textual.geometry import Offset
+from textual.geometry import Offset, Size
 from textual.screen import Screen
 from textual.theme import BUILTIN_THEMES
 from textual.timer import Timer
@@ -68,9 +68,14 @@ from vibe.cli.textual_ui.mcp_commands import (
 from vibe.cli.textual_ui.message_queue import MessageQueue, QueueController, QueuePorts
 from vibe.cli.textual_ui.native_scroll import (
     ScrollbackCommitter,
-    build_bottom_anchor,
     build_commit_injection,
+    build_inline_terminal_reset,
+    build_inline_terminal_setup,
+    build_relocated_anchor,
+    build_resize_sweep,
+    build_scroll_region_commit_injection,
 )
+from vibe.cli.textual_ui.native_scroll.inline_frame import trim_inline_update
 from vibe.cli.textual_ui.notifications import (
     NotificationContext,
     NotificationPort,
@@ -172,7 +177,7 @@ from vibe.cli.vscode_extension_promo import (
     VscodeExtensionPromoState,
     should_show_promo,
 )
-from vibe.core.agents import AgentProfile
+from vibe.core.agents import AgentProfile, AgentSafety
 from vibe.core.autocompletion.path_prompt import (
     PathPromptPayload,
     PathResource,
@@ -422,6 +427,16 @@ _REJECT_HINT_PAUSED = "clear the queue first or remove this input."
 _CONFIG_RELOADED_NOTICE = (
     "Configuration reloaded (includes agent instructions and skills)."
 )
+_BOTTOM_AGENT_LABEL_MAX = 18
+_BOTTOM_AGENT_LABEL_PREFIX = 15
+# Resize storms (interactive drags) deliver many SIGWINCH steps; painting at
+# every intermediate size hands the emulator fresh full-width rows to rewrap
+# into scrollback fragments. Frames are dropped until the size is quiet for
+# this long, then one repaint runs at the settled geometry.
+_RESIZE_SETTLE_SECONDS = 0.25
+# Frames to wait for the post-resize cursor report before falling back to the
+# geometry-math sweep.
+_ANCHOR_MAX_WAIT_FRAMES = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,10 +521,7 @@ class VibeApp(App):  # noqa: PLR0904
         # Single-writer scrollback committer, created in on_mount when native
         # scroll is enabled. Owns durable transcript output to host scrollback.
         self._committer: ScrollbackCommitter | None = None
-        # Whether the inline live region has been pinned to the bottom of the
-        # terminal. Reset on resize so the region is re-anchored after a SIGWINCH
-        # redraw; see ``_display`` / ``_anchor_inline_region``.
-        self._inline_anchored = False
+        self._init_native_inline_state()
 
         self._chat_input_container: ChatInputContainer | None = None
         self._current_bottom_app: BottomApp = BottomApp.Input
@@ -736,6 +748,7 @@ class VibeApp(App):  # noqa: PLR0904
         with Horizontal(id="bottom-bar"):
             yield PathDisplay(self.config.displayed_workdir or Path.cwd())
             yield NoMarkupStatic(id="spacer")
+            yield NoMarkupStatic(id="bottom-agent-label")
             yield ContextProgress()
 
     @property
@@ -791,6 +804,10 @@ class VibeApp(App):  # noqa: PLR0904
         if self._banner is not None:
             self._banner.freeze_animation()
         self._apply_caret_shape()
+
+        self._install_inline_resize_handler()
+        self._setup_inline_terminal_modes()
+
         self._committer = ScrollbackCommitter(
             width_getter=lambda: self.size.width,
             refresh=self.refresh,
@@ -860,6 +877,58 @@ class VibeApp(App):  # noqa: PLR0904
 
         gc.collect()
         gc.freeze()
+
+    def _init_native_inline_state(self) -> None:
+        """Initialize native inline-region bookkeeping.
+
+        ``_inline_anchored`` tracks whether the live region is pinned to the
+        terminal bottom; it is reset on resize so the region is re-anchored on
+        the next painted frame (see ``_display`` / ``_anchor_inline_region``).
+        ``_last_painted_widths`` / ``_last_painted_size`` record the last frame
+        actually written, used by the post-resize repair and duplicate-resize
+        detection. The settle fields implement the resize-storm debounce.
+        """
+        self._inline_anchored = False
+        self._inline_needs_bottom_reset = True
+        self._inline_resized = False
+        self._inline_terminal_setup = False
+        self._last_painted_widths: list[int] | None = None
+        self._last_painted_size: tuple[int, int] | None = None
+        self._resize_settle_until = 0.0
+        self._resize_repaint_timer: Timer | None = None
+        self._anchor_wait_frames = 0
+
+    def _install_inline_resize_handler(self) -> None:
+        if not hasattr(signal, "SIGWINCH"):
+            return
+
+        # Override Textual's SIGWINCH handler to prevent it from clearing the screen
+        # with \x1b[2J, which would erase committed scrollback content from view.
+        # Textual's inline driver registers a handler that sends \x1b[2J
+        # (clear entire screen) on resize. We replace it with a handler that only
+        # sends the Resize event, preserving native terminal scrollback visibility.
+        def _on_resize_no_clear(signum: int, stack: object) -> None:
+            try:
+                width, height = shutil.get_terminal_size()
+            except (ValueError, OSError):
+                width, height = 80, 25
+            event = Resize(Size(width, height), Size(width, height))
+            driver = self._driver
+            if driver is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._post_message(event), loop=driver._loop
+                )
+
+        self._original_sigwinch_handler = signal.signal(
+            signal.SIGWINCH, _on_resize_no_clear
+        )
+
+    def _setup_inline_terminal_modes(self) -> None:
+        if self._driver is None or not self._driver.is_inline:
+            return
+        self._driver.write(build_inline_terminal_setup())
+        self._driver.flush()
+        self._inline_terminal_setup = True
 
     def _apply_caret_shape(self) -> None:
         """Apply the configured input caret shape (block / underscore)."""
@@ -2833,8 +2902,7 @@ class VibeApp(App):  # noqa: PLR0904
         self._emit_session_closed_for_active_session()
 
         loaded_messages, metadata = SessionLoader.load_session(session_path)
-        if self._chat_input_container:
-            self._chat_input_container.set_custom_border(None)
+        self._clear_input_custom_label()
 
         non_system_messages = [
             msg for msg in loaded_messages if msg.role != Role.system
@@ -2942,8 +3010,7 @@ class VibeApp(App):  # noqa: PLR0904
     async def _clear_history(self, **kwargs: Any) -> None:
         try:
             self._reset_ui_state()
-            if self._chat_input_container:
-                self._chat_input_container.set_custom_border(None)
+            self._clear_input_custom_label()
             await self.agent_loop.clear_history()
             if self.event_handler:
                 await self.event_handler.finalize_streaming()
@@ -3650,6 +3717,42 @@ class VibeApp(App):  # noqa: PLR0904
             self._chat_input_container.set_safety(profile.safety)
             self._chat_input_container.set_agent_name(profile.display_name.lower())
             self._chat_input_container.set_custom_border(None)
+        self._update_bottom_agent_label(
+            profile.display_name.lower(), safety=profile.safety
+        )
+
+    def _clear_input_custom_label(self) -> None:
+        if self._chat_input_container:
+            self._chat_input_container.set_custom_border(None)
+        profile = self.agent_loop.agent_profile
+        self._update_bottom_agent_label(
+            profile.display_name.lower(), safety=profile.safety
+        )
+
+    def _update_bottom_agent_label(self, label: str, *, safety: AgentSafety) -> None:
+        try:
+            label_widget = self.query_one("#bottom-agent-label", NoMarkupStatic)
+        except Exception:
+            return
+        normalized = label.strip().lower()
+        if len(normalized) > _BOTTOM_AGENT_LABEL_MAX:
+            normalized = f"{normalized[:_BOTTOM_AGENT_LABEL_PREFIX]}..."
+        label_widget.update(f"[{normalized}]" if normalized else "")
+        for class_name in (
+            "agent-label-safe",
+            "agent-label-warning",
+            "agent-label-error",
+        ):
+            label_widget.remove_class(class_name)
+        match safety:
+            case AgentSafety.SAFE:
+                label_widget.add_class("agent-label-safe")
+            case AgentSafety.DESTRUCTIVE:
+                label_widget.add_class("agent-label-warning")
+            case AgentSafety.YOLO:
+                label_widget.add_class("agent-label-error")
+            case AgentSafety.NEUTRAL:
+                pass
 
     async def _cycle_agent(self) -> None:
         new_profile = self.agent_loop.agent_manager.next_agent(
@@ -4044,6 +4147,21 @@ class VibeApp(App):  # noqa: PLR0904
         self.refresh(layout=True)
 
     def on_unmount(self) -> None:
+        if self._driver is not None:
+            try:
+                reset = "\x1b[r"
+                if self._inline_terminal_setup:
+                    reset += build_inline_terminal_reset()
+                self._driver.write(reset)
+            except Exception:
+                pass
+        # Restore the original SIGWINCH handler so Textual can clean up properly
+        original_sigwinch_handler = getattr(self, "_original_sigwinch_handler", None)
+        if hasattr(signal, "SIGWINCH") and original_sigwinch_handler is not None:
+            try:
+                signal.signal(signal.SIGWINCH, original_sigwinch_handler)
+            except (ValueError, OSError):
+                pass
         if self._committer is not None:
             self._committer.close()
 
@@ -4066,49 +4184,163 @@ class VibeApp(App):  # noqa: PLR0904
             and self._driver is not None
             and self._driver.is_inline
         ):
+            if time.monotonic() < self._resize_settle_until:
+                # Resize storm in flight: drop the frame. Painting now would
+                # hand the emulator fresh full-width rows to rewrap at the
+                # next step; committed lines stay queued until the repaint
+                # scheduled by ``on_resize`` runs at the settled geometry.
+                return
             # Pin the region to the terminal bottom before committing, so that
             # writing committed lines reliably scrolls them into native
             # scrollback (rather than sliding the region down a partially filled
             # screen). One-time per (re)size; safe no-op once anchored.
-            self._anchor_inline_region(renderable)
+            anchored_this_frame = self._anchor_inline_region(renderable)
+            if self._inline_resized:
+                renderable.clear = True
+                self._inline_resized = False
             if committer.has_pending:
+                region_height = len(renderable.strips)
+                terminal_size = shutil.get_terminal_size((80, 24))
+                terminal_height = terminal_size.lines
+                lines = committer.drain_lines()
                 prev = self._previous_cursor_position
-                self._driver.write(
-                    build_commit_injection(committer.drain_lines(), (prev.x, prev.y))
+                # If the live region grew since the last *painted* frame
+                # (status/loading rows appearing), the transcript rows under
+                # the taller block are scrolled up first instead of being
+                # painted over. An anchor/sweep frame already repositioned
+                # everything, so growth handling is skipped there.
+                previous_height = (
+                    len(self._last_painted_widths)
+                    if self._last_painted_widths is not None and not anchored_this_frame
+                    else None
                 )
+                sequence = build_scroll_region_commit_injection(
+                    lines,
+                    live_region_height=region_height,
+                    terminal_height=terminal_height,
+                    previous_live_region_height=previous_height,
+                )
+                if not sequence:
+                    sequence = build_commit_injection(
+                        lines,
+                        (prev.x, prev.y),
+                        live_region_height=region_height,
+                        terminal_height=terminal_height,
+                        previous_live_region_height=previous_height,
+                    )
+                self._driver.write(sequence)
                 self._previous_cursor_position = Offset(0, 0)
+            trimmed = trim_inline_update(renderable)
+            self._last_painted_widths = trimmed.painted_widths
+            painted_size = shutil.get_terminal_size((80, 24))
+            self._last_painted_size = (painted_size.columns, painted_size.lines)
+            renderable = trimmed
         super()._display(screen, renderable)
 
-    def _anchor_inline_region(self, renderable: InlineUpdate) -> None:
+    def _anchor_inline_region(self, renderable: InlineUpdate) -> bool:
         """Push the live region flush to the terminal bottom if it has drifted.
 
         Runs once after each (re)size. Uses the region's absolute top row as
         reported by the terminal (``driver.cursor_origin``); if that is not known
-        yet, the attempt is skipped and retried on the next frame.
+        yet, the attempt is skipped and retried on the next frame. Returns
+        ``True`` when a reset/anchor sequence was written this frame.
         """
         if self._inline_anchored or self._driver is None:
-            return
+            return False
+        region_height = len(renderable.strips)
+        terminal_size = shutil.get_terminal_size((80, 24))
+        terminal_height = terminal_size.lines
+        if self._inline_needs_bottom_reset:
+            # Erase the new region plus the wrap-induced fragment rows above
+            # it: a reflowing emulator has already rewrapped the previously
+            # painted live rows before SIGWINCH was delivered, so each old row
+            # wider than the new width left continuation fragments above the
+            # new region top.
+            self._driver.write(
+                build_resize_sweep(
+                    painted_widths=self._last_painted_widths or [],
+                    new_width=terminal_size.columns,
+                    region_height=region_height,
+                    terminal_height=terminal_height,
+                )
+            )
+            self._previous_cursor_position = Offset(0, 0)
+            self._inline_needs_bottom_reset = False
+            self._inline_anchored = True
+            return True
+        # Post-resize path: the emulator reflowed/relocated the buffer before
+        # SIGWINCH, so only a fresh cursor report (requested by ``on_resize``
+        # after invalidating the stale origin) can locate the old live block.
+        # The cursor rode along with its logical row, which was the caret row
+        # of the last painted frame.
         origin = self._driver.cursor_origin
         if origin is None:
-            return  # No cursor report yet; try again next frame.
-        region_height = len(renderable.strips)
-        terminal_height = shutil.get_terminal_size((80, 24)).lines
-        prev = self._previous_cursor_position
-        sequence = build_bottom_anchor(
-            region_top=origin[1],
-            region_height=region_height,
-            terminal_height=terminal_height,
-            cursor_offset=(prev.x, prev.y),
-        )
+            self._anchor_wait_frames += 1
+            if self._anchor_wait_frames < _ANCHOR_MAX_WAIT_FRAMES:
+                return False  # No fresh cursor report yet; retry next frame.
+            # Cursor report lost: fall back to the width-math sweep.
+            self._driver.write(
+                build_resize_sweep(
+                    painted_widths=self._last_painted_widths or [],
+                    new_width=terminal_size.columns,
+                    region_height=region_height,
+                    terminal_height=terminal_height,
+                )
+            )
+        else:
+            prev = self._previous_cursor_position
+            self._driver.write(
+                build_relocated_anchor(
+                    reply_row=origin[1],
+                    caret_row_offset=prev.y,
+                    region_height=region_height,
+                    terminal_height=terminal_height,
+                )
+            )
+        self._previous_cursor_position = Offset(0, 0)
         self._inline_anchored = True
-        if sequence is not None:
-            self._driver.write(sequence)
-            self._previous_cursor_position = Offset(0, 0)
+        return True
 
     def on_resize(self, event: Resize) -> None:
-        # A SIGWINCH redraw can move the live region away from the bottom row;
-        # re-anchor it on the next inline frame.
+        # Textual can deliver duplicate/late Resize events (its own idle-time
+        # resize tracking) after the geometry already settled and repainted.
+        # Re-arming the anchor then would erase healthy content with stale
+        # data, so unchanged geometry is ignored.
+        if self._inline_anchored and self._last_painted_size == (
+            event.size.width,
+            event.size.height,
+        ):
+            return
+        # A SIGWINCH redraw moves the live region; re-anchor on the next
+        # painted frame using a fresh post-reflow cursor report.
         self._inline_anchored = False
+        self._inline_resized = True
+        self._anchor_wait_frames = 0
+        if self._last_painted_widths is None:
+            # Startup resize: nothing painted yet; keep the launch bottom
+            # reset pending and do not debounce the first paint.
+            self._inline_needs_bottom_reset = True
+            return
+        driver = self._driver
+        if driver is not None and driver.is_inline:
+            # Invalidate the pre-reflow origin and ask the terminal where the
+            # cursor (and with it, the old live block) ended up.
+            driver.cursor_origin = None
+            driver.write("\x1b[6n")
+            driver.flush()
+        self._resize_settle_until = time.monotonic() + _RESIZE_SETTLE_SECONDS
+        if self._resize_repaint_timer is not None:
+            self._resize_repaint_timer.stop()
+        self._resize_repaint_timer = self.set_timer(
+            _RESIZE_SETTLE_SECONDS + 0.05, self._repaint_after_resize
+        )
+
+    def _repaint_after_resize(self) -> None:
+        self._resize_repaint_timer = None
+        # The timer firing is the quiet signal; without this a late duplicate
+        # Resize event could keep the settle gate closed indefinitely.
+        self._resize_settle_until = 0.0
+        self.refresh(layout=True)
 
     def _make_default_narrator_manager(self) -> NarratorManagerPort:
         return create_default_narrator_manager(

@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
+import os
+import re
 import time
 
 import pexpect
 import pyte
 import pytest
 
+from tests import TESTS_ROOT
+from tests.cli.terminal_loop import TerminalLoop, strip_ansi as strip_terminal_ansi
 from tests.e2e.common import strip_ansi, wait_for_rendered_text, wait_for_request_count
 from tests.e2e.mock_server import ChatCompletionsRequestPayload, StreamingMockServer
 
 _ALT_SCREEN = "\x1b[?1049h"
+_CLEAR_SCREEN = "\x1b[2J"
+_DISABLE_AUTOWRAP = "\x1b[?7l"
+_ENABLE_AUTOWRAP = "\x1b[?7h"
 _PTY_COLUMNS = 120
 _PTY_ROWS = 36
 _MANUAL_BASH_OUTPUT = "__NATIVE_MANUAL_BASH_OK__"
@@ -32,18 +40,67 @@ def _assert_native_terminal_contract(raw: str) -> None:
     assert _ALT_SCREEN not in raw
 
 
-def _terminal_lines(raw: str) -> list[str]:
-    screen = pyte.HistoryScreen(_PTY_COLUMNS, _PTY_ROWS, history=5000)
+def _terminal_lines(
+    raw: str, *, columns: int = _PTY_COLUMNS, rows: int = _PTY_ROWS
+) -> list[str]:
+    screen = pyte.HistoryScreen(columns, rows, history=5000)
     stream = pyte.ByteStream(screen)
     stream.feed(raw.encode("utf-8", "ignore"))
+    return _screen_lines(screen, columns=columns, rows=rows)
 
+
+def _screen_lines(screen: pyte.HistoryScreen, *, columns: int, rows: int) -> list[str]:
     def render_row(row) -> str:
-        return "".join(row[x].data for x in range(_PTY_COLUMNS)).rstrip()
+        return "".join(row[x].data for x in range(columns)).rstrip()
 
     return [
         *(render_row(row) for row in screen.history.top),
-        *(screen.display[y].rstrip() for y in range(_PTY_ROWS)),
+        *(screen.display[y].rstrip() for y in range(rows)),
     ]
+
+
+def _terminal_loop_text(loop: TerminalLoop) -> str:
+    return "\n".join(strip_terminal_ansi(line) for line in loop.all_lines())
+
+
+def _wait_for_terminal_text(loop: TerminalLoop, needle: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        loop.pump(timeout=0.1, idle_reads=1)
+        if needle in _terminal_loop_text(loop):
+            return
+    rendered_tail = _terminal_loop_text(loop)[-1200:]
+    raise AssertionError(
+        f"Timed out waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
+    )
+
+
+def _spawn_terminal_loop(e2e_workdir) -> tuple[pexpect.spawn, TerminalLoop]:
+    child = pexpect.spawn(
+        "uv",
+        ["run", "uvibe", "--workdir", str(e2e_workdir)],
+        cwd=str(TESTS_ROOT.parent),
+        env=os.environ.copy(),
+        encoding=None,
+        timeout=30,
+        dimensions=(_PTY_ROWS, _PTY_COLUMNS),
+    )
+    return child, TerminalLoop(child, rows=_PTY_ROWS, cols=_PTY_COLUMNS)
+
+
+def _wait_for_backend_requests(
+    loop: TerminalLoop,
+    request_count_getter: Callable[[], int],
+    *,
+    expected_count: int,
+    timeout: float,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if request_count_getter() >= expected_count:
+            return
+        loop.pump(timeout=0.1, idle_reads=1)
+    raise AssertionError(f"Timed out waiting for {expected_count} backend request(s).")
 
 
 def _slow_queue_factory(
@@ -176,6 +233,7 @@ def test_native_scroll_shell_starts_as_bottom_region(
         assert child.isalive()
         # Never enters the alternate screen buffer.
         _assert_native_terminal_contract(raw)
+        assert _DISABLE_AUTOWRAP in raw
         # The live input region is present.
         assert "> " in rendered
         # The chat scroll area and its full animated banner are hidden: transcript
@@ -186,7 +244,11 @@ def test_native_scroll_shell_starts_as_bottom_region(
         assert "/help" in rendered
 
         child.sendcontrol("d")
+        _pump(child, 0.5)
+        child.sendcontrol("d")
         _pump(child, 3.0)
+
+        assert _ENABLE_AUTOWRAP in captured.getvalue()
 
     assert not child.isalive()
 
@@ -214,9 +276,150 @@ def test_native_scroll_commits_assistant_response_to_scrollback(
 
         raw = captured.getvalue()
         _assert_native_terminal_contract(raw)
+        assert re.search(r"\x1b\[1;\d+r", raw)
+        assert "\x1b[r" in raw
 
         child.sendcontrol("d")
         _pump(child, 3.0)
+
+    assert not child.isalive()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("setup_e2e_env")
+def test_native_scroll_narrow_resize_preserves_committed_scrollback(
+    e2e_workdir,
+) -> None:
+    child, loop = _spawn_terminal_loop(e2e_workdir)
+    try:
+        _wait_for_terminal_text(loop, ">", timeout=15)
+
+        child.send(b"Greet")
+        child.send(b"\r")
+        _wait_for_terminal_text(loop, "Hello from mock server", timeout=30)
+
+        before_resize = len(loop.raw)
+        loop.resize(_PTY_ROWS, 60)
+        loop.pump(timeout=0.1, idle_reads=20)
+
+        raw = loop.raw.decode("utf-8", "replace")
+        after_resize = raw[before_resize:]
+        terminal_lines = [
+            strip_terminal_ansi(line)
+            for line in [*loop.scrollback_lines(), *loop.visible_lines()]
+        ]
+        terminal_text = "\n".join(terminal_lines)
+
+        _assert_native_terminal_contract(raw)
+        assert _CLEAR_SCREEN not in after_resize
+        assert "Hello from mock server" in terminal_text
+        hello_index = next(
+            index
+            for index, line in enumerate(terminal_lines)
+            if "Hello from mock server" in line
+        )
+        assert not any(
+            "Generating" in line for line in terminal_lines[hello_index + 1 : -4]
+        )
+
+        child.sendcontrol("d")
+        loop.pump(timeout=0.1, idle_reads=20)
+    finally:
+        if child.isalive():
+            child.terminate(force=True)
+        if not child.closed:
+            child.close()
+
+    assert not child.isalive()
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("streaming_mock_server", [_slow_queue_factory], indirect=True)
+@pytest.mark.usefixtures("setup_e2e_env")
+def test_native_scroll_active_narrow_resize_does_not_capture_live_chrome(
+    streaming_mock_server: StreamingMockServer, e2e_workdir
+) -> None:
+    child, loop = _spawn_terminal_loop(e2e_workdir)
+    try:
+        _wait_for_terminal_text(loop, ">", timeout=15)
+
+        child.send(b"Start slow turn")
+        child.send(b"\r")
+        _wait_for_backend_requests(
+            loop,
+            lambda: len(streaming_mock_server.requests),
+            expected_count=1,
+            timeout=10,
+        )
+
+        before_resize = len(loop.raw)
+        loop.resize(_PTY_ROWS, 60)
+        loop.pump(timeout=0.1, idle_reads=30)
+
+        raw = loop.raw.decode("utf-8", "replace")
+        after_resize = raw[before_resize:]
+        scrollback_lines = [
+            strip_terminal_ansi(line) for line in loop.scrollback_lines()
+        ]
+
+        _assert_native_terminal_contract(raw)
+        assert _CLEAR_SCREEN not in after_resize
+        assert not any("Generating" in line for line in scrollback_lines)
+        assert not any("─" in line for line in scrollback_lines)
+        assert not any("[default]" in line for line in scrollback_lines)
+
+        child.sendcontrol("c")
+        loop.pump(timeout=0.1, idle_reads=20)
+    finally:
+        if child.isalive():
+            child.terminate(force=True)
+        if not child.closed:
+            child.close()
+
+    assert not child.isalive()
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("resize_columns", [_PTY_COLUMNS - 20, 60])
+@pytest.mark.usefixtures("setup_e2e_env")
+def test_native_scroll_typed_input_survives_narrow_resize(
+    e2e_workdir, resize_columns: int
+) -> None:
+    child, loop = _spawn_terminal_loop(e2e_workdir)
+    prompt = b"typed resize prompt stays editable"
+    try:
+        _wait_for_terminal_text(loop, ">", timeout=15)
+
+        child.send(prompt)
+        _wait_for_terminal_text(loop, "typed resize prompt", timeout=15)
+
+        before_resize = len(loop.raw)
+        loop.resize(_PTY_ROWS, resize_columns)
+        loop.pump(timeout=0.1, idle_reads=20)
+
+        raw = loop.raw.decode("utf-8", "replace")
+        after_resize = raw[before_resize:]
+        visible_text = "\n".join(
+            strip_terminal_ansi(line) for line in loop.visible_lines()
+        )
+        scrollback_text = "\n".join(
+            strip_terminal_ansi(line) for line in loop.scrollback_lines()
+        )
+
+        _assert_native_terminal_contract(raw)
+        assert _CLEAR_SCREEN not in after_resize
+        assert "typed resize prompt" in visible_text
+        assert "typed resize prompt" not in scrollback_text
+
+        child.sendcontrol("c")
+        loop.pump(timeout=0.1, idle_reads=10)
+        child.sendcontrol("d")
+        loop.pump(timeout=0.1, idle_reads=20)
+    finally:
+        if child.isalive():
+            child.terminate(force=True)
+        if not child.closed:
+            child.close()
 
     assert not child.isalive()
 

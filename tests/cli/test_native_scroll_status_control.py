@@ -10,21 +10,28 @@ hidden ``#messages`` tree.
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from unittest.mock import MagicMock
 
 import pytest
+from textual.events import Resize
+from textual.geometry import Size
 from textual.widgets import Static
 
-from tests.conftest import build_test_vibe_app
+from tests.conftest import build_test_vibe_app, build_test_vibe_config
 import vibe.cli.textual_ui.app as app_module
 from vibe.cli.textual_ui.native_scroll.app_surfaces import (
     render_plan_notice,
     render_startup_header,
     render_teleport_outcome,
 )
+from vibe.cli.textual_ui.native_scroll.inline_frame import strip_trailing_padding
 from vibe.cli.textual_ui.scrollback_committer import ScrollbackCommitter
+from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.messages import PlanFileMessage, WarningMessage
+from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.teleport_message import TeleportMessage
+from vibe.core.agents import AgentSafety
 from vibe.core.types import PlanReviewEndedEvent, PlanReviewRequestedEvent
 
 
@@ -115,6 +122,84 @@ async def test_startup_header_committed_once() -> None:
         assert "/help" in text
         # Not mounted into the hidden transcript.
         assert len(list(app._messages_area.children)) == 0
+
+
+@pytest.mark.asyncio
+async def test_bottom_agent_label_tracks_profile_without_resetting_input() -> None:
+    app = build_test_vibe_app()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        label = app.query_one("#bottom-agent-label", NoMarkupStatic)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.value = "typed but not submitted"
+
+        app._update_profile_widgets(app.agent_loop.agent_profile)
+        await pilot.pause()
+
+        assert str(label.render()) == "[default]"
+        assert chat_input.value == "typed but not submitted"
+
+        app._update_bottom_agent_label("accept-edits", safety=AgentSafety.DESTRUCTIVE)
+        await pilot.pause()
+
+        assert str(label.render()) == "[accept-edits]"
+        assert label.has_class("agent-label-warning")
+        assert chat_input.value == "typed but not submitted"
+
+
+@pytest.mark.asyncio
+async def test_resize_settle_window_engages_only_after_first_painted_frame() -> None:
+    app = build_test_vibe_app()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        # Startup resizes must not delay the first paint.
+        assert app._resize_settle_until == 0.0
+        assert app._resize_repaint_timer is None
+
+        app._last_painted_widths = [42, 7]
+        app.on_resize(Resize(Size(80, 24), Size(80, 24)))
+
+        assert app._resize_settle_until > time.monotonic()
+        assert app._resize_repaint_timer is not None
+        first_timer = app._resize_repaint_timer
+
+        app.on_resize(Resize(Size(70, 24), Size(70, 24)))
+        assert app._resize_repaint_timer is not first_timer
+
+        app._repaint_after_resize()
+        assert app._resize_repaint_timer is None
+
+        # A late/duplicate resize at unchanged painted geometry must not
+        # re-arm the sweep: it would erase healthy transcript with stale data.
+        app._inline_anchored = True
+        app._inline_needs_bottom_reset = False
+        app._last_painted_size = (70, 24)
+        app._resize_settle_until = 0.0
+        app.on_resize(Resize(Size(70, 24), Size(70, 24)))
+        assert app._inline_anchored is True
+        assert app._inline_needs_bottom_reset is False
+        assert app._resize_settle_until == 0.0
+
+
+@pytest.mark.asyncio
+async def test_bottom_bar_paints_left_adjacent_content_only() -> None:
+    config = build_test_vibe_config(displayed_workdir="~/proj")
+    app = build_test_vibe_app(config=config)
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        bar = app.query_one("#bottom-bar")
+        strips = app.screen._compositor.render_strips()
+        row = strips[bar.region.y]
+        text = row.text.rstrip()
+        # Agent label sits directly after the path with a fixed gap, not
+        # right-aligned behind a 1fr spacer painting interior spaces.
+        assert "[default]" in text
+        assert "          " not in text
+        trimmed = strip_trailing_padding(row)
+        assert trimmed.cell_length <= len(text) + 1
+        assert trimmed.cell_length <= 100
 
 
 @pytest.mark.asyncio

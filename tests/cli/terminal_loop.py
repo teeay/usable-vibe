@@ -47,6 +47,13 @@ class TerminalLoop:
             idle = 0
             self._feed(data)
 
+    def resize(self, rows: int, cols: int) -> None:
+        """Resize both the child PTY and the emulator model."""
+        self._child.setwinsize(rows, cols)
+        self._screen.resize(lines=rows, columns=cols)
+        self._rows = rows
+        self._cols = cols
+
     def _feed(self, data: bytes) -> None:
         self._raw.extend(data)
         for index, chunk in enumerate(data.split(_DSR)):

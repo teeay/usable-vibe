@@ -84,8 +84,7 @@ class ChatInputContainer(Vertical):
         yield CompletionPopup()
 
         border_class = self._get_border_class()
-        with Vertical(id=self.ID_INPUT_BOX, classes=border_class) as input_box:
-            input_box.border_title = self._get_border_title()
+        with Vertical(id=self.ID_INPUT_BOX, classes=border_class):
             self._body = ChatInputBody(
                 history_file=self._history_file,
                 command_registry=self._command_registry,
@@ -223,9 +222,13 @@ class ChatInputContainer(Vertical):
             return ""
         return SAFETY_BORDER_CLASSES.get(self._safety, "")
 
-    def _get_border_title(self) -> str:
-        label = self._custom_border_label or self._agent_name
-        return f" {label} " if label else ""
+    @property
+    def chrome_label(self) -> str:
+        return self._custom_border_label or self._agent_name
+
+    @property
+    def safety(self) -> AgentSafety:
+        return self._safety
 
     def _apply_input_box_chrome(self) -> None:
         try:
@@ -239,5 +242,3 @@ class ChatInputContainer(Vertical):
         border_class = self._get_border_class()
         if border_class:
             input_box.add_class(border_class)
-
-        input_box.border_title = self._get_border_title()
