@@ -22,7 +22,7 @@ from vibe.cli.textual_ui.native_scroll.widget_render import render_user_prompt
 from vibe.cli.textual_ui.widgets.messages import UserMessage
 from vibe.core.types import LLMMessage, Role
 
-_SHORTENABLE_TOOL_NAMES = {"bash", "read", "grep"}
+_SHORTENABLE_TOOL_NAMES = {"bash", "read_file", "read", "grep"}
 
 HistoryBlock = tuple[RenderableType, bool]
 

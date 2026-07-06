@@ -41,18 +41,18 @@ def _fork_env() -> dict[str, str]:
 def test_release_version_uses_integer_fourth_segment() -> None:
     script = (
         "source private/scripts/_lib.sh\n"
-        "release_version_for_counter v2.18.4 9\n"
-        "next_release_counter 9\n"
+        "release_version_for_counter v2.19.0 11\n"
+        "next_release_counter 11\n"
     )
 
     result = _run_private_script(script)
 
     assert result.returncode == 0
-    assert result.stdout.splitlines() == ["2.18.4.9", "10"]
+    assert result.stdout.splitlines() == ["2.19.0.11", "12"]
 
 
 def test_release_version_rejects_zero_padded_counter() -> None:
-    script = "source private/scripts/_lib.sh\nrelease_version_for_counter v2.18.4 005\n"
+    script = "source private/scripts/_lib.sh\nrelease_version_for_counter v2.19.0 005\n"
 
     result = _run_private_script(script)
 
@@ -99,7 +99,7 @@ def test_patch_pyproject_adds_release_project_icon_url(tmp_path: Path) -> None:
             """\
             [project]
             name = "mistral-vibe"
-            version = "2.18.4"
+            version = "2.19.0"
             description = "Minimal CLI coding agent by Mistral"
             authors = [{ name = "Mistral AI" }]
             keywords = ["ai", "mistral", "developer-tools"]
@@ -139,7 +139,7 @@ def test_patch_pyproject_adds_release_project_icon_url(tmp_path: Path) -> None:
             "DOCS_URL": "https://teeay.dev/oss/uvibe",
             "ICON_URL": "https://teeay.dev/images/oss/usable-vibe-icon.png",
             "UPSTREAM_DISPLAY": "Mistral Vibe",
-            "FORK_VERSION": "2.18.4.10",
+            "FORK_VERSION": "2.19.0.11",
         },
         text=True,
     )
@@ -148,6 +148,76 @@ def test_patch_pyproject_adds_release_project_icon_url(tmp_path: Path) -> None:
     rendered = pyproject.read_text(encoding="utf-8")
     assert 'name = "uvibe"' in rendered
     assert 'Icon = "https://teeay.dev/images/oss/usable-vibe-icon.png"' in rendered
+
+
+def test_set_release_version_accepts_acp_initialize_version_binding(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "vibe").mkdir()
+    (tmp_path / "tests" / "acp").mkdir(parents=True)
+    (tmp_path / "distribution" / "zed").mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text(
+        dedent(
+            """\
+            [project]
+            name = "uvibe"
+            version = "2.19.0"
+            """
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "vibe" / "__init__.py").write_text(
+        '__version__ = "2.19.0"\n', encoding="utf-8"
+    )
+    (tmp_path / "tests" / "acp" / "test_initialize.py").write_text(
+        "from vibe import __version__\n"
+        "agent_info = Implementation(version=__version__)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "distribution" / "zed" / "extension.toml").write_text(
+        dedent(
+            """\
+            version = "2.19.0"
+            archive = "https://example.test/releases/download/v2.19.0/vibe-acp-darwin-aarch64-2.19.0.zip"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(REPO_ROOT),
+            "python",
+            str(REPO_ROOT / "private/scripts/set_release_version.py"),
+            "2.19.0.11",
+            "--root",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        check=False,
+        cwd=REPO_ROOT,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert 'version = "2.19.0.11"' in (tmp_path / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    assert (tmp_path / "vibe" / "__init__.py").read_text(encoding="utf-8") == (
+        '__version__ = "2.19.0.11"\n'
+    )
+    assert "version=__version__" in (
+        tmp_path / "tests" / "acp" / "test_initialize.py"
+    ).read_text(encoding="utf-8")
+    zed_extension = (tmp_path / "distribution" / "zed" / "extension.toml").read_text(
+        encoding="utf-8"
+    )
+    assert 'version = "2.19.0.11"' in zed_extension
+    assert "releases/download/v2.19.0.11" in zed_extension
+    assert "-2.19.0.11.zip" in zed_extension
 
 
 def test_remove_upstream_readme_install_section_preserves_surrounding_content(
@@ -423,6 +493,21 @@ def test_rebrand_rewrites_existing_prompt_markdown_dynamically() -> None:
 
     assert "find vibe/core/prompts -maxdepth 1 -type f -name '*.md'" in rebrand_script
     assert "cli_2026-06_emoji.md" not in rebrand_script
+
+
+def test_rebrand_covers_upstream_skill_command_literals() -> None:
+    rebrand_script = (REPO_ROOT / "private" / "scripts" / "rebrand.sh").read_text(
+        encoding="utf-8"
+    )
+    skill_path = ".vibe/skills/instrument-feature-analytics/SKILL.md"
+    skill_source = (REPO_ROOT / skill_path).read_text(encoding="utf-8")
+    script_name = _fork_env()["SCRIPT_NAME"]
+
+    assert "uv run vibe" in skill_source or f"uv run {script_name}" in skill_source
+    if "uv run vibe" in skill_source:
+        assert skill_path in rebrand_script
+        assert "'uv run vibe'" in rebrand_script
+        assert '"uv run ${SCRIPT_NAME}"' in rebrand_script
 
 
 def test_publish_pypi_rewrites_readme_only_for_build() -> None:

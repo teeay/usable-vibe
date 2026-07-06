@@ -6,22 +6,22 @@ semantic inputs as Rich renderables straight into the host terminal's
 scrollback. These renderers build from the typed result models
 (:class:`BashResult`, :class:`EditResult`, :class:`AskUserQuestionResult`),
 never by scraping a completed widget, so they are the durable rendering
-architecture for tool output. Disposable agent tool output (bash/read/grep) is
-shortened by default for terminal readability; manual ``!`` bash and
+architecture for tool output. Disposable agent tool output
+(``bash``/``read_file``/``grep``) is shortened by default for terminal readability;
+manual ``!`` bash and
 work-product/structured tools keep full result bodies. The renderers are pure
 and Rich-only -- no Textual, no app state -- so the terminal output can be
 unit-tested directly, mirroring ``inline_inject.py``.
 
-Every tool with a dedicated full-screen result widget (``RESULT_WIDGETS`` in
-``tool_widgets.py``) is covered here: shortened agent bash output, full manual
+The high-fidelity native body set is: shortened agent bash output, full manual
 ``!`` bash output, full edit diffs, full ask_user_question answers, full
-write_file content, shortened read content, shortened grep matches, and full
-todo lists. :func:`render_result_body` returns ``None`` for any other tool --
-the builtins rendered by the generic ``ToolResultWidget`` (``webfetch``,
-``websearch``, ``task``, ``skill``, ``exit_plan_mode``) and any future or
-non-builtin tool -- so the committer keeps its ``format_result_display`` summary
-line. Those are intentionally summary-only: their bodies are large model-facing
-reference blobs the legacy UI hides by default (see ``private/ui-map.md``).
+write_file content, shortened read_file content, shortened grep matches, and
+full todo lists. :func:`render_result_body` returns ``None`` for any other tool
+-- including ``web_fetch``, ``web_search``, ``task``, ``skill``, and
+``exit_plan_mode`` -- so the committer keeps its ``format_result_display``
+summary line. Those are intentionally summary-only: their bodies are large
+reference blobs that are collapsed in the full-screen UI (see
+``private/ui-map.md``).
 """
 
 from __future__ import annotations
@@ -39,13 +39,13 @@ from vibe.core.tools.builtins.ask_user_question import AskUserQuestionResult
 from vibe.core.tools.builtins.bash import BashResult
 from vibe.core.tools.builtins.edit import EditResult
 from vibe.core.tools.builtins.grep import GrepResult
-from vibe.core.tools.builtins.read import ReadResult
+from vibe.core.tools.builtins.read_file import ReadFileResult
 from vibe.core.tools.builtins.todo import TodoResult
 from vibe.core.tools.builtins.write_file import WriteFileResult
 
 # A unified-diff hunk header, e.g. ``@@ -1,3 +1,4 @@``.
 _HUNK_HEADER_RE = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-# The model-facing ``   12→`` line-number prefix added to read output.
+# The model-facing ``   12→`` line-number prefix added to read_file output.
 _LINE_NUMBER_PREFIX_RE = re.compile(r"^ *\d+→")
 # Todo statuses in display order, with their checkbox icons.
 _TODO_STATUS_ORDER = ("in_progress", "pending", "completed", "cancelled")
@@ -85,7 +85,7 @@ def render_result_body(
             body = _render_ask_user_question_result(result)
         case ("write_file", WriteFileResult()):
             body = _render_write_file_result(result, dark=dark, ansi=ansi)
-        case ("read", ReadResult()):
+        case ("read_file" | "read", ReadFileResult()):
             body = _render_read_result(
                 result,
                 dark=dark,
@@ -190,12 +190,12 @@ def _render_write_file_result(
     if not content:
         return Text("(no content)", style="dim")
     return _highlighted_block(
-        content, _language_for_path(result.path), dark=dark, ansi=ansi
+        content, _language_for_path(result.file_path), dark=dark, ansi=ansi
     )
 
 
 def _render_read_result(
-    result: ReadResult,
+    result: ReadFileResult,
     *,
     dark: bool,
     ansi: bool,

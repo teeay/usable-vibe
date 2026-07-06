@@ -36,11 +36,15 @@ def test_render_history_blocks_covers_each_role() -> None:
             content="pong",
             tool_calls=[
                 ToolCall(
-                    id="c1", index=0, function=FunctionCall(name="read", arguments="{}")
+                    id="c1",
+                    index=0,
+                    function=FunctionCall(name="read_file", arguments="{}"),
                 )
             ],
         ),
-        LLMMessage(role=Role.tool, content="file body", name="read", tool_call_id="c1"),
+        LLMMessage(
+            role=Role.tool, content="file body", name="read_file", tool_call_id="c1"
+        ),
     ]
     committer = _committer()
     for block, is_full_width in render_history_blocks(messages, {}, omitted_count=0):
@@ -48,7 +52,7 @@ def test_render_history_blocks_covers_each_role() -> None:
     text = _lines(committer)
     assert "ping" in text
     assert "pong" in text
-    assert "read" in text
+    assert "read_file" in text
     assert "file body" in text
 
 

@@ -296,7 +296,7 @@ def test_write_file_result_commits_content_body() -> None:
             tool_name="write_file",
             tool_class=WriteFile,
             result=WriteFileResult(
-                path="hello.py", bytes_written=11, content="print('hi')\n"
+                file_path="hello.py", bytes_written=11, content="print('hi')\n"
             ),
             tool_call_id="w1",
         )
@@ -305,14 +305,14 @@ def test_write_file_result_commits_content_body() -> None:
 
 
 def test_read_result_commits_content_body_without_line_numbers() -> None:
-    from vibe.core.tools.builtins.read import Read, ReadResult
+    from vibe.core.tools.builtins.read_file import ReadFile, ReadFileResult
 
     committer = _committer()
     committer.handle_event(
         ToolResultEvent(
-            tool_name="read",
-            tool_class=Read,
-            result=ReadResult(
+            tool_name="read_file",
+            tool_class=ReadFile,
+            result=ReadFileResult(
                 file_path="a.py",
                 content="   1→import os\n   2→print(os)",
                 num_lines=2,
@@ -375,12 +375,12 @@ def test_todo_result_commits_status_grouped_body() -> None:
 
 
 def test_unregistered_builtin_result_is_summary_only() -> None:
-    from vibe.core.tools.builtins.websearch import WebSearch, WebSearchResult
+    from vibe.core.tools.builtins.web_search import WebSearch, WebSearchResult
 
     committer = _committer()
     committer.handle_event(
         ToolResultEvent(
-            tool_name="websearch",
+            tool_name="web_search",
             tool_class=WebSearch,
             result=WebSearchResult(
                 query="capital of france", answer="Paris is the capital.", sources=[]
@@ -389,7 +389,7 @@ def test_unregistered_builtin_result_is_summary_only() -> None:
         )
     )
     text = _drain_text(committer)
-    # websearch has no dedicated body renderer: the summary line is committed,
+    # web_search has no native body renderer: the summary line is committed,
     # and the large answer/source body is intentionally not dumped.
     assert "capital of france" in text
     assert "Paris is the capital." not in text

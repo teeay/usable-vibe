@@ -400,7 +400,7 @@ async def test_execute_rewind_commits_marker_and_prefills_input() -> None:
         app._committer.drain_lines()
 
         app.agent_loop.rewind_manager.rewind_to_message = AsyncMock(  # type: ignore[method-assign]
-            return_value=("second prompt", [])
+            return_value=("second prompt", [], [])
         )
 
         app.action_rewind_prev()

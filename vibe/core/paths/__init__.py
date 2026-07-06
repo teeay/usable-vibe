@@ -21,6 +21,7 @@ from vibe.core.paths._vibe_home import (
     TRUSTED_FOLDERS_FILE,
     UVIBE_HOME,
     VIBE_HOME,
+    WORKTREES_DIR,
     GlobalPath,
 )
 from vibe.core.paths.conventions import AGENTS_MD_FILENAME
@@ -42,6 +43,7 @@ __all__ = [
     "TRUSTED_FOLDERS_FILE",
     "UVIBE_HOME",
     "VIBE_HOME",
+    "WORKTREES_DIR",
     "GlobalPath",
     "LocalConfigDirs",
     "dedup_paths",

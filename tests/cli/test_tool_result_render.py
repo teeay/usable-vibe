@@ -13,7 +13,7 @@ from vibe.core.tools.builtins.ask_user_question import Answer, AskUserQuestionRe
 from vibe.core.tools.builtins.bash import BashResult
 from vibe.core.tools.builtins.edit import EditResult
 from vibe.core.tools.builtins.grep import GrepResult
-from vibe.core.tools.builtins.read import ReadResult
+from vibe.core.tools.builtins.read_file import ReadFileResult
 from vibe.core.tools.builtins.todo import TodoItem, TodoResult, TodoStatus
 from vibe.core.tools.builtins.write_file import WriteFileResult
 
@@ -248,7 +248,9 @@ def test_ask_cancelled_renders_cancel_notice() -> None:
 
 
 def test_write_file_body_includes_content() -> None:
-    result = WriteFileResult(path="hello.py", bytes_written=11, content="print('hi')\n")
+    result = WriteFileResult(
+        file_path="hello.py", bytes_written=11, content="print('hi')\n"
+    )
     text = _plain(render_result_body("write_file", result, dark=True, ansi=False))
     assert "print('hi')" in text
 
@@ -256,7 +258,7 @@ def test_write_file_body_includes_content() -> None:
 def test_write_file_body_does_not_shorten() -> None:
     content = "\n".join(f"line {i}" for i in range(1, 11))
     result = WriteFileResult(
-        path="hello.py", bytes_written=len(content), content=content
+        file_path="hello.py", bytes_written=len(content), content=content
     )
     text = _plain(render_result_body("write_file", result, dark=True, ansi=False))
     assert "line 4" in text
@@ -265,19 +267,19 @@ def test_write_file_body_does_not_shorten() -> None:
 
 
 def test_write_file_empty_content_renders_no_content() -> None:
-    result = WriteFileResult(path="empty.txt", bytes_written=0, content="")
+    result = WriteFileResult(file_path="empty.txt", bytes_written=0, content="")
     text = _plain(render_result_body("write_file", result, dark=True, ansi=False))
     assert "(no content)" in text
 
 
 def test_read_body_strips_line_number_prefixes() -> None:
-    result = ReadResult(
+    result = ReadFileResult(
         file_path="a.py",
         content="   1→import os\n   2→print(os.getcwd())",
         num_lines=2,
         start_line=1,
     )
-    text = _plain(render_result_body("read", result, dark=True, ansi=False))
+    text = _plain(render_result_body("read_file", result, dark=True, ansi=False))
     assert "import os" in text
     assert "print(os.getcwd())" in text
     assert "1→" not in text
@@ -286,8 +288,10 @@ def test_read_body_strips_line_number_prefixes() -> None:
 
 def test_read_body_shortens_after_stripping_line_numbers() -> None:
     content = "\n".join(f"{i:4d}→value {i}" for i in range(1, 11))
-    result = ReadResult(file_path="a.py", content=content, num_lines=10, start_line=1)
-    text = _plain(render_result_body("read", result, dark=True, ansi=False))
+    result = ReadFileResult(
+        file_path="a.py", content=content, num_lines=10, start_line=1
+    )
+    text = _plain(render_result_body("read_file", result, dark=True, ansi=False))
     assert "value 1" in text
     assert "value 3" in text
     assert "value 4" not in text
@@ -299,8 +303,8 @@ def test_read_body_shortens_after_stripping_line_numbers() -> None:
 
 
 def test_read_empty_content_renders_no_content() -> None:
-    result = ReadResult(file_path="a.py", content="", num_lines=0, start_line=1)
-    text = _plain(render_result_body("read", result, dark=True, ansi=False))
+    result = ReadFileResult(file_path="a.py", content="", num_lines=0, start_line=1)
+    text = _plain(render_result_body("read_file", result, dark=True, ansi=False))
     assert "(no content)" in text
 
 
@@ -358,7 +362,7 @@ def test_todo_empty_renders_no_todos() -> None:
 
 def test_unknown_tool_has_no_body() -> None:
     result = BashResult(command="ls", stdout="x", stderr="", returncode=0)
-    assert render_result_body("webfetch", result, dark=True, ansi=False) is None
+    assert render_result_body("web_fetch", result, dark=True, ansi=False) is None
 
 
 def test_mismatched_result_type_has_no_body() -> None:
