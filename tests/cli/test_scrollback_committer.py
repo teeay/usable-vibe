@@ -31,6 +31,7 @@ from vibe.core.types import (
     AssistantEvent,
     BaseEvent,
     CompactEndEvent,
+    ContextClearedEvent,
     FileImageSource,
     ImageAttachment,
     ReasoningEvent,
@@ -146,6 +147,12 @@ def test_tool_error_result_renders_failure() -> None:
     text = _drain_text(committer)
     assert "✗" in text
     assert "boom" in text
+
+
+def test_context_cleared_event_is_app_handled_and_silent() -> None:
+    committer = _committer()
+    committer.handle_event(ContextClearedEvent(plan_file_path=Path("/tmp/plan.md")))
+    assert committer.has_pending is False
 
 
 def test_bash_result_commits_output_body() -> None:

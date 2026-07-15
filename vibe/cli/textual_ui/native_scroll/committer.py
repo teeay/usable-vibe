@@ -60,6 +60,7 @@ from vibe.core.types import (
     BaseEvent,
     CompactEndEvent,
     CompactStartEvent,
+    ContextClearedEvent,
     LLMMessage,
     PlanReviewEndedEvent,
     PlanReviewRequestedEvent,
@@ -405,6 +406,7 @@ class ScrollbackCommitter:
                 AgentProfileChangedEvent()
                 | SessionTitleUpdatedEvent()
                 | PlanReviewEndedEvent()
+                | ContextClearedEvent()
             ):
                 pass  # No durable transcript line; handled live by the app.
             case _:

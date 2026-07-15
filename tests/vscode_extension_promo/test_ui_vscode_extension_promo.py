@@ -25,7 +25,6 @@ from vibe.cli.textual_ui.widgets.messages import (
 from vibe.cli.update_notifier import UpdateCache
 from vibe.cli.vscode_extension_promo import (
     VscodeExtensionPromo,
-    VscodeExtensionPromoState,
 )
 from vibe.core.config import VibeConfig
 
@@ -74,7 +73,7 @@ def _bypass_promo_gates() -> object:
 
 
 @pytest.mark.asyncio
-async def test_promo_appears_as_standalone_chat_message_when_no_whats_new(
+async def test_promo_stays_disabled_when_no_whats_new(
     vibe_config: VibeConfig, tmp_path: Path
 ) -> None:
     repository = FakeVscodeExtensionPromoRepository()
@@ -93,14 +92,15 @@ async def test_promo_appears_as_standalone_chat_message_when_no_whats_new(
     with patch("vibe.cli.update_notifier.whats_new.VIBE_ROOT", tmp_path):
         async with app.run_test() as pilot:
             await pilot.pause(0.3)
-            await _wait_for(lambda: bool(app.query(VscodeExtensionPromoMessage)), pilot)
+            await pilot.pause(0.4)
 
+    assert not app.query(VscodeExtensionPromoMessage)
     assert not app.query(WhatsNewMessage)
-    assert repository.state == VscodeExtensionPromoState(shown_count=1)
+    assert repository.state is None
 
 
 @pytest.mark.asyncio
-async def test_promo_is_merged_into_whats_new_message_when_both_shown(
+async def test_promo_stays_disabled_when_whats_new_shown(
     vibe_config: VibeConfig, tmp_path: Path
 ) -> None:
     repository = FakeVscodeExtensionPromoRepository()
@@ -124,13 +124,13 @@ async def test_promo_is_merged_into_whats_new_message_when_both_shown(
             await _wait_for(lambda: bool(app.query(WhatsNewMessage)), pilot)
             message = app.query_one(WhatsNewMessage)
             await _wait_for(
-                lambda: repository.state == VscodeExtensionPromoState(shown_count=1),
+                lambda: repository.state is None,
                 pilot,
             )
 
     assert not app.query(VscodeExtensionPromoMessage)
     assert message._content.startswith(whats_new_content)
-    assert message._content.endswith(VSCODE_EXTENSION_PROMO_WHATS_NEW_SUFFIX)
+    assert not message._content.endswith(VSCODE_EXTENSION_PROMO_WHATS_NEW_SUFFIX)
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import re
 import time
 from typing import Any, ClassVar, Literal
 
@@ -9,7 +10,7 @@ from textual.binding import Binding
 from textual.message import Message
 from textual.reactive import Reactive, reactive
 from textual.widgets import TextArea
-from textual.widgets.text_area import Selection
+from textual.widgets.text_area import Location, Selection
 
 from vibe.cli.autocompletion.base import CompletionResult
 from vibe.cli.commands import CommandRegistry
@@ -32,8 +33,14 @@ from vibe.core.config.models import NativeScrollCursorShape
 
 InputMode = Literal["!", "/", ">", "&"]
 
+_WORD = re.compile(r"\w+")
+_DOUBLE_CLICK = 2
+_TRIPLE_CLICK = 3
+
 
 class ChatTextArea(TextArea):
+    ALLOW_SELECT: ClassVar[bool] = False
+
     # The base TextArea draws its caret by reverse-styling the cell under the
     # cursor. Under the fork's ansi themes that resolves to `reverse` over a
     # default/ANSI-black pair, which on the usual end-of-line (blank) caret cell
@@ -194,6 +201,18 @@ class ChatTextArea(TextArea):
 
     def on_click(self, event: events.Click) -> None:
         self._mark_cursor_moved_if_needed()
+        if event.chain == _DOUBLE_CLICK:
+            self._select_word_at(self.get_target_document_location(event))
+        elif event.chain == _TRIPLE_CLICK:
+            self.select_line(self.get_target_document_location(event)[0])
+
+    def _select_word_at(self, location: Location) -> None:
+        row, column = location
+        for match in _WORD.finditer(self.document[row]):
+            start, end = match.span()
+            if start <= column < end:
+                self.selection = Selection((row, start), (row, end))
+                return
 
     async def _on_paste(self, event: events.Paste) -> None:
         # Best-effort: terminals that emit bracketed paste sequences will

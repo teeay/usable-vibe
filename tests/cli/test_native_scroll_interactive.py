@@ -242,9 +242,6 @@ async def test_thinking_selection_commits_single_outcome(
         assert app._committer is not None
         app._committer.drain_lines()
         _neutralize_reload(app, monkeypatch)
-        # set_thinking writes the TOML; stub it on the class (pydantic instances
-        # reject attribute assignment) so the test isolates the outcome commit.
-        monkeypatch.setattr(type(app.config), "set_thinking", lambda self, level: None)
 
         await app.on_thinking_picker_app_thinking_selected(
             ThinkingPickerApp.ThinkingSelected(level="high")

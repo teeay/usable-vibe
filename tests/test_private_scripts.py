@@ -41,18 +41,18 @@ def _fork_env() -> dict[str, str]:
 def test_release_version_uses_integer_fourth_segment() -> None:
     script = (
         "source private/scripts/_lib.sh\n"
-        "release_version_for_counter v2.19.0 11\n"
-        "next_release_counter 11\n"
+        "release_version_for_counter v2.19.1 12\n"
+        "next_release_counter 12\n"
     )
 
     result = _run_private_script(script)
 
     assert result.returncode == 0
-    assert result.stdout.splitlines() == ["2.19.0.11", "12"]
+    assert result.stdout.splitlines() == ["2.19.1.12", "13"]
 
 
 def test_release_version_rejects_zero_padded_counter() -> None:
-    script = "source private/scripts/_lib.sh\nrelease_version_for_counter v2.19.0 005\n"
+    script = "source private/scripts/_lib.sh\nrelease_version_for_counter v2.19.1 005\n"
 
     result = _run_private_script(script)
 
@@ -99,7 +99,7 @@ def test_patch_pyproject_adds_release_project_icon_url(tmp_path: Path) -> None:
             """\
             [project]
             name = "mistral-vibe"
-            version = "2.19.0"
+            version = "2.19.1"
             description = "Minimal CLI coding agent by Mistral"
             authors = [{ name = "Mistral AI" }]
             keywords = ["ai", "mistral", "developer-tools"]
@@ -139,7 +139,7 @@ def test_patch_pyproject_adds_release_project_icon_url(tmp_path: Path) -> None:
             "DOCS_URL": "https://teeay.dev/oss/uvibe",
             "ICON_URL": "https://teeay.dev/images/oss/usable-vibe-icon.png",
             "UPSTREAM_DISPLAY": "Mistral Vibe",
-            "FORK_VERSION": "2.19.0.11",
+            "FORK_VERSION": "2.19.1.12",
         },
         text=True,
     )
@@ -161,13 +161,13 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
             """\
             [project]
             name = "uvibe"
-            version = "2.19.0"
+            version = "2.19.1"
             """
         ),
         encoding="utf-8",
     )
     (tmp_path / "vibe" / "__init__.py").write_text(
-        '__version__ = "2.19.0"\n', encoding="utf-8"
+        '__version__ = "2.19.1"\n', encoding="utf-8"
     )
     (tmp_path / "tests" / "acp" / "test_initialize.py").write_text(
         "from vibe import __version__\n"
@@ -177,8 +177,8 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
     (tmp_path / "distribution" / "zed" / "extension.toml").write_text(
         dedent(
             """\
-            version = "2.19.0"
-            archive = "https://example.test/releases/download/v2.19.0/vibe-acp-darwin-aarch64-2.19.0.zip"
+            version = "2.19.1"
+            archive = "https://example.test/releases/download/v2.19.1/vibe-acp-darwin-aarch64-2.19.1.zip"
             """
         ),
         encoding="utf-8",
@@ -192,7 +192,7 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
             str(REPO_ROOT),
             "python",
             str(REPO_ROOT / "private/scripts/set_release_version.py"),
-            "2.19.0.11",
+            "2.19.1.12",
             "--root",
             str(tmp_path),
         ],
@@ -203,11 +203,11 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
     )
 
     assert result.returncode == 0, result.stderr
-    assert 'version = "2.19.0.11"' in (tmp_path / "pyproject.toml").read_text(
+    assert 'version = "2.19.1.12"' in (tmp_path / "pyproject.toml").read_text(
         encoding="utf-8"
     )
     assert (tmp_path / "vibe" / "__init__.py").read_text(encoding="utf-8") == (
-        '__version__ = "2.19.0.11"\n'
+        '__version__ = "2.19.1.12"\n'
     )
     assert "version=__version__" in (
         tmp_path / "tests" / "acp" / "test_initialize.py"
@@ -215,9 +215,9 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
     zed_extension = (tmp_path / "distribution" / "zed" / "extension.toml").read_text(
         encoding="utf-8"
     )
-    assert 'version = "2.19.0.11"' in zed_extension
-    assert "releases/download/v2.19.0.11" in zed_extension
-    assert "-2.19.0.11.zip" in zed_extension
+    assert 'version = "2.19.1.12"' in zed_extension
+    assert "releases/download/v2.19.1.12" in zed_extension
+    assert "-2.19.1.12.zip" in zed_extension
 
 
 def test_remove_upstream_readme_install_section_preserves_surrounding_content(
@@ -508,6 +508,60 @@ def test_rebrand_covers_upstream_skill_command_literals() -> None:
         assert skill_path in rebrand_script
         assert "'uv run vibe'" in rebrand_script
         assert '"uv run ${SCRIPT_NAME}"' in rebrand_script
+
+
+def test_rebrand_disables_vscode_extension_promo_ui_tests() -> None:
+    rebrand_script = (REPO_ROOT / "private" / "scripts" / "rebrand.sh").read_text(
+        encoding="utf-8"
+    )
+    promo_test_path = "tests/vscode_extension_promo/test_ui_vscode_extension_promo.py"
+    promo_test = (REPO_ROOT / promo_test_path).read_text(encoding="utf-8")
+    app_source = (REPO_ROOT / "vibe" / "cli" / "textual_ui" / "app.py").read_text(
+        encoding="utf-8"
+    )
+    required_substitutions = {
+        "test_promo_appears_as_standalone_chat_message_when_no_whats_new": (
+            "test_promo_stays_disabled_when_no_whats_new"
+        ),
+        "test_promo_is_merged_into_whats_new_message_when_both_shown": (
+            "test_promo_stays_disabled_when_whats_new_shown"
+        ),
+        "await _wait_for(lambda: bool(app.query(VscodeExtensionPromoMessage)), pilot)": (
+            "await pilot.pause(0.4)"
+        ),
+        "lambda: repository.state == VscodeExtensionPromoState(shown_count=1),": (
+            "lambda: repository.state is None,"
+        ),
+        "assert repository.state == VscodeExtensionPromoState(shown_count=1)": (
+            "assert repository.state is None"
+        ),
+        "assert message._content.endswith(VSCODE_EXTENSION_PROMO_WHATS_NEW_SUFFIX)": (
+            "assert not message._content.endswith("
+            "VSCODE_EXTENSION_PROMO_WHATS_NEW_SUFFIX)"
+        ),
+    }
+
+    assert promo_test_path in rebrand_script
+    assert (
+        "vscode_extension_promo=vscode_extension_promo," in app_source
+        or "vscode_extension_promo=None," in app_source
+    )
+    assert "vscode_extension_promo=vscode_extension_promo," in rebrand_script
+    assert "vscode_extension_promo=None," in rebrand_script
+    for upstream, released in required_substitutions.items():
+        assert upstream in promo_test or released in promo_test
+        if upstream in promo_test:
+            assert upstream in rebrand_script
+            assert released in rebrand_script
+    assert "    assert not app.query(WhatsNewMessage)" in promo_test
+    assert "    assert not app.query(WhatsNewMessage)\\n" in rebrand_script
+    assert "    assert repository.state is None" in rebrand_script
+    assert "    assert not app.query(VscodeExtensionPromoMessage)\\n" in rebrand_script
+    assert (
+        "VscodeExtensionPromoState," in promo_test
+        or "VscodeExtensionPromo,\n)" in promo_test
+    )
+    assert "VscodeExtensionPromoState," in rebrand_script
 
 
 def test_publish_pypi_rewrites_readme_only_for_build() -> None:

@@ -13,6 +13,8 @@ from tests.conftest import (
 from tests.skills.conftest import create_skill
 from vibe.cli.textual_ui.app import VibeApp
 from vibe.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
+from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
+from vibe.core.types import Role
 
 SKILL_BODY = "## Instructions\n\nDo the thing."
 
@@ -40,8 +42,17 @@ async def _wait_for_scrollback_containing(
     )
 
 
+async def _wait_until(pilot, predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await pilot.pause(0.05)
+    return False
+
+
 @pytest.mark.asyncio
-async def test_skill_without_args_sends_skill_content(
+async def test_skill_without_args_displays_literal_command(
     vibe_app_with_skills: VibeApp,
 ) -> None:
     async with vibe_app_with_skills.run_test() as pilot:
@@ -51,13 +62,14 @@ async def test_skill_without_args_sends_skill_content(
         await pilot.pause(0.1)
 
         scrollback = await _wait_for_scrollback_containing(
-            vibe_app_with_skills, pilot, "Do the thing."
+            vibe_app_with_skills, pilot, "Loaded skill: my-skill"
         )
-        assert "Do the thing." in scrollback
+        assert "/my-skill" in scrollback
+        assert "Do the thing." not in scrollback
 
 
 @pytest.mark.asyncio
-async def test_skill_with_args_prepends_invocation_line(
+async def test_skill_with_args_displays_literal_command_with_args(
     vibe_app_with_skills: VibeApp,
 ) -> None:
     async with vibe_app_with_skills.run_test() as pilot:
@@ -67,10 +79,10 @@ async def test_skill_with_args_prepends_invocation_line(
         await pilot.pause(0.1)
 
         scrollback = await _wait_for_scrollback_containing(
-            vibe_app_with_skills, pilot, "Do the thing."
+            vibe_app_with_skills, pilot, "Loaded skill: my-skill"
         )
         assert "/my-skill foo bar" in scrollback
-        assert "Do the thing." in scrollback
+        assert "Do the thing." not in scrollback
 
 
 @pytest.mark.asyncio
@@ -95,11 +107,13 @@ async def test_bare_slash_falls_through(vibe_app_with_skills: VibeApp) -> None:
         chat_input.post_message(ChatInputContainer.Submitted("/"))
         await pilot.pause(0.2)
 
-        assert "Do the thing." not in committed_scrollback(vibe_app_with_skills)
+        assert "Loaded skill: my-skill" not in committed_scrollback(
+            vibe_app_with_skills
+        )
 
 
 @pytest.mark.asyncio
-async def test_skill_without_args_does_not_prepend_invocation_line(
+async def test_skill_without_args_does_not_add_extra_text(
     vibe_app_with_skills: VibeApp,
 ) -> None:
     async with vibe_app_with_skills.run_test() as pilot:
@@ -109,9 +123,29 @@ async def test_skill_without_args_does_not_prepend_invocation_line(
         await pilot.pause(0.1)
 
         scrollback = await _wait_for_scrollback_containing(
-            vibe_app_with_skills, pilot, "Do the thing."
+            vibe_app_with_skills, pilot, "Loaded skill: my-skill"
         )
-        assert "/my-skill" not in scrollback
+        assert "/my-skill" in scrollback
+        assert "Do the thing." not in scrollback
+
+
+@pytest.mark.asyncio
+async def test_idle_skill_fires_telemetry(
+    vibe_app_with_skills: VibeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with vibe_app_with_skills.run_test() as pilot:
+        events: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            vibe_app_with_skills.agent_loop.telemetry_client,
+            "send_slash_command_used",
+            lambda name, kind: events.append((name, kind)),
+        )
+
+        chat_input = vibe_app_with_skills.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("/my-skill foo"))
+        await pilot.pause(0.1)
+
+        assert events == [("my-skill", "skill")]
 
 
 @pytest.mark.asyncio
@@ -139,3 +173,88 @@ async def test_popped_queued_skill_does_not_fire_telemetry(
             assert events == []
         finally:
             vibe_app_with_skills._agent_running = False
+
+
+@pytest.mark.asyncio
+async def test_queued_head_skill_injects_skill_tool_message(
+    vibe_app_with_skills: VibeApp,
+) -> None:
+    async with vibe_app_with_skills.run_test() as pilot:
+        chat_input = vibe_app_with_skills.query_one(ChatInputContainer)
+        vibe_app_with_skills._agent_running = True
+        try:
+            chat_input.post_message(ChatInputContainer.Submitted("/my-skill"))
+            chat_input.post_message(ChatInputContainer.Submitted("follow-up prompt"))
+            await pilot.pause(0.1)
+            assert len(vibe_app_with_skills._input_queue) == 2
+        finally:
+            vibe_app_with_skills._agent_running = False
+
+        vibe_app_with_skills._queue.start_drain_if_needed()
+
+        assert await _wait_until(
+            pilot,
+            lambda: (
+                len(vibe_app_with_skills._input_queue) == 0
+                and vibe_app_with_skills._agent_task is None
+                and any(
+                    widget._tool_name == "skill"
+                    for widget in vibe_app_with_skills.query(ToolCallMessage)
+                )
+                and any(
+                    widget.tool_name == "skill"
+                    for widget in vibe_app_with_skills.query(ToolResultMessage)
+                )
+            ),
+            timeout=5.0,
+        )
+
+        assert any(
+            message.role == Role.tool
+            and message.name == "skill"
+            and '<skill_content name="my-skill">' in (message.content or "")
+            for message in vibe_app_with_skills.agent_loop.messages
+        )
+
+
+@pytest.mark.asyncio
+async def test_skill_prompt_flushed_before_bash_injects_skill_tool_message(
+    vibe_app_with_skills: VibeApp,
+) -> None:
+    async with vibe_app_with_skills.run_test() as pilot:
+        chat_input = vibe_app_with_skills.query_one(ChatInputContainer)
+        vibe_app_with_skills._agent_running = True
+        try:
+            chat_input.post_message(ChatInputContainer.Submitted("/my-skill"))
+            chat_input.post_message(ChatInputContainer.Submitted("!echo queued"))
+            await pilot.pause(0.1)
+            assert len(vibe_app_with_skills._input_queue) == 2
+        finally:
+            vibe_app_with_skills._agent_running = False
+
+        vibe_app_with_skills._queue.start_drain_if_needed()
+
+        assert await _wait_until(
+            pilot,
+            lambda: (
+                len(vibe_app_with_skills._input_queue) == 0
+                and vibe_app_with_skills._agent_task is None
+                and vibe_app_with_skills._bash_task is None
+                and any(
+                    widget._tool_name == "skill"
+                    for widget in vibe_app_with_skills.query(ToolCallMessage)
+                )
+                and any(
+                    widget.tool_name == "skill"
+                    for widget in vibe_app_with_skills.query(ToolResultMessage)
+                )
+            ),
+            timeout=5.0,
+        )
+
+        assert any(
+            message.role == Role.tool
+            and message.name == "skill"
+            and '<skill_content name="my-skill">' in (message.content or "")
+            for message in vibe_app_with_skills.agent_loop.messages
+        )

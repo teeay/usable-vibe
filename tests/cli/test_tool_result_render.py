@@ -12,6 +12,12 @@ from vibe.cli.textual_ui.tool_result_render import (
 from vibe.core.tools.builtins.ask_user_question import Answer, AskUserQuestionResult
 from vibe.core.tools.builtins.bash import BashResult
 from vibe.core.tools.builtins.edit import EditResult
+from vibe.core.tools.builtins.experimental_bash import (
+    BashLogFileResult,
+    BashOutputResult,
+    BashStdinResult,
+    ExperimentalBashResult,
+)
 from vibe.core.tools.builtins.grep import GrepResult
 from vibe.core.tools.builtins.read_file import ReadFileResult
 from vibe.core.tools.builtins.todo import TodoItem, TodoResult, TodoStatus
@@ -40,6 +46,67 @@ def test_bash_body_includes_stdout_and_stderr() -> None:
     text = _plain(render_result_body("bash", result, dark=True, ansi=False))
     assert "line-out" in text
     assert "line-err" in text
+
+
+def test_experimental_bash_body_uses_compat_stdout() -> None:
+    result = ExperimentalBashResult(
+        command="printf",
+        stdout="line-out\n",
+        stderr="",
+        output="ignored fallback\n",
+        returncode=0,
+    )
+    text = _plain(render_result_body("bash", result, dark=True, ansi=False))
+    assert "line-out" in text
+    assert "ignored fallback" not in text
+
+
+def test_experimental_bash_body_falls_back_to_output() -> None:
+    result = ExperimentalBashResult(
+        command="printf", stdout="", stderr="", output="pty output\n", returncode=0
+    )
+    text = _plain(render_result_body("bash", result, dark=True, ansi=False))
+    assert "pty output" in text
+
+
+def test_bash_output_body_shortens_output() -> None:
+    result = BashOutputResult(
+        session_id="bash_1",
+        status="running",
+        output="\n".join(f"line-{i}" for i in range(1, 11)),
+        next_cursor=99,
+        truncated=False,
+        output_path="/tmp/log",
+    )
+    text = _plain(render_result_body("bash_output", result, dark=True, ansi=False))
+    assert "line-1" in text
+    assert "line-4" not in text
+    assert "line-10" in text
+    assert "... 4 lines omitted ..." in text
+
+
+def test_bash_log_file_read_body_renders_content_only_for_read() -> None:
+    result = BashLogFileResult(
+        action="read",
+        path="/tmp/bash.log",
+        content="log line\n",
+        next_cursor=9,
+        truncated=False,
+    )
+    text = _plain(render_result_body("bash_log_file", result, dark=True, ansi=False))
+    assert "log line" in text
+
+    write_result = BashLogFileResult(
+        action="write", path="/tmp/bash.log", bytes_written=8
+    )
+    assert (
+        render_result_body("bash_log_file", write_result, dark=True, ansi=False) is None
+    )
+
+
+def test_bash_control_tools_remain_summary_only() -> None:
+    result = BashStdinResult(session_id="bash_1", bytes_written=2, status="running")
+    assert render_result_body("bash_stdin", result, dark=True, ansi=False) is None
 
 
 def test_shorten_text_middle_keeps_short_content() -> None:

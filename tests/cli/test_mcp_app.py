@@ -3,9 +3,8 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 import inspect
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
-import pytest
 from textual.content import Content
 from textual.widgets.option_list import Option
 
@@ -192,11 +191,10 @@ class TestMCPAppInit:
         app.action_back()
         assert render_calls == []
 
-    @pytest.mark.asyncio
-    async def test_action_refresh_dispatches_worker(self) -> None:
+    def test_start_refresh_dispatches_worker(self) -> None:
         servers = [MCPStdio(name="srv", transport="stdio", command="cmd")]
         mgr = _make_tool_manager({})
-        refresh_callback = AsyncMock(return_value="Refreshed.")
+        refresh_callback = AsyncMock(return_value=None)
         app = MCPApp(
             mcp_servers=servers, tool_manager=mgr, refresh_callback=refresh_callback
         )
@@ -204,11 +202,35 @@ class TestMCPAppInit:
         app._set_help_text = MagicMock()
         app.run_worker = _run_worker_mock()
 
-        await app.action_refresh()
+        app._start_refresh()
 
-        assert app._status_message == "Refreshing..."
         assert app._refreshing is True
         app.run_worker.assert_called_once()
+
+    def test_start_refresh_noop_without_callback(self) -> None:
+        servers = [MCPStdio(name="srv", transport="stdio", command="cmd")]
+        mgr = _make_tool_manager({})
+        app = MCPApp(mcp_servers=servers, tool_manager=mgr)
+        app.run_worker = MagicMock()
+
+        app._start_refresh()
+
+        assert app._refreshing is False
+        app.run_worker.assert_not_called()
+
+    def test_start_refresh_skips_when_already_refreshing(self) -> None:
+        servers = [MCPStdio(name="srv", transport="stdio", command="cmd")]
+        mgr = _make_tool_manager({})
+        refresh_callback = AsyncMock(return_value=None)
+        app = MCPApp(
+            mcp_servers=servers, tool_manager=mgr, refresh_callback=refresh_callback
+        )
+        app._refreshing = True
+        app.run_worker = MagicMock()
+
+        app._start_refresh()
+
+        app.run_worker.assert_not_called()
 
     def test_on_worker_state_changed_updates_after_refresh(self) -> None:
         from textual.worker import Worker
@@ -216,22 +238,47 @@ class TestMCPAppInit:
         servers = [MCPStdio(name="srv", transport="stdio", command="cmd")]
         mgr = _make_tool_manager({})
         app = MCPApp(mcp_servers=servers, tool_manager=mgr)
+        app._refreshing = True
         app.refresh_index = MagicMock()
 
         worker = MagicMock(spec=Worker)
         worker.group = "refresh"
         worker.is_finished = True
-        worker.result = "Refreshed."
         event = MagicMock(spec=Worker.StateChanged)
         event.worker = worker
 
-        app.on_worker_state_changed(event)
+        with patch.object(
+            MCPApp, "is_attached", new_callable=PropertyMock, return_value=True
+        ):
+            app.on_worker_state_changed(event)
 
-        assert app._status_message == "Refreshed."
         assert app._refreshing is False
         app.refresh_index.assert_called_once()
 
-    def test_close_blocked_while_refreshing(self) -> None:
+    def test_on_worker_state_changed_skips_refresh_when_detached(self) -> None:
+        from textual.worker import Worker
+
+        servers = [MCPStdio(name="srv", transport="stdio", command="cmd")]
+        mgr = _make_tool_manager({})
+        app = MCPApp(mcp_servers=servers, tool_manager=mgr)
+        app._refreshing = True
+        app.refresh_index = MagicMock()
+
+        worker = MagicMock(spec=Worker)
+        worker.group = "refresh"
+        worker.is_finished = True
+        event = MagicMock(spec=Worker.StateChanged)
+        event.worker = worker
+
+        with patch.object(
+            MCPApp, "is_attached", new_callable=PropertyMock, return_value=False
+        ):
+            app.on_worker_state_changed(event)
+
+        assert app._refreshing is False
+        app.refresh_index.assert_not_called()
+
+    def test_close_not_blocked_while_refreshing(self) -> None:
         mgr = _make_tool_manager({})
         app = MCPApp(mcp_servers=[], tool_manager=mgr)
         app._refreshing = True
@@ -239,9 +286,9 @@ class TestMCPAppInit:
 
         app.action_close()
 
-        app.post_message.assert_not_called()
+        app.post_message.assert_called_once()
 
-    def test_back_blocked_while_refreshing(self) -> None:
+    def test_back_not_blocked_while_refreshing(self) -> None:
         servers = [MCPStdio(name="srv", transport="stdio", command="cmd")]
         mgr = _make_tool_manager({})
         app = MCPApp(mcp_servers=servers, tool_manager=mgr)
@@ -254,7 +301,7 @@ class TestMCPAppInit:
 
         app.action_back()
 
-        assert render_calls == []
+        assert render_calls == [None]
 
 
 class TestConnectorMenuOrdering:

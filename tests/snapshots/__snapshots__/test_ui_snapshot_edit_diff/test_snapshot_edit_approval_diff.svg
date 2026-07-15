@@ -48,7 +48,7 @@
 .terminal-r14 { fill: #b1b1b5 }
 .terminal-r15 { fill: #9ece6a;font-weight: bold }
 .terminal-r16 { fill: #f6768e }
-.terminal-r17 { fill: #fe9e64;font-weight: bold }
+.terminal-r17 { fill: #bb9af7;font-weight: bold }
     </style>
 
     <defs>

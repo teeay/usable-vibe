@@ -32,7 +32,11 @@ from vibe.cli.textual_ui.widgets.messages import PlanFileMessage, WarningMessage
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.teleport_message import TeleportMessage
 from vibe.core.agents import AgentSafety
-from vibe.core.types import PlanReviewEndedEvent, PlanReviewRequestedEvent
+from vibe.core.types import (
+    ContextClearedEvent,
+    PlanReviewEndedEvent,
+    PlanReviewRequestedEvent,
+)
 
 
 def _committer() -> ScrollbackCommitter:
@@ -294,6 +298,31 @@ async def test_plan_review_native_owner_and_ctrl_g(tmp_path: Path) -> None:
         await pilot.pause()
         assert app._native_plan_message is None
         assert message not in app._live_surface.children
+
+
+@pytest.mark.asyncio
+async def test_context_cleared_event_resets_and_keeps_plan_live(tmp_path: Path) -> None:
+    app = build_test_vibe_app()
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Approved\n")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._committer is not None
+        app._committer.drain_lines()
+
+        await app._apply_native_context_effects(
+            ContextClearedEvent(plan_file_path=plan_path)
+        )
+        await pilot.pause()
+
+        message = app._native_plan_message
+        assert isinstance(message, PlanFileMessage)
+        assert message in app._live_surface.children
+        assert message not in app._messages_area.children
+        assert len(list(app._messages_area.children)) == 0
+        text = "\n".join(app._committer.drain_lines())
+        assert "Context cleared. Implementing the approved plan..." in text
+        assert "ContextClearedEvent" not in text
 
 
 @pytest.mark.asyncio

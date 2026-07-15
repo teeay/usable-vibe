@@ -13,15 +13,15 @@ work-product/structured tools keep full result bodies. The renderers are pure
 and Rich-only -- no Textual, no app state -- so the terminal output can be
 unit-tested directly, mirroring ``inline_inject.py``.
 
-The high-fidelity native body set is: shortened agent bash output, full manual
-``!`` bash output, full edit diffs, full ask_user_question answers, full
-write_file content, shortened read_file content, shortened grep matches, and
-full todo lists. :func:`render_result_body` returns ``None`` for any other tool
--- including ``web_fetch``, ``web_search``, ``task``, ``skill``, and
-``exit_plan_mode`` -- so the committer keeps its ``format_result_display``
-summary line. Those are intentionally summary-only: their bodies are large
-reference blobs that are collapsed in the full-screen UI (see
-``private/ui-map.md``).
+The high-fidelity native body set is: shortened agent bash output (including
+the experimental managed bash output tools), full manual ``!`` bash output,
+full edit diffs, full ask_user_question answers, full write_file content,
+shortened read_file content, shortened grep matches, and full todo lists.
+:func:`render_result_body` returns ``None`` for any other tool -- including
+``web_fetch``, ``web_search``, ``task``, ``skill``, and ``exit_plan_mode`` -- so
+the committer keeps its ``format_result_display`` summary line. Those are
+intentionally summary-only: their bodies are large reference blobs that are
+collapsed in the full-screen UI (see ``private/ui-map.md``).
 """
 
 from __future__ import annotations
@@ -38,6 +38,11 @@ from rich.text import Text
 from vibe.core.tools.builtins.ask_user_question import AskUserQuestionResult
 from vibe.core.tools.builtins.bash import BashResult
 from vibe.core.tools.builtins.edit import EditResult
+from vibe.core.tools.builtins.experimental_bash import (
+    BashLogFileResult,
+    BashOutputResult,
+    ExperimentalBashResult,
+)
 from vibe.core.tools.builtins.grep import GrepResult
 from vibe.core.tools.builtins.read_file import ReadFileResult
 from vibe.core.tools.builtins.todo import TodoResult
@@ -77,6 +82,18 @@ def render_result_body(
     match (tool_name, result):
         case ("bash", BashResult()):
             body = _render_bash_result(
+                result, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
+            )
+        case ("bash", ExperimentalBashResult()):
+            body = _render_experimental_bash_result(
+                result, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
+            )
+        case ("bash_output", BashOutputResult()):
+            body = _render_bash_output_result(
+                result, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
+            )
+        case ("bash_log_file", BashLogFileResult(action="read")):
+            body = _render_bash_log_file_result(
                 result, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
             )
         case ("edit", EditResult()):
@@ -131,12 +148,55 @@ def render_manual_bash_body(
 def _render_bash_result(
     result: BashResult, *, shorten: bool, head_lines: int, tail_lines: int
 ) -> RenderableType:
+    output = _combined_output(result.stdout, result.stderr)
+    return _render_terminal_output(
+        output, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
+    )
+
+
+def _render_experimental_bash_result(
+    result: ExperimentalBashResult, *, shorten: bool, head_lines: int, tail_lines: int
+) -> RenderableType:
+    output = _combined_output(result.stdout, result.stderr) or result.output.strip("\n")
+    return _render_terminal_output(
+        output, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
+    )
+
+
+def _render_bash_output_result(
+    result: BashOutputResult, *, shorten: bool, head_lines: int, tail_lines: int
+) -> RenderableType:
+    return _render_terminal_output(
+        result.output.strip("\n"),
+        shorten=shorten,
+        head_lines=head_lines,
+        tail_lines=tail_lines,
+    )
+
+
+def _render_bash_log_file_result(
+    result: BashLogFileResult, *, shorten: bool, head_lines: int, tail_lines: int
+) -> RenderableType:
+    return _render_terminal_output(
+        (result.content or "").strip("\n"),
+        shorten=shorten,
+        head_lines=head_lines,
+        tail_lines=tail_lines,
+    )
+
+
+def _combined_output(stdout: str, stderr: str) -> str:
     parts: list[str] = []
-    if result.stdout:
-        parts.append(result.stdout.strip("\n"))
-    if result.stderr:
-        parts.append(result.stderr.strip("\n"))
-    output = "\n".join(part for part in parts if part)
+    if stdout:
+        parts.append(stdout.strip("\n"))
+    if stderr:
+        parts.append(stderr.strip("\n"))
+    return "\n".join(part for part in parts if part)
+
+
+def _render_terminal_output(
+    output: str, *, shorten: bool, head_lines: int, tail_lines: int
+) -> RenderableType:
     if not output:
         return Text("(no content)", style="dim")
     if shorten:
