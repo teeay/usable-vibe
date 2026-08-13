@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from io import StringIO
+from pathlib import Path
 import re
 
 from rich.console import Console, Group, RenderableType
@@ -28,6 +29,30 @@ from rich.padding import Padding
 from rich.text import Text
 from textual.widget import Widget
 
+from vibe.app_server.events import (
+    AppServerEvent,
+    HistoryEntryAdded,
+    HistoryEntryUpdated,
+)
+from vibe.app_server.models import (
+    CancelledEffectState,
+    CompletedEffectState,
+    FailedEffectState,
+    HookNoticeDetail,
+    HookScope,
+    HookSeverity,
+    PlanReviewStartedNoticeDetail,
+    PublicCheckpointEntry,
+    PublicEffectEntry,
+    PublicEntryGenerationStatus,
+    PublicHistoryEntry,
+    PublicMessageEntry,
+    PublicNoticeEntry,
+    PublicReasoningEntry,
+    ShellEffectDetail,
+    ShellEffectOutput,
+    SkippedEffectState,
+)
 from vibe.cli.textual_ui.native_scroll.app_surfaces import (
     render_approval_outcome,
     render_plan_notice,
@@ -43,6 +68,7 @@ from vibe.cli.textual_ui.native_scroll.tool_result_render import (
 from vibe.cli.textual_ui.native_scroll.widget_render import (
     render_hook_line,
     render_hook_run,
+    render_user_prompt,
     render_widget_block,
 )
 from vibe.core.hooks.models import (
@@ -53,6 +79,7 @@ from vibe.core.hooks.models import (
     HookRunStartEvent,
     HookType,
 )
+from vibe.core.tools.builtins.bash import BashResult
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIDataAdapter
 from vibe.core.types import (
     AgentProfileChangedEvent,
@@ -78,6 +105,29 @@ from vibe.core.types import (
 _LIST_ITEM_RE = re.compile(r"^ {0,3}([-*+]|\d{1,9}[.)])\s")
 # A fenced code block delimiter (``` or ~~~), again allowing slight indentation.
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_SHELL_EXIT_STATUS_RE = re.compile(r"status\s+(-?\d+)")
+_APP_HOOK_SCOPE_TYPES: dict[HookScope, HookType] = {
+    HookScope.POST_AGENT: HookType.POST_AGENT,
+    HookScope.PRE_TOOL: HookType.PRE_TOOL,
+    HookScope.POST_TOOL: HookType.POST_TOOL,
+}
+_APP_HOOK_SEVERITY_TYPES: dict[HookSeverity, HookMessageSeverity] = {
+    HookSeverity.OK: HookMessageSeverity.OK,
+    HookSeverity.WARNING: HookMessageSeverity.WARNING,
+    HookSeverity.ERROR: HookMessageSeverity.ERROR,
+}
+
+
+def _hook_scope_to_type(scope: HookScope) -> HookType:
+    return _APP_HOOK_SCOPE_TYPES.get(scope, HookType.POST_AGENT)
+
+
+def _hook_severity_to_message_severity(
+    severity: HookSeverity | None,
+) -> HookMessageSeverity:
+    if severity is None:
+        return HookMessageSeverity.WARNING
+    return _APP_HOOK_SEVERITY_TYPES.get(severity, HookMessageSeverity.WARNING)
 
 
 @dataclass(frozen=True)
@@ -398,8 +448,6 @@ class ScrollbackCommitter:
             case WaitingForInputEvent():
                 self.flush()
             case PlanReviewRequestedEvent():
-                # The live PlanFileMessage (and Ctrl+G state) is owned by the app;
-                # the committer records the durable "plan ready" notice.
                 self.flush()
                 self._enqueue(render_plan_notice(event.file_path))
             case (
@@ -412,6 +460,235 @@ class ScrollbackCommitter:
             case _:
                 self.flush()
                 self._enqueue(Text(str(event), style="dim"))
+
+    def handle_app_server_event(self, event: AppServerEvent) -> None:
+        """Route a v2.24 app-server event to durable scrollback or buffers."""
+        match event:
+            case HistoryEntryAdded(entry=entry):
+                self._handle_public_entry_added(entry)
+            case HistoryEntryUpdated(previous=previous, entry=entry):
+                self._handle_public_entry_updated(previous, entry)
+            case _:
+                pass
+
+    def _handle_public_entry_added(self, entry: object) -> None:
+        match entry:
+            case PublicMessageEntry(role="assistant"):
+                self._flush_reasoning()
+                self._assistant_buffer += entry.text
+                if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+                    self._flush_assistant()
+                else:
+                    self._commit_ready_assistant()
+            case PublicMessageEntry(role="user"):
+                # Local prompts are committed via the UserMessage widget path.
+                self.flush()
+            case PublicMessageEntry(role="system"):
+                self.flush()
+            case PublicReasoningEntry():
+                self._flush_assistant()
+                self._reasoning_buffer += entry.text
+                if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+                    self._flush_reasoning()
+                else:
+                    self._commit_ready_reasoning()
+            case PublicEffectEntry():
+                self.flush()
+                self._record_public_effect(entry)
+                if self._public_effect_terminal(entry):
+                    self._commit_public_effect(entry)
+            case PublicCheckpointEntry(kind="compaction"):
+                self.flush()
+                if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+                    self._enqueue(Text("✓ Conversation compacted", style="green"))
+            case PublicNoticeEntry():
+                self._handle_public_notice(entry)
+            case _:
+                pass
+
+    def _handle_public_entry_updated(self, previous: object, entry: object) -> None:
+        match entry:
+            case PublicMessageEntry(role="assistant"):
+                previous_text = (
+                    previous.text if isinstance(previous, PublicMessageEntry) else ""
+                )
+                delta = entry.text.removeprefix(previous_text)
+                if delta == entry.text and previous_text:
+                    delta = entry.text
+                self._flush_reasoning()
+                self._assistant_buffer += delta
+                if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+                    self._flush_assistant()
+                else:
+                    self._commit_ready_assistant()
+            case PublicReasoningEntry():
+                previous_text = (
+                    previous.text if isinstance(previous, PublicReasoningEntry) else ""
+                )
+                delta = entry.text.removeprefix(previous_text)
+                if delta == entry.text and previous_text:
+                    delta = entry.text
+                self._flush_assistant()
+                self._reasoning_buffer += delta
+                if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+                    self._flush_reasoning()
+                else:
+                    self._commit_ready_reasoning()
+            case PublicEffectEntry():
+                self._record_public_effect(entry)
+                if self._public_effect_became_terminal(previous, entry):
+                    self.flush()
+                    self._commit_public_effect(entry)
+            case PublicCheckpointEntry(kind="compaction"):
+                if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+                    self.flush()
+                    self._enqueue(Text("✓ Conversation compacted", style="green"))
+            case _:
+                pass
+
+    def _handle_public_notice(self, entry: PublicNoticeEntry) -> None:
+        match entry.detail:
+            case PlanReviewStartedNoticeDetail(file_path=file_path):
+                self.flush()
+                self._enqueue(render_plan_notice(Path(file_path)))
+            case HookNoticeDetail(kind="hook_run_started") as detail:
+                self.flush()
+                self._begin_hook_run(
+                    HookRunStartEvent(
+                        scope=_hook_scope_to_type(detail.scope),
+                        tool_name=detail.tool_name,
+                        tool_call_id=detail.tool_call_id,
+                    )
+                )
+            case HookNoticeDetail(kind="hook_run_completed") as detail:
+                self._commit_hook_run(
+                    HookRunEndEvent(
+                        scope=_hook_scope_to_type(detail.scope),
+                        tool_call_id=detail.tool_call_id,
+                    )
+                )
+            case HookNoticeDetail(kind="hook_completed") as detail:
+                if detail.content:
+                    self._record_hook_end(
+                        HookEndEvent(
+                            hook_name=detail.hook_name or "hook",
+                            status=_hook_severity_to_message_severity(detail.status),
+                            content=detail.content,
+                            scope=_hook_scope_to_type(detail.scope),
+                            tool_call_id=detail.tool_call_id,
+                        )
+                    )
+            case _:
+                pass
+
+    def _record_public_effect(self, entry: PublicEffectEntry) -> None:
+        self._tool_calls[entry.id] = ToolCallDisplay(
+            summary=entry.detail.display.summary,
+            content=entry.detail.display.content,
+            suffix=entry.detail.display.suffix,
+        )
+
+    def _public_effect_terminal(self, entry: PublicEffectEntry) -> bool:
+        return isinstance(
+            entry.state,
+            (
+                CompletedEffectState,
+                FailedEffectState,
+                CancelledEffectState,
+                SkippedEffectState,
+            ),
+        )
+
+    def _public_effect_became_terminal(
+        self, previous: object, entry: PublicEffectEntry
+    ) -> bool:
+        return (
+            not isinstance(previous, PublicEffectEntry)
+            or not self._public_effect_terminal(previous)
+        ) and self._public_effect_terminal(entry)
+
+    def _commit_public_effect(self, entry: PublicEffectEntry) -> None:
+        call = self._tool_calls.pop(entry.id, None)
+        state = entry.state
+        if isinstance(state, CompletedEffectState | SkippedEffectState):
+            display = state.display
+            result = ToolResultDisplay(
+                success=display.success,
+                message=display.text,
+                warnings=display.warnings,
+                suffix=display.suffix,
+            )
+        elif isinstance(state, FailedEffectState):
+            display = state.display
+            result = ToolResultDisplay(
+                success=False,
+                message=display.text or state.error.message,
+                warnings=display.warnings,
+                suffix=display.suffix,
+            )
+        elif isinstance(state, CancelledEffectState):
+            result = ToolResultDisplay(success=False, message=state.reason)
+        else:
+            return
+        self._enqueue(
+            self._tool_block(
+                entry.title, call, result, self._public_effect_body(entry, state)
+            )
+        )
+
+    def _public_effect_body(
+        self, entry: PublicEffectEntry, state: object
+    ) -> RenderableType | None:
+        if not isinstance(entry.detail, ShellEffectDetail):
+            return None
+        if entry.detail.input is None:
+            return None
+
+        command = entry.detail.input.command
+        if (
+            entry.detail.tool_name == "bash"
+            and isinstance(state, CompletedEffectState)
+            and state.output is not None
+        ):
+            return self._agent_shell_body(command, state)
+
+        return self._manual_shell_body(command, state)
+
+    def _agent_shell_body(
+        self, command: str, state: CompletedEffectState
+    ) -> RenderableType | None:
+        output = ShellEffectOutput.model_validate(state.output)
+        return render_result_body(
+            "bash",
+            BashResult(
+                command=command,
+                stdout=output.stdout,
+                stderr=output.stderr,
+                returncode=0,
+            ),
+            dark=self._dark(),
+            ansi=self._ansi(),
+            shorten=self._shorten_tool_output(),
+            head_lines=self._tool_output_head_lines(),
+            tail_lines=self._tool_output_tail_lines(),
+        )
+
+    def _manual_shell_body(self, command: str, state: object) -> RenderableType | None:
+        output = getattr(state, "output_text", "")
+        if isinstance(state, CompletedEffectState):
+            return render_manual_bash_body(command, output, 0)
+        if isinstance(state, FailedEffectState):
+            return render_manual_bash_body(
+                command, output, self._shell_exit_code(state.error.message)
+            )
+        if isinstance(state, CancelledEffectState):
+            return render_manual_bash_body(command, output, 1, interrupted=True)
+        return None
+
+    def _shell_exit_code(self, message: str) -> int:
+        if match := _SHELL_EXIT_STATUS_RE.search(message):
+            return int(match.group(1))
+        return 1
 
     # -- tool rendering ----------------------------------------------------
 
@@ -504,17 +781,34 @@ class ScrollbackCommitter:
         ):
             self._enqueue(block, is_full_width=is_full_width)
 
+    def commit_public_history(
+        self, entries: Sequence[PublicHistoryEntry], *, omitted_count: int
+    ) -> None:
+        """Commit app-server public history to native scrollback."""
+        self.flush()
+        if omitted_count > 0:
+            noun = "message" if omitted_count == 1 else "messages"
+            self._enqueue(
+                Text(f"↑ {omitted_count} earlier {noun} omitted", style="dim italic")
+            )
+        for entry in entries:
+            if isinstance(entry, PublicMessageEntry) and entry.role == "user":
+                self._enqueue(
+                    render_user_prompt(
+                        ">", entry.text, entry.images or None, dark=self._dark()
+                    )
+                )
+                continue
+            self._handle_public_entry_added(entry)
+        self.flush()
+
     def commit_startup_header(self, *, version: str, model: str, cwd: str) -> None:
         """Commit the compact durable session header once at startup."""
         self.flush()
         self._enqueue(render_startup_header(version=version, model=model, cwd=cwd))
 
     def commit_teleport(self, *, url: str | None, error: str | None) -> None:
-        """Commit the durable teleport outcome line.
-
-        The live ``TeleportMessage`` spinner is owned by the app while teleporting;
-        this commits the final result and the app removes the live widget.
-        """
+        """Commit the durable teleport outcome line."""
         self.flush()
         self._enqueue(render_teleport_outcome(url=url, error=error))
 
@@ -531,6 +825,11 @@ class ScrollbackCommitter:
         self._enqueue(
             render_approval_outcome(tool_name=tool_name, approved=approved, scope=scope)
         )
+
+    def commit_compaction(self) -> None:
+        """Commit the durable compaction success marker."""
+        self.flush()
+        self._enqueue(Text("✓ Conversation compacted", style="green"))
 
     def commit_rewind(
         self, preview: str, *, restored_files: bool, discarded: int
@@ -566,7 +865,7 @@ class ScrollbackCommitter:
     def _hook_run_key(scope: HookType, tool_call_id: str | None) -> str:
         # Mirror EventHandler._hook_container_key so native grouping matches the
         # full-screen container keying exactly.
-        if scope == HookType.POST_AGENT_TURN:
+        if scope == HookType.POST_AGENT:
             return "agent_turn"
         return f"{scope.value}:{tool_call_id or ''}"
 

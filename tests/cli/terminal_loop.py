@@ -99,6 +99,8 @@ def run_under_terminal(
     rows: int = 8,
     cols: int = 40,
     env: dict[str, str] | None = None,
+    pump_timeout: float = 0.3,
+    idle_reads: int = 3,
     spawn_timeout: float = 20.0,
 ) -> TerminalLoop:
     """Run `argv` under a pseudo-terminal and return the settled emulator."""
@@ -111,7 +113,7 @@ def run_under_terminal(
         env=env,
     )
     loop = TerminalLoop(child, rows=rows, cols=cols)
-    loop.pump()
+    loop.pump(timeout=pump_timeout, idle_reads=idle_reads)
     child.close(force=True)
     return loop
 

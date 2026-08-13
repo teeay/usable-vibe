@@ -1,36 +1,48 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import time
-from unittest.mock import Mock
 
 import pytest
 
-from tests.cli.plan_offer.adapters.fake_whoami_gateway import FakeWhoAmIGateway
 from tests.conftest import build_test_agent_loop
-from vibe.cli.plan_offer.ports.whoami_gateway import WhoAmIPlanType, WhoAmIResponse
+from tests.stubs.app_server import create_test_app_server_session
+from tests.stubs.fake_account_gateway import FakeAccountGateway
+from vibe.app_server._account import WhoAmIResult
+from vibe.app_server.models import AccountPlanKind
 from vibe.cli.textual_ui.app import ChatScroll, VibeApp
 from vibe.cli.textual_ui.widgets.load_more import HistoryLoadMoreMessage
 from vibe.cli.textual_ui.widgets.messages import UserMessage
 from vibe.cli.textual_ui.windowing import HISTORY_RESUME_TAIL_MESSAGES
-from vibe.core.config import SessionLoggingConfig, VibeConfig
+from vibe.core.config import SessionLoggingConfig, VibeConfigSchema
 from vibe.core.types import LLMMessage, Role
 
 
 @pytest.fixture
-def vibe_config() -> VibeConfig:
-    return VibeConfig(
+def vibe_config(make_config) -> VibeConfigSchema:
+    return make_config(
         session_logging=SessionLoggingConfig(enabled=False), enable_update_checks=False
     )
 
 
-def _pro_plan_gateway() -> FakeWhoAmIGateway:
-    return FakeWhoAmIGateway(
-        response=WhoAmIResponse(
-            plan_type=WhoAmIPlanType.CHAT,
+def _pro_account_gateway() -> FakeAccountGateway:
+    return FakeAccountGateway(
+        result=WhoAmIResult(
+            plan_type=AccountPlanKind.CHAT,
             plan_name="INDIVIDUAL",
             prompt_switching_to_pro_plan=False,
         )
+    )
+
+
+def _app(agent_loop) -> VibeApp:
+    account_gateway = _pro_account_gateway()
+    return VibeApp(
+        app_server=lambda: create_test_app_server_session(
+            agent_loop, account_gateway=account_gateway
+        ),
+        history_file=Path(".vibehistory"),
     )
 
 
@@ -45,51 +57,41 @@ async def _wait_until(pause, predicate, timeout: float = 2.0) -> None:
 
 @pytest.mark.asyncio
 async def test_ui_mount_defers_history_resume(
-    vibe_config: VibeConfig, monkeypatch: pytest.MonkeyPatch
+    vibe_config: VibeConfigSchema, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     agent_loop = build_test_agent_loop(config=vibe_config, enable_streaming=False)
-    app = VibeApp(agent_loop=agent_loop, plan_offer_gateway=_pro_plan_gateway())
+    app = _app(agent_loop)
+    await app.prepare()
     history_started = asyncio.Event()
     history_release = asyncio.Event()
-    restore_from_session = Mock()
-    loop_start = Mock()
-    initialize_experiments = Mock()
+    event_listener_started = asyncio.Event()
+    event_listener_release = asyncio.Event()
 
     async def resume_history() -> None:
         history_started.set()
         await history_release.wait()
 
-    monkeypatch.setattr(app, "_resume_history_from_messages", resume_history)
-    monkeypatch.setattr(app._loop_runner, "restore_from_session", restore_from_session)
-    monkeypatch.setattr(app._loop_runner, "start", loop_start)
-    monkeypatch.setattr(
-        agent_loop, "start_initialize_experiments", initialize_experiments
-    )
+    async def listen_app_server_events() -> None:
+        event_listener_started.set()
+        await event_listener_release.wait()
 
+    monkeypatch.setattr(app, "_resume_history_from_messages", resume_history)
+    monkeypatch.setattr(app, "_listen_app_server_events", listen_app_server_events)
     async with asyncio.timeout(5):
         async with app.run_test() as pilot:
             await _wait_until(pilot.pause, history_started.is_set, timeout=2.0)
 
             app.query_one(ChatScroll)
-            restore_from_session.assert_not_called()
-            loop_start.assert_not_called()
-            initialize_experiments.assert_not_called()
+            assert not event_listener_started.is_set()
 
             history_release.set()
-            await _wait_until(
-                pilot.pause,
-                lambda: (
-                    restore_from_session.call_count == 1
-                    and loop_start.call_count == 1
-                    and initialize_experiments.call_count == 1
-                ),
-                timeout=2.0,
-            )
+            await _wait_until(pilot.pause, event_listener_started.is_set, timeout=2.0)
+            event_listener_release.set()
 
 
 @pytest.mark.asyncio
 async def test_resume_commits_bounded_tail_and_omitted_marker(
-    vibe_config: VibeConfig,
+    vibe_config: VibeConfigSchema,
 ) -> None:
     total = 66
     omitted = total - HISTORY_RESUME_TAIL_MESSAGES
@@ -98,7 +100,7 @@ async def test_resume_commits_bounded_tail_and_omitted_marker(
         LLMMessage(role=Role.user, content=f"msg-{idx}") for idx in range(total)
     ])
 
-    app = VibeApp(agent_loop=agent_loop, plan_offer_gateway=_pro_plan_gateway())
+    app = _app(agent_loop)
 
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -116,7 +118,7 @@ async def test_resume_commits_bounded_tail_and_omitted_marker(
 
 @pytest.mark.asyncio
 async def test_resume_marker_is_singular_for_one_omitted_message(
-    vibe_config: VibeConfig,
+    vibe_config: VibeConfigSchema,
 ) -> None:
     agent_loop = build_test_agent_loop(config=vibe_config, enable_streaming=False)
     agent_loop.messages.extend([
@@ -124,7 +126,7 @@ async def test_resume_marker_is_singular_for_one_omitted_message(
         for idx in range(HISTORY_RESUME_TAIL_MESSAGES + 1)
     ])
 
-    app = VibeApp(agent_loop=agent_loop, plan_offer_gateway=_pro_plan_gateway())
+    app = _app(agent_loop)
 
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -135,13 +137,15 @@ async def test_resume_marker_is_singular_for_one_omitted_message(
 
 
 @pytest.mark.asyncio
-async def test_resume_does_not_populate_hidden_chat(vibe_config: VibeConfig) -> None:
+async def test_resume_does_not_populate_hidden_chat(
+    vibe_config: VibeConfigSchema,
+) -> None:
     agent_loop = build_test_agent_loop(config=vibe_config, enable_streaming=False)
     agent_loop.messages.extend([
         LLMMessage(role=Role.user, content=f"msg-{idx}") for idx in range(31)
     ])
 
-    app = VibeApp(agent_loop=agent_loop, plan_offer_gateway=_pro_plan_gateway())
+    app = _app(agent_loop)
 
     async with app.run_test() as pilot:
         await pilot.pause()

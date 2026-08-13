@@ -2,18 +2,18 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from pydantic import BaseModel
 import pytest
 from textual import events
 
+from tests.stubs.app_config import build_test_app_config
+from vibe.app_server.models import (
+    EffectCallDisplay,
+    ShellEffectDetail,
+    ShellEffectInput,
+)
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
-from vibe.core.config import VibeConfig
 
 _TEST_GRACE_PERIOD_S = 0.5
-
-
-class FakeArgs(BaseModel):
-    command: str = "echo hello"
 
 
 @pytest.fixture
@@ -22,8 +22,14 @@ def approval_app(monkeypatch: pytest.MonkeyPatch):
         "vibe.cli.textual_ui.widgets.approval_app._INPUT_GRACE_PERIOD_S",
         _TEST_GRACE_PERIOD_S,
     )
-    config = VibeConfig()
-    app = ApprovalApp(tool_name="bash", tool_args=FakeArgs(), config=config)
+    app = ApprovalApp(
+        effect=ShellEffectDetail(
+            tool_name="bash",
+            input=ShellEffectInput(command="echo hello"),
+            display=EffectCallDisplay(summary="bash", status_text="Running"),
+        ),
+        config=build_test_app_config(),
+    )
     app._mount_time = 100.0
     return app
 
@@ -45,7 +51,7 @@ class TestGracePeriod:
 
             posted.assert_not_called()
 
-    def test_actions_post_messages_after_grace_period(self, approval_app: ApprovalApp):
+    def test_action_posts_message_after_grace_period(self, approval_app: ApprovalApp):
         with (
             patch("vibe.cli.textual_ui.widgets.approval_app.time") as mock_time,
             patch.object(approval_app, "post_message") as posted,
@@ -54,14 +60,28 @@ class TestGracePeriod:
             assert not approval_app.is_within_grace_period()
 
             approval_app.action_select_1()
-            approval_app.action_reject()
 
-            assert posted.call_count == 2
+            assert posted.call_count == 1
             assert isinstance(
                 posted.call_args_list[0].args[0], ApprovalApp.ApprovalGranted
             )
+
+    def test_actions_post_only_once_after_selection(
+        self, approval_app: ApprovalApp
+    ) -> None:
+        with (
+            patch("vibe.cli.textual_ui.widgets.approval_app.time") as mock_time,
+            patch.object(approval_app, "post_message") as posted,
+        ):
+            mock_time.monotonic.return_value = 100.0 + _TEST_GRACE_PERIOD_S + 0.01
+
+            approval_app.action_select_1()
+            approval_app.action_select()
+            approval_app.action_reject()
+
+            assert posted.call_count == 1
             assert isinstance(
-                posted.call_args_list[1].args[0], ApprovalApp.ApprovalRejected
+                posted.call_args_list[0].args[0], ApprovalApp.ApprovalGranted
             )
 
     def test_arrow_keys_work_during_grace_period(self, approval_app: ApprovalApp):

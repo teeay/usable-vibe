@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pexpect
@@ -19,8 +20,9 @@ from tests.e2e.mock_server import ChatCompletionsRequestPayload, StreamingMockSe
 _ALT_SCREEN = "\x1b[?1049h"
 _PTY_COLUMNS = 120
 _PTY_ROWS = 36
-PREDICTABLE_OUTPUT = "__E2E_BASH_OK__"
-TOOL_ARGUMENTS = f'{{"command":"printf \\"{PREDICTABLE_OUTPUT}\\\\n\\""}}'
+PREDICTABLE_OUTPUT = "E2E-BASH-OK"
+COMMAND = 'printf "E2E-%s-OK\\n" "BASH"'
+TOOL_ARGUMENTS = json.dumps({"command": COMMAND})
 
 
 def _terminal_lines(raw: str) -> list[str]:
@@ -123,7 +125,6 @@ def test_spawn_cli_asks_bash_permission_and_shows_tool_output_after_approval(
     assert [line for line in terminal_lines if "Approved bash" in line] == [
         f"{indent}✓ Approved bash"
     ]
-    assert [line for line in terminal_lines if PREDICTABLE_OUTPUT in line] == [
-        f'{indent}✓ bash: printf "{PREDICTABLE_OUTPUT}\\n"',
-        f"{indent}{PREDICTABLE_OUTPUT}",
-    ]
+    assert f"{indent}✓ bash: {COMMAND}" in terminal_lines
+    assert f"{indent}$ {COMMAND}" not in terminal_lines
+    assert terminal_lines.count(f"{indent}{PREDICTABLE_OUTPUT}") == 1

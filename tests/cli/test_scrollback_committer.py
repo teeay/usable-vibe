@@ -10,6 +10,19 @@ from pathlib import Path
 from pydantic import BaseModel
 from textual.widgets import Static
 
+from vibe.app_server.events import HistoryEntryAdded
+from vibe.app_server.models import (
+    CompletedEffectState,
+    EffectCallDisplay,
+    EffectResultDisplay,
+    FileImageSource,
+    ImageAttachment,
+    PublicEffectEntry,
+    PublicEntryGenerationStatus,
+    ShellEffectDetail,
+    ShellEffectInput,
+    ShellEffectOutput,
+)
 from vibe.cli.textual_ui.scrollback_committer import ScrollbackCommitter
 from vibe.cli.textual_ui.widgets.messages import (
     ErrorMessage,
@@ -32,8 +45,6 @@ from vibe.core.types import (
     BaseEvent,
     CompactEndEvent,
     ContextClearedEvent,
-    FileImageSource,
-    ImageAttachment,
     ReasoningEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -78,6 +89,59 @@ class _FakeTool(
 def _committer() -> ScrollbackCommitter:
     # color_system=None renders plain text so assertions are about content.
     return ScrollbackCommitter(width_getter=lambda: 80, color_system=None)
+
+
+def _shell_effect_entry(
+    *, command: str, output_text: str, message: str = "Ran command"
+) -> PublicEffectEntry:
+    return PublicEffectEntry(
+        id="effect-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        created_at=1,
+        updated_at=1,
+        title="shell",
+        detail=ShellEffectDetail(
+            tool_name="shell",
+            input=ShellEffectInput(command=command),
+            display=EffectCallDisplay(
+                summary=f"shell: {command}", status_text="Running command"
+            ),
+        ),
+        state=CompletedEffectState(
+            output_text=output_text,
+            display=EffectResultDisplay(success=True, message=message),
+        ),
+    )
+
+
+def _agent_bash_effect_entry(
+    *, command: str, stdout: str, stderr: str = ""
+) -> PublicEffectEntry:
+    return PublicEffectEntry(
+        id="effect-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        created_at=1,
+        updated_at=1,
+        title="bash",
+        detail=ShellEffectDetail(
+            tool_name="bash",
+            input=ShellEffectInput(command=command),
+            display=EffectCallDisplay(
+                summary=f"bash: {command}", status_text="Running command"
+            ),
+        ),
+        state=CompletedEffectState(
+            output=ShellEffectOutput(stdout=stdout, stderr=stderr).model_dump(
+                mode="json", by_alias=True
+            ),
+            output_text="",
+            display=EffectResultDisplay(success=True, message=f"Ran {command}"),
+        ),
+    )
 
 
 def _drain_text(committer: ScrollbackCommitter) -> str:
@@ -250,10 +314,10 @@ def test_edit_result_commits_diff_body() -> None:
 
 def test_ask_user_question_result_commits_answers_exactly_once() -> None:
     from vibe.core.tools.builtins.ask_user_question import (
-        Answer,
         AskUserQuestion,
         AskUserQuestionResult,
     )
+    from vibe.questions import UserAnswer
 
     committer = _committer()
     committer.handle_event(
@@ -261,7 +325,7 @@ def test_ask_user_question_result_commits_answers_exactly_once() -> None:
             tool_name="ask_user_question",
             tool_class=AskUserQuestion,
             result=AskUserQuestionResult(
-                answers=[Answer(question="Which db?", answer="Postgres")],
+                answers=[UserAnswer(question="Which db?", answer="Postgres")],
                 cancelled=False,
             ),
             tool_call_id="q1",
@@ -292,6 +356,41 @@ def test_tool_body_drops_generic_summary_line() -> None:
     # must not appear as a separate line alongside it.
     assert "output" in text
     assert "Ran echo hi" not in text
+
+
+def test_public_shell_effect_commits_full_manual_body() -> None:
+    committer = _committer()
+
+    committer.handle_app_server_event(
+        HistoryEntryAdded(
+            _shell_effect_entry(
+                command="seq 3", output_text="1\n2\n3\n", message="Ran seq 3"
+            )
+        )
+    )
+
+    text = _drain_text(committer)
+    assert "$ seq 3" in text
+    assert "1" in text
+    assert "2" in text
+    assert "3" in text
+    assert "Ran seq 3" not in text
+
+
+def test_public_agent_bash_effect_commits_structured_output() -> None:
+    committer = _committer()
+
+    committer.handle_app_server_event(
+        HistoryEntryAdded(
+            _agent_bash_effect_entry(command='printf "ok\\n"', stdout="ok\n")
+        )
+    )
+
+    text = _drain_text(committer)
+    assert 'bash: printf "ok\\n"' in text
+    assert "ok" in text
+    assert '$ printf "ok\\n"' not in text
+    assert "Ran printf" not in text
 
 
 def test_write_file_result_commits_content_body() -> None:
@@ -363,7 +462,7 @@ def test_todo_result_commits_status_grouped_body() -> None:
             tool_name="todo",
             tool_class=Todo,
             result=TodoResult(
-                message="ok",
+                verb="Updated",
                 total_count=2,
                 todos=[
                     TodoItem(id="1", content="done item", status=TodoStatus.COMPLETED),
@@ -410,7 +509,7 @@ def test_compact_end_commits_marker() -> None:
 
 def test_hook_run_commits_one_grouped_block() -> None:
     committer = _committer()
-    committer.handle_event(HookRunStartEvent(scope=HookType.POST_AGENT_TURN))
+    committer.handle_event(HookRunStartEvent(scope=HookType.POST_AGENT))
     # Lines are buffered into the run, not committed individually.
     committer.handle_event(
         HookEndEvent(
@@ -423,7 +522,7 @@ def test_hook_run_commits_one_grouped_block() -> None:
         )
     )
     assert committer.has_pending is False
-    committer.handle_event(HookRunEndEvent(scope=HookType.POST_AGENT_TURN))
+    committer.handle_event(HookRunEndEvent(scope=HookType.POST_AGENT))
     text = _drain_text(committer)
     assert "post-agent-turn" in text
     assert "✓" in text
@@ -434,20 +533,20 @@ def test_hook_run_commits_one_grouped_block() -> None:
 
 def test_empty_hook_run_commits_nothing() -> None:
     committer = _committer()
-    committer.handle_event(HookRunStartEvent(scope=HookType.POST_AGENT_TURN))
-    committer.handle_event(HookRunEndEvent(scope=HookType.POST_AGENT_TURN))
+    committer.handle_event(HookRunStartEvent(scope=HookType.POST_AGENT))
+    committer.handle_event(HookRunEndEvent(scope=HookType.POST_AGENT))
     assert committer.has_pending is False
     assert committer.drain_lines() == []
 
 
 def test_hook_run_omits_empty_content_lines() -> None:
     committer = _committer()
-    committer.handle_event(HookRunStartEvent(scope=HookType.POST_AGENT_TURN))
+    committer.handle_event(HookRunStartEvent(scope=HookType.POST_AGENT))
     # A HookEndEvent with no content contributes no line; the run stays empty.
     committer.handle_event(
         HookEndEvent(hook_name="silent", status=HookMessageSeverity.OK, content=None)
     )
-    committer.handle_event(HookRunEndEvent(scope=HookType.POST_AGENT_TURN))
+    committer.handle_event(HookRunEndEvent(scope=HookType.POST_AGENT))
     assert committer.drain_lines() == []
 
 
@@ -457,22 +556,18 @@ def test_before_and_after_tool_hook_runs_order_around_result() -> None:
     committer = _committer()
     # before_tool run for call "a"
     committer.handle_event(
-        HookRunStartEvent(
-            scope=HookType.BEFORE_TOOL, tool_name="bash", tool_call_id="a"
-        )
+        HookRunStartEvent(scope=HookType.PRE_TOOL, tool_name="bash", tool_call_id="a")
     )
     committer.handle_event(
         HookEndEvent(
             hook_name="guard",
             status=HookMessageSeverity.OK,
             content="precondition ok",
-            scope=HookType.BEFORE_TOOL,
+            scope=HookType.PRE_TOOL,
             tool_call_id="a",
         )
     )
-    committer.handle_event(
-        HookRunEndEvent(scope=HookType.BEFORE_TOOL, tool_call_id="a")
-    )
+    committer.handle_event(HookRunEndEvent(scope=HookType.PRE_TOOL, tool_call_id="a"))
     # the tool result itself
     committer.handle_event(
         ToolResultEvent(
@@ -484,18 +579,18 @@ def test_before_and_after_tool_hook_runs_order_around_result() -> None:
     )
     # after_tool run for the same call
     committer.handle_event(
-        HookRunStartEvent(scope=HookType.AFTER_TOOL, tool_name="bash", tool_call_id="a")
+        HookRunStartEvent(scope=HookType.POST_TOOL, tool_name="bash", tool_call_id="a")
     )
     committer.handle_event(
         HookEndEvent(
             hook_name="audit",
             status=HookMessageSeverity.OK,
             content="logged",
-            scope=HookType.AFTER_TOOL,
+            scope=HookType.POST_TOOL,
             tool_call_id="a",
         )
     )
-    committer.handle_event(HookRunEndEvent(scope=HookType.AFTER_TOOL, tool_call_id="a"))
+    committer.handle_event(HookRunEndEvent(scope=HookType.POST_TOOL, tool_call_id="a"))
     text = _drain_text(committer)
     assert "before bash" in text
     assert "after bash" in text
@@ -507,21 +602,17 @@ def test_before_and_after_tool_hook_runs_order_around_result() -> None:
 def test_interleaved_tool_hook_runs_do_not_merge_across_call_ids() -> None:
     committer = _committer()
     committer.handle_event(
-        HookRunStartEvent(
-            scope=HookType.BEFORE_TOOL, tool_name="edit", tool_call_id="a"
-        )
+        HookRunStartEvent(scope=HookType.PRE_TOOL, tool_name="edit", tool_call_id="a")
     )
     committer.handle_event(
-        HookRunStartEvent(
-            scope=HookType.BEFORE_TOOL, tool_name="read", tool_call_id="b"
-        )
+        HookRunStartEvent(scope=HookType.PRE_TOOL, tool_name="read", tool_call_id="b")
     )
     committer.handle_event(
         HookEndEvent(
             hook_name="ha",
             status=HookMessageSeverity.OK,
             content="for-a",
-            scope=HookType.BEFORE_TOOL,
+            scope=HookType.PRE_TOOL,
             tool_call_id="a",
         )
     )
@@ -530,20 +621,16 @@ def test_interleaved_tool_hook_runs_do_not_merge_across_call_ids() -> None:
             hook_name="hb",
             status=HookMessageSeverity.OK,
             content="for-b",
-            scope=HookType.BEFORE_TOOL,
+            scope=HookType.PRE_TOOL,
             tool_call_id="b",
         )
     )
     # Closing run "a" commits only its own line, not "b"'s.
-    committer.handle_event(
-        HookRunEndEvent(scope=HookType.BEFORE_TOOL, tool_call_id="a")
-    )
+    committer.handle_event(HookRunEndEvent(scope=HookType.PRE_TOOL, tool_call_id="a"))
     text_a = _drain_text(committer)
     assert "for-a" in text_a
     assert "for-b" not in text_a
-    committer.handle_event(
-        HookRunEndEvent(scope=HookType.BEFORE_TOOL, tool_call_id="b")
-    )
+    committer.handle_event(HookRunEndEvent(scope=HookType.PRE_TOOL, tool_call_id="b"))
     text_b = _drain_text(committer)
     assert "for-b" in text_b
     assert "for-a" not in text_b
@@ -678,7 +765,7 @@ def test_user_message_attachment_carries_file_hyperlink(tmp_path: Path) -> None:
             "look",
             images=[
                 ImageAttachment(
-                    source=FileImageSource(path=image),
+                    source=FileImageSource(path=str(image)),
                     alias="shot.png",
                     mime_type="image/png",
                 )

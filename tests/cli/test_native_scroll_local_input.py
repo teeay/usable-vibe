@@ -15,13 +15,36 @@ import asyncio
 import pytest
 
 from tests.conftest import build_test_vibe_app
+from vibe.app_server.models import (
+    PublicEntryGenerationStatus,
+    PublicMessageEntry,
+    TextContentBlock,
+)
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
 from vibe.cli.textual_ui.widgets.messages import (
     BashOutputMessage,
     QueueHeaderMessage,
     UserMessage,
 )
-from vibe.core.types import LLMMessage, Role
+
+
+def _entry(
+    app: object, entry_id: str, role: str, text: str, index: int
+) -> PublicMessageEntry:
+    return PublicMessageEntry(
+        id=entry_id,
+        session_id=app.app_server.session_id,  # type: ignore[attr-defined]
+        turn_id=f"turn-{index}",
+        role=role,  # type: ignore[arg-type]
+        content=[TextContentBlock(text=text)],
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        created_at=index,
+        updated_at=index,
+    )
+
+
+def _set_history(app: object, entries: list[PublicMessageEntry]) -> None:
+    app.app_server.state.history = entries  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -31,7 +54,6 @@ async def test_queued_prompt_is_live_not_hidden() -> None:
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()  # drop the startup-header baseline
-        app._agent_running = True
         await app._queue.enqueue_prompt("queued one")
         await pilot.pause()
 
@@ -49,7 +71,6 @@ async def test_queue_header_tracks_pause_resume() -> None:
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
-        app._agent_running = True
         await app._queue.enqueue_prompt("one")
         await pilot.pause()
 
@@ -73,7 +94,6 @@ async def test_queue_pop_removes_live_widget_without_committing() -> None:
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()  # drop the startup-header baseline
-        app._agent_running = True
         await app._queue.enqueue_prompt("first")
         await app._queue.enqueue_prompt("second")
         await pilot.pause()
@@ -98,8 +118,7 @@ async def test_queued_bash_widget_is_live_in_live_queue() -> None:
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()  # drop the startup-header baseline
-        app._agent_running = True
-        await app._queue.enqueue_bash("echo hi")
+        await app._queue.enqueue_bash("echo hi", app.app_server.cwd)
         await pilot.pause()
 
         assert any(isinstance(c, BashOutputMessage) for c in app._live_queue.children)
@@ -157,7 +176,7 @@ async def test_clear_echo_commits_to_scrollback() -> None:
         assert app._committer is not None
         text = "\n".join(app._committer.drain_lines())
         assert "clear" in text
-        assert "cleared" in text.lower()
+        assert "New conversation started" in text
 
 
 @pytest.mark.asyncio
@@ -175,9 +194,14 @@ async def test_compact_status_is_live_and_outcome_is_durable(
             await release.wait()
             return ""
 
-        monkeypatch.setattr(app.agent_loop, "compact", fake_compact)
-        app.agent_loop.messages.append(LLMMessage(role=Role.user, content="a"))
-        app.agent_loop.messages.append(LLMMessage(role=Role.assistant, content="b"))
+        monkeypatch.setattr(app.app_server, "compact", fake_compact)
+        _set_history(
+            app,
+            [
+                _entry(app, "user-1", "user", "a", 1),
+                _entry(app, "assistant-1", "assistant", "b", 2),
+            ],
+        )
 
         await app._compact_history()
         await pilot.pause()
@@ -200,5 +224,5 @@ async def test_compact_status_is_live_and_outcome_is_durable(
         # Live status removed; durable outcome committed to scrollback.
         assert not any(isinstance(c, CompactMessage) for c in app._live_queue.children)
         text = "\n".join(app._committer.drain_lines())
-        assert "Compaction completed" in text
+        assert "Conversation compacted" in text
         assert list(app._messages_area.children) == []

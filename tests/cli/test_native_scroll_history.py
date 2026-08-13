@@ -11,6 +11,11 @@ from __future__ import annotations
 import pytest
 
 from tests.conftest import build_test_vibe_app
+from vibe.app_server.models import (
+    PublicEntryGenerationStatus,
+    PublicMessageEntry,
+    TextContentBlock,
+)
 from vibe.cli.textual_ui.native_scroll.committer import ScrollbackCommitter
 from vibe.cli.textual_ui.native_scroll.history_render import render_history_blocks
 from vibe.cli.textual_ui.widgets.load_more import HistoryLoadMoreRequested
@@ -23,6 +28,25 @@ def _committer() -> ScrollbackCommitter:
 
 def _lines(committer: ScrollbackCommitter) -> str:
     return "\n".join(committer.drain_lines())
+
+
+def _entry(
+    app: object, entry_id: str, role: str, text: str, index: int
+) -> PublicMessageEntry:
+    return PublicMessageEntry(
+        id=entry_id,
+        session_id=app.app_server.session_id,  # type: ignore[attr-defined]
+        turn_id=f"turn-{index}",
+        role=role,  # type: ignore[arg-type]
+        content=[TextContentBlock(text=text)],
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        created_at=index,
+        updated_at=index,
+    )
+
+
+def _set_history(app: object, entries: list[PublicMessageEntry]) -> None:
+    app.app_server.state.history = entries  # type: ignore[attr-defined]
 
 
 # -- pure history renderer -------------------------------------------------
@@ -161,10 +185,13 @@ async def test_resume_commits_tail_not_hidden_messages() -> None:
         assert app._committer is not None
         app._committer.drain_lines()  # drop the startup-header baseline
 
-        app.agent_loop.messages.extend([
-            LLMMessage(role=Role.user, content="resumed prompt"),
-            LLMMessage(role=Role.assistant, content="resumed answer"),
-        ])
+        _set_history(
+            app,
+            [
+                _entry(app, "user-1", "user", "resumed prompt", 1),
+                _entry(app, "assistant-1", "assistant", "resumed answer", 2),
+            ],
+        )
         await app._resume_history_from_messages()
         await pilot.pause()
 
@@ -183,10 +210,9 @@ async def test_resume_commits_omitted_marker_beyond_tail() -> None:
         app._committer.drain_lines()
 
         # More than HISTORY_RESUME_TAIL_MESSAGES so a backfill remains.
-        for i in range(25):
-            app.agent_loop.messages.append(
-                LLMMessage(role=Role.user, content=f"msg {i}")
-            )
+        _set_history(
+            app, [_entry(app, f"user-{i}", "user", f"msg {i}", i) for i in range(25)]
+        )
         await app._resume_history_from_messages()
         await pilot.pause()
 

@@ -9,7 +9,7 @@ from vibe.cli.textual_ui.tool_result_render import (
     render_manual_bash_body,
     render_result_body,
 )
-from vibe.core.tools.builtins.ask_user_question import Answer, AskUserQuestionResult
+from vibe.core.tools.builtins.ask_user_question import AskUserQuestionResult
 from vibe.core.tools.builtins.bash import BashResult
 from vibe.core.tools.builtins.edit import EditResult
 from vibe.core.tools.builtins.experimental_bash import (
@@ -22,6 +22,7 @@ from vibe.core.tools.builtins.grep import GrepResult
 from vibe.core.tools.builtins.read_file import ReadFileResult
 from vibe.core.tools.builtins.todo import TodoItem, TodoResult, TodoStatus
 from vibe.core.tools.builtins.write_file import WriteFileResult
+from vibe.questions import UserAnswer
 
 
 def _plain(renderable: RenderableType | None, width: int = 80) -> str:
@@ -269,7 +270,7 @@ def test_edit_diff_repeats_replace_all_occurrences() -> None:
 
 def test_ask_single_answer_has_no_question_header() -> None:
     result = AskUserQuestionResult(
-        answers=[Answer(question="Which db?", answer="Postgres")], cancelled=False
+        answers=[UserAnswer(question="Which db?", answer="Postgres")], cancelled=False
     )
     text = _plain(
         render_result_body("ask_user_question", result, dark=True, ansi=False)
@@ -281,8 +282,8 @@ def test_ask_single_answer_has_no_question_header() -> None:
 def test_ask_multiple_answers_show_question_headers() -> None:
     result = AskUserQuestionResult(
         answers=[
-            Answer(question="Which db?", answer="Postgres"),
-            Answer(question="Which cache?", answer="Redis"),
+            UserAnswer(question="Which db?", answer="Postgres"),
+            UserAnswer(question="Which cache?", answer="Redis"),
         ],
         cancelled=False,
     )
@@ -297,7 +298,7 @@ def test_ask_multiple_answers_show_question_headers() -> None:
 
 def test_ask_other_answer_is_prefixed() -> None:
     result = AskUserQuestionResult(
-        answers=[Answer(question="Which db?", answer="SQLite", is_other=True)],
+        answers=[UserAnswer(question="Which db?", answer="SQLite", is_other=True)],
         cancelled=False,
     )
     text = _plain(
@@ -405,7 +406,7 @@ def test_grep_empty_matches_renders_no_matches() -> None:
 
 def test_todo_body_groups_by_status_with_icons() -> None:
     result = TodoResult(
-        message="ok",
+        verb="Updated",
         total_count=3,
         todos=[
             TodoItem(id="1", content="done item", status=TodoStatus.COMPLETED),
@@ -422,7 +423,7 @@ def test_todo_body_groups_by_status_with_icons() -> None:
 
 
 def test_todo_empty_renders_no_todos() -> None:
-    result = TodoResult(message="ok", total_count=0, todos=[])
+    result = TodoResult(verb="Retrieved", total_count=0, todos=[])
     text = _plain(render_result_body("todo", result, dark=True, ansi=False))
     assert "No todos" in text
 

@@ -38,8 +38,12 @@ GLOBAL_ENV_FILE = GlobalPath(lambda: VIBE_HOME.path / ".env")
 SESSION_LOG_DIR = GlobalPath(lambda: VIBE_HOME.path / "logs" / "session")
 WORKTREES_DIR = GlobalPath(lambda: VIBE_HOME.path / "worktrees")
 TRUSTED_FOLDERS_FILE = GlobalPath(lambda: VIBE_HOME.path / "trusted_folders.toml")
+PROJECTS_FILE = GlobalPath(lambda: VIBE_HOME.path / "projects.toml")
 CONNECTOR_BOOTSTRAP_CACHE_FILE = GlobalPath(
     lambda: VIBE_HOME.path / "connector_bootstrap_cache.json"
+)
+EXPERIMENT_EVAL_CACHE_FILE = GlobalPath(
+    lambda: VIBE_HOME.path / "experiment_eval_cache.json"
 )
 HISTORY_FILE = GlobalPath(lambda: VIBE_HOME.path / "vibehistory")
 PLANS_DIR = GlobalPath(lambda: VIBE_HOME.path / "plans")

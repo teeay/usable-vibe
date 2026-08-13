@@ -272,7 +272,7 @@ def test_native_scroll_commits_assistant_response_to_scrollback(
 
         # The mock backend streams "Hello from mock server"; it must reach the
         # terminal output as committed transcript text.
-        wait_for_rendered_text(child, captured, "Hello from mock server", timeout=30)
+        wait_for_rendered_text(child, captured, "Hello from mock server", timeout=15)
 
         raw = captured.getvalue()
         _assert_native_terminal_contract(raw)

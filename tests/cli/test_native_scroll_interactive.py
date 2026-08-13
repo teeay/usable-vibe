@@ -8,14 +8,17 @@ hidden ``#messages`` widgets.
 
 from __future__ import annotations
 
-import asyncio
 import re
 from unittest.mock import AsyncMock
 
-from pydantic import BaseModel
 import pytest
 
 from tests.conftest import build_test_vibe_app
+from vibe.app_server.models import (
+    PublicEntryGenerationStatus,
+    PublicMessageEntry,
+    TextContentBlock,
+)
 from vibe.cli.textual_ui.native_scroll.app_surfaces import (
     render_approval_outcome,
     render_rewind_outcome,
@@ -24,16 +27,11 @@ from vibe.cli.textual_ui.scrollback_committer import ScrollbackCommitter
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.connector_auth_app import ConnectorAuthApp
 from vibe.cli.textual_ui.widgets.mcp_oauth_app import MCPOAuthApp
+from vibe.cli.textual_ui.widgets.messages import UserCommandMessage
 from vibe.cli.textual_ui.widgets.model_picker import ModelPickerApp
 from vibe.cli.textual_ui.widgets.rewind_app import RewindApp
 from vibe.cli.textual_ui.widgets.theme_picker import ThemePickerApp
 from vibe.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
-from vibe.core.rewind import RewindError
-from vibe.core.types import LLMMessage, Role
-
-
-class _Args(BaseModel):
-    pass
 
 
 def _committer() -> ScrollbackCommitter:
@@ -49,6 +47,21 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 def _plain(committer: ScrollbackCommitter) -> str:
     return _ANSI_RE.sub("", "\n".join(committer.drain_lines()))
+
+
+def _message_entry(
+    app: object, entry_id: str, role: str, text: str, index: int
+) -> PublicMessageEntry:
+    return PublicMessageEntry(
+        id=entry_id,
+        session_id=app.app_server.session_id,  # type: ignore[attr-defined]
+        turn_id=f"turn-{index}",
+        role=role,  # type: ignore[arg-type]
+        content=[TextContentBlock(text=text)],
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        created_at=index,
+        updated_at=index,
+    )
 
 
 # -- pure renderers --------------------------------------------------------
@@ -119,12 +132,10 @@ async def test_approval_granted_commits_outcome() -> None:
         assert app._committer is not None
         app._committer.drain_lines()  # clear startup header
 
-        app._pending_approval = asyncio.Future()
         await app.on_approval_app_approval_granted(
-            ApprovalApp.ApprovalGranted(tool_name="bash", tool_args=_Args())
+            ApprovalApp.ApprovalGranted(tool_name="bash", tool_args={})
         )
 
-        assert app._pending_approval.done()
         assert "Approved bash" in _plain(app._committer)
         assert len(list(app._messages_area.children)) == 0
 
@@ -137,9 +148,8 @@ async def test_approval_rejected_commits_denied() -> None:
         assert app._committer is not None
         app._committer.drain_lines()
 
-        app._pending_approval = asyncio.Future()
         await app.on_approval_app_approval_rejected(
-            ApprovalApp.ApprovalRejected(tool_name="edit", tool_args=_Args())
+            ApprovalApp.ApprovalRejected(tool_name="edit", tool_args={})
         )
 
         assert "Denied edit" in _plain(app._committer)
@@ -147,20 +157,15 @@ async def test_approval_rejected_commits_denied() -> None:
 
 
 @pytest.mark.asyncio
-async def test_approval_always_tool_commits_scope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_approval_always_tool_commits_scope() -> None:
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()
-        monkeypatch.setattr(app.agent_loop, "approve_always", lambda *a, **k: None)
-
-        app._pending_approval = asyncio.Future()
         await app.on_approval_app_approval_granted_always_tool(
             ApprovalApp.ApprovalGrantedAlwaysTool(
-                tool_name="bash", tool_args=_Args(), required_permissions=[]
+                tool_name="bash", tool_args={}, required_permissions=[]
             )
         )
 
@@ -170,20 +175,15 @@ async def test_approval_always_tool_commits_scope(
 
 
 @pytest.mark.asyncio
-async def test_approval_always_permanent_commits_scope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_approval_always_permanent_commits_scope() -> None:
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()
-        monkeypatch.setattr(app.agent_loop, "approve_always", lambda *a, **k: None)
-
-        app._pending_approval = asyncio.Future()
         await app.on_approval_app_approval_granted_always_permanent(
             ApprovalApp.ApprovalGrantedAlwaysPermanent(
-                tool_name="edit", tool_args=_Args(), required_permissions=[]
+                tool_name="edit", tool_args={}, required_permissions=[]
             )
         )
 
@@ -195,19 +195,11 @@ async def test_approval_always_permanent_commits_scope(
 def _neutralize_reload(app: object, monkeypatch: pytest.MonkeyPatch) -> None:
     """Let `_reload_config` run its single notice commit without heavy IO."""
     monkeypatch.setattr(
-        "vibe.cli.textual_ui.app.VibeConfig.load",
-        classmethod(lambda cls: app.config),  # type: ignore[attr-defined]
+        app.app_server.resources.config,  # type: ignore[attr-defined]
+        "reload",
+        AsyncMock(return_value=0),
     )
-    monkeypatch.setattr(
-        "vibe.cli.textual_ui.app.VibeConfig.save_updates",
-        staticmethod(lambda *a, **k: None),
-    )
-    monkeypatch.setattr(
-        app.agent_loop,  # type: ignore[attr-defined]
-        "reload_with_initial_messages",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(app, "_resolve_plan", AsyncMock())  # type: ignore[arg-type]
+    monkeypatch.setattr(app, "_apply_config_to_ui", AsyncMock())
 
 
 @pytest.mark.asyncio
@@ -264,7 +256,8 @@ async def test_config_save_commits_single_outcome(
         app._committer.drain_lines()
         _neutralize_reload(app, monkeypatch)
 
-        await app._handle_config_settings_closed({"some_setting": "value"})
+        await app._persist_config_changes({"some_setting": "value"})
+        await app._mount_and_scroll(UserCommandMessage("Configuration updated."))
         await pilot.pause()
 
         text = _plain(app._committer)
@@ -280,10 +273,7 @@ async def test_theme_selection_commits_outcome(monkeypatch: pytest.MonkeyPatch) 
         assert app._committer is not None
         app._committer.drain_lines()
 
-        monkeypatch.setattr(
-            "vibe.cli.textual_ui.app.VibeConfig.save_updates",
-            staticmethod(lambda *a, **k: None),
-        )
+        monkeypatch.setattr(app.app_server.resources.config, "update", AsyncMock())
 
         theme = app.config.theme
         await app.on_theme_picker_app_theme_selected(
@@ -306,7 +296,6 @@ async def test_connector_auth_refresh_commits_outcome(
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()
-        monkeypatch.setattr(app.agent_loop, "refresh_system_prompt", AsyncMock())
         monkeypatch.setattr(app, "_show_mcp", AsyncMock())
 
         await app.on_connector_auth_app_connector_auth_closed(
@@ -345,13 +334,15 @@ async def test_mcp_oauth_refresh_commits_outcome(
 
 
 def _seed_two_turns(app: object) -> tuple[int, int]:
-    messages = app.agent_loop.messages  # type: ignore[attr-defined]
-    first_index = len(messages)
-    messages.append(LLMMessage(role=Role.user, content="first prompt"))
-    messages.append(LLMMessage(role=Role.assistant, content="first reply"))
-    second_index = len(messages)
-    messages.append(LLMMessage(role=Role.user, content="second prompt"))
-    messages.append(LLMMessage(role=Role.assistant, content="second reply"))
+    messages = [
+        _message_entry(app, "user-1", "user", "first prompt", 1),
+        _message_entry(app, "assistant-1", "assistant", "first reply", 2),
+        _message_entry(app, "user-2", "user", "second prompt", 3),
+        _message_entry(app, "assistant-2", "assistant", "second reply", 4),
+    ]
+    app.app_server.state.history = messages  # type: ignore[attr-defined]
+    first_index = 0
+    second_index = 2
     return first_index, second_index
 
 
@@ -368,7 +359,7 @@ async def test_rewind_navigates_by_message_index() -> None:
 
         # Newest user message selected by index; live RewindApp panel is shown.
         assert app._rewind_mode is True
-        assert app._rewind_target_index == second_index
+        assert app._rewind_target_entry_id == "user-2"
         rewind_app = app.query_one(RewindApp)
         assert "second prompt" in rewind_app._message_preview
 
@@ -376,36 +367,49 @@ async def test_rewind_navigates_by_message_index() -> None:
         app.action_rewind_prev()
         await pilot.pause()
         await pilot.pause()
-        assert app._rewind_target_index == first_index
+        assert app._rewind_target_entry_id == "user-1"
 
         app.action_rewind_next()
         await pilot.pause()
         await pilot.pause()
-        assert app._rewind_target_index == second_index
+        assert app._rewind_target_entry_id == "user-2"
 
         # No hidden transcript widgets are involved in selection.
         assert len(list(app._messages_area.children)) == 0
 
 
 @pytest.mark.asyncio
-async def test_execute_rewind_commits_marker_and_prefills_input() -> None:
+async def test_execute_rewind_commits_marker_and_prefills_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app._committer is not None
-        _first_index, second_index = _seed_two_turns(app)
+        _first_index, _second_index = _seed_two_turns(app)
         app._committer.drain_lines()
 
-        app.agent_loop.rewind_manager.rewind_to_message = AsyncMock(  # type: ignore[method-assign]
-            return_value=("second prompt", [], [])
+        monkeypatch.setattr(
+            app.app_server.resources.sessions,
+            "rewind",
+            AsyncMock(
+                return_value=type(
+                    "RewindResponse",
+                    (),
+                    {"message": "second prompt", "restore_errors": []},
+                )()
+            ),
         )
+        monkeypatch.setattr(app.app_server.resources, "refresh", AsyncMock())
 
         app.action_rewind_prev()
         await pilot.pause()
         await pilot.pause()
-        assert app._rewind_target_index == second_index
+        assert app._rewind_target_entry_id == "user-2"
 
-        await app.on_rewind_app_rewind_without_restore(RewindApp.RewindWithoutRestore())
+        await app.on_rewind_app_rewind_confirmed(
+            RewindApp.RewindConfirmed(restore_files=False, inplace=True)
+        )
         await pilot.pause()
 
         text = _plain(app._committer)
@@ -415,13 +419,14 @@ async def test_execute_rewind_commits_marker_and_prefills_input() -> None:
         assert "1 later message discarded" in text
         assert "files kept" in text
         assert app._rewind_mode is False
-        assert app._rewind_target_index is None
         assert app._chat_input_container is not None
         assert app._chat_input_container.value == "second prompt"
 
 
 @pytest.mark.asyncio
-async def test_rewind_error_is_transient_not_durable() -> None:
+async def test_execute_rewind_non_inplace_commits_fork_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -429,10 +434,60 @@ async def test_rewind_error_is_transient_not_durable() -> None:
         _seed_two_turns(app)
         app._committer.drain_lines()
 
-        async def _raise(*_args: object, **_kwargs: object) -> tuple[str, list[str]]:
-            raise RewindError("invalid index")
+        monkeypatch.setattr(
+            app.app_server.resources.sessions,
+            "rewind",
+            AsyncMock(
+                return_value=type(
+                    "RewindResponse",
+                    (),
+                    {"message": "second prompt", "restore_errors": []},
+                )()
+            ),
+        )
+        monkeypatch.setattr(app.app_server.resources, "refresh", AsyncMock())
 
-        app.agent_loop.rewind_manager.rewind_to_message = _raise  # type: ignore[method-assign]
+        app.action_rewind_prev()
+        await pilot.pause()
+        await pilot.pause()
+        assert app._rewind_target_entry_id == "user-2"
+
+        await app.on_rewind_app_rewind_confirmed(
+            RewindApp.RewindConfirmed(restore_files=False, inplace=False)
+        )
+        await pilot.pause()
+
+        text = _plain(app._committer)
+        assert "Rewound to: second prompt" in text
+        assert "Forked to a new session" in text
+        assert len(list(app._messages_area.children)) == 0
+
+
+@pytest.mark.asyncio
+async def test_rewind_error_is_transient_not_durable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_vibe_app()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._committer is not None
+        _seed_two_turns(app)
+        app._committer.drain_lines()
+
+        async def _raise(*_args: object, **_kwargs: object) -> object:
+            from vibe.app_server.protocol import (
+                AppServerResponseError,
+                ProtocolError,
+                ProtocolErrorCode,
+            )
+
+            raise AppServerResponseError(
+                ProtocolError(
+                    code=ProtocolErrorCode.INVALID_PARAMS, message="invalid index"
+                )
+            )
+
+        monkeypatch.setattr(app.app_server.resources.sessions, "rewind", _raise)
         notices: list[str] = []
         app.notify = lambda message, **_k: notices.append(str(message))  # type: ignore[assignment,method-assign]
 
@@ -440,7 +495,9 @@ async def test_rewind_error_is_transient_not_durable() -> None:
         await pilot.pause()
         await pilot.pause()
 
-        await app.on_rewind_app_rewind_without_restore(RewindApp.RewindWithoutRestore())
+        await app.on_rewind_app_rewind_confirmed(
+            RewindApp.RewindConfirmed(restore_files=False, inplace=True)
+        )
         await pilot.pause()
 
         # The error is a transient toast, never durable scrollback; rewind state

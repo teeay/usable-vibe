@@ -11,6 +11,7 @@ shared severity presentation rather than scraping the container.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown
@@ -19,6 +20,12 @@ from rich.style import Style
 from rich.text import Text
 from textual.widget import Widget
 
+from vibe.app_server.models import (
+    FileImageSource as AppFileImageSource,
+    HookSeverity,
+    ImageAttachment as AppImageAttachment,
+    InlineImageSource as AppInlineImageSource,
+)
 from vibe.cli.textual_ui.native_scroll.presentation import (
     HOOK_SEVERITY_ICONS,
     HOOK_SEVERITY_STYLES,
@@ -31,8 +38,22 @@ from vibe.cli.textual_ui.widgets.messages import (
     UserMessage,
     WarningMessage,
 )
+from vibe.cli.textual_ui.widgets.rewind_fork_message import RewindForkMessage
 from vibe.core.hooks.models import HookMessageSeverity, HookType
-from vibe.core.types import FileImageSource, ImageAttachment, InlineImageSource
+from vibe.core.types import (
+    FileImageSource as CoreFileImageSource,
+    ImageAttachment as CoreImageAttachment,
+    InlineImageSource as CoreInlineImageSource,
+)
+
+type NativeHookSeverity = HookMessageSeverity | HookSeverity
+type NativeImageAttachment = CoreImageAttachment | AppImageAttachment
+
+_APP_HOOK_SEVERITY_TYPES: dict[HookSeverity, HookMessageSeverity] = {
+    HookSeverity.OK: HookMessageSeverity.OK,
+    HookSeverity.WARNING: HookMessageSeverity.WARNING,
+    HookSeverity.ERROR: HookMessageSeverity.ERROR,
+}
 
 # User-prompt band: a warm gray-red background that sets prompts apart from the
 # response transcript without a separator rule. These are deliberate RGB values,
@@ -64,15 +85,24 @@ def render_widget_block(  # noqa: PLR0911
         return Text("Interrupted · What should Vibe do instead?", style="yellow")
     if isinstance(widget, HookSystemMessageLine):
         return render_hook_line(widget._hook_name, widget._content, widget._severity)
+    if isinstance(widget, RewindForkMessage):
+        return Text(widget.get_content(), style="green")
     return None
 
 
 def render_hook_line(
-    hook_name: str, content: str, severity: HookMessageSeverity
+    hook_name: str, content: str, severity: NativeHookSeverity
 ) -> Text:
-    icon = HOOK_SEVERITY_ICONS.get(severity, "⚠")
-    style = HOOK_SEVERITY_STYLES.get(severity, "yellow")
+    message_severity = _hook_message_severity(severity)
+    icon = HOOK_SEVERITY_ICONS.get(message_severity, "⚠")
+    style = HOOK_SEVERITY_STYLES.get(message_severity, "yellow")
     return Text.assemble((f"{icon} ", style), (f"[{hook_name}] {content}", ""))
+
+
+def _hook_message_severity(severity: NativeHookSeverity) -> HookMessageSeverity:
+    if isinstance(severity, HookMessageSeverity):
+        return severity
+    return _APP_HOOK_SEVERITY_TYPES.get(severity, HookMessageSeverity.WARNING)
 
 
 def render_hook_run(
@@ -99,9 +129,9 @@ def render_hook_run(
 def _hook_run_header(scope: HookType, tool_name: str | None) -> str:
     tool = tool_name or "tool"
     match scope:
-        case HookType.BEFORE_TOOL:
+        case HookType.PRE_TOOL:
             return f"before {tool}"
-        case HookType.AFTER_TOOL:
+        case HookType.POST_TOOL:
             return f"after {tool}"
         case _:
             return "post-agent-turn"
@@ -110,7 +140,7 @@ def _hook_run_header(scope: HookType, tool_name: str | None) -> str:
 def render_user_prompt(
     prompt_char: str,
     content: str,
-    images: list[ImageAttachment] | None = None,
+    images: Sequence[NativeImageAttachment] | None = None,
     *,
     dark: bool = True,
 ) -> RenderableType:
@@ -130,7 +160,7 @@ def render_user_prompt(
     return Padding(body, (0, 1), style=band, expand=True)
 
 
-def _attachments_line(images: list[ImageAttachment]) -> RenderableType:
+def _attachments_line(images: Sequence[NativeImageAttachment]) -> RenderableType:
     label = "attached image" if len(images) == 1 else "attached images"
     line = Text(f"└ {label}: ", style="dim")
     for index, image in enumerate(images):
@@ -138,9 +168,13 @@ def _attachments_line(images: list[ImageAttachment]) -> RenderableType:
             line.append(", ", style="dim")
         # Carry a file:// terminal hyperlink on the alias, matching the widget's
         # clickable attachment links. Inline images have no durable file target.
-        match image.source:
-            case FileImageSource(path=path):
-                line.append(image.alias, style=Style(link=path.as_uri(), dim=True))
-            case InlineImageSource():
-                line.append(image.alias, style="dim")
+        source = image.source
+        if isinstance(source, CoreFileImageSource | AppFileImageSource):
+            path = source.path if isinstance(source.path, Path) else Path(source.path)
+            line.append(
+                image.alias,
+                style=Style(link=path.expanduser().resolve().as_uri(), dim=True),
+            )
+        elif isinstance(source, CoreInlineImageSource | AppInlineImageSource):
+            line.append(image.alias, style="dim")
     return line

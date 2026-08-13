@@ -15,13 +15,19 @@ from typing import cast
 import pytest
 
 from tests.conftest import build_test_vibe_app, committed_scrollback
+from vibe.app_server.models import (
+    FileImageSource,
+    ImageAttachment,
+    QuestionChoice,
+    UserAnswer,
+    UserQuestion,
+    UserQuestionRequest,
+)
 from vibe.cli.textual_ui.app import VibeApp
 from vibe.cli.textual_ui.scrollback_committer import ScrollbackCommitter
 from vibe.cli.textual_ui.widgets.messages import UserMessage, WhatsNewMessage
 from vibe.core.types import (
     AssistantEvent,
-    FileImageSource,
-    ImageAttachment,
     ReasoningEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -128,7 +134,7 @@ async def test_user_message_image_attachments_reach_scrollback(tmp_path: Path) -
             "look at this",
             images=[
                 ImageAttachment(
-                    source=FileImageSource(path=image),
+                    source=FileImageSource(path=str(image)),
                     alias="shot.png",
                     mime_type="image/png",
                 )
@@ -144,7 +150,6 @@ async def test_user_message_image_attachments_reach_scrollback(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_ask_user_question_answers_reach_scrollback() -> None:
     from vibe.core.tools.builtins.ask_user_question import (
-        Answer,
         AskUserQuestion,
         AskUserQuestionResult,
     )
@@ -153,7 +158,7 @@ async def test_ask_user_question_answers_reach_scrollback() -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         result = AskUserQuestionResult(
-            answers=[Answer(question="Which DB?", answer="SQLite", is_other=False)],
+            answers=[UserAnswer(question="Which DB?", answer="SQLite", is_other=False)],
             cancelled=False,
         )
         _committer(app).handle_event(
@@ -179,26 +184,26 @@ async def test_question_app_form_lifecycle_commits_answer_once() -> None:
     from vibe.cli.textual_ui.widgets.question_app import QuestionApp
     from vibe.core.tools.builtins.ask_user_question import (
         AskUserQuestion,
-        AskUserQuestionArgs,
         AskUserQuestionResult,
-        Choice,
-        Question,
     )
 
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
         _committer(app).drain_lines()  # drop the startup-header baseline
-        args = AskUserQuestionArgs(
+        args = UserQuestionRequest(
             questions=[
-                Question(
+                UserQuestion(
                     question="Which DB?",
                     header="DB",
-                    options=[Choice(label="Postgres"), Choice(label="SQLite")],
+                    options=[
+                        QuestionChoice(label="Postgres"),
+                        QuestionChoice(label="SQLite"),
+                    ],
                 )
             ]
         )
-        callback = asyncio.ensure_future(app._user_input_callback(args))
+        callback = asyncio.ensure_future(app._request_local_user_input(args))
 
         question_app: QuestionApp | None = None
         for _ in range(50):
@@ -248,26 +253,26 @@ async def test_question_app_cancel_commits_cancellation() -> None:
     from vibe.cli.textual_ui.widgets.question_app import QuestionApp
     from vibe.core.tools.builtins.ask_user_question import (
         AskUserQuestion,
-        AskUserQuestionArgs,
         AskUserQuestionResult,
-        Choice,
-        Question,
     )
 
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
         _committer(app).drain_lines()  # drop the startup-header baseline
-        args = AskUserQuestionArgs(
+        args = UserQuestionRequest(
             questions=[
-                Question(
+                UserQuestion(
                     question="Which DB?",
                     header="DB",
-                    options=[Choice(label="Postgres"), Choice(label="SQLite")],
+                    options=[
+                        QuestionChoice(label="Postgres"),
+                        QuestionChoice(label="SQLite"),
+                    ],
                 )
             ]
         )
-        callback = asyncio.ensure_future(app._user_input_callback(args))
+        callback = asyncio.ensure_future(app._request_local_user_input(args))
 
         question_app: QuestionApp | None = None
         for _ in range(50):

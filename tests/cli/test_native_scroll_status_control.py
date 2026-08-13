@@ -19,6 +19,8 @@ from textual.geometry import Size
 from textual.widgets import Static
 
 from tests.conftest import build_test_vibe_app, build_test_vibe_config
+from tests.stubs.app_server import CoreEventProjection
+from vibe.app_server.events import AppServerEvent
 import vibe.cli.textual_ui.app as app_module
 from vibe.cli.textual_ui.native_scroll.app_surfaces import (
     render_plan_notice,
@@ -41,6 +43,12 @@ from vibe.core.types import (
 
 def _committer() -> ScrollbackCommitter:
     return ScrollbackCommitter(width_getter=lambda: 80, color_system=None)
+
+
+def _project_one(event: object) -> AppServerEvent:
+    projected = CoreEventProjection().project(event)  # type: ignore[arg-type]
+    assert len(projected) == 1
+    return projected[0]
 
 
 def _lines(committer: ScrollbackCommitter) -> str:
@@ -138,10 +146,10 @@ async def test_bottom_agent_label_tracks_profile_without_resetting_input() -> No
         chat_input = app.query_one(ChatInputContainer)
         chat_input.value = "typed but not submitted"
 
-        app._update_profile_widgets(app.agent_loop.agent_profile)
+        app._update_profile_widgets(app.app_server.resources.agents.active)
         await pilot.pause()
 
-        assert str(label.render()) == "[default]"
+        assert str(label.render()) == "[ask]"
         assert chat_input.value == "typed but not submitted"
 
         app._update_bottom_agent_label("accept-edits", safety=AgentSafety.DESTRUCTIVE)
@@ -199,7 +207,7 @@ async def test_bottom_bar_paints_left_adjacent_content_only() -> None:
         text = row.text.rstrip()
         # Agent label sits directly after the path with a fixed gap, not
         # right-aligned behind a 1fr spacer painting interior spaces.
-        assert "[default]" in text
+        assert "[ask]" in text
         assert "          " not in text
         trimmed = strip_trailing_padding(row)
         assert trimmed.cell_length <= len(text) + 1
@@ -278,7 +286,7 @@ async def test_plan_review_native_owner_and_ctrl_g(tmp_path: Path) -> None:
         app._committer.drain_lines()
 
         await app._apply_native_plan_effects(
-            PlanReviewRequestedEvent(file_path=plan_path)
+            _project_one(PlanReviewRequestedEvent(file_path=plan_path))
         )
         await pilot.pause()
 
@@ -294,7 +302,7 @@ async def test_plan_review_native_owner_and_ctrl_g(tmp_path: Path) -> None:
         message.open_in_editor.assert_called_once()
 
         # Review ends: live owner torn down.
-        await app._apply_native_plan_effects(PlanReviewEndedEvent())
+        await app._apply_native_plan_effects(_project_one(PlanReviewEndedEvent()))
         await pilot.pause()
         assert app._native_plan_message is None
         assert message not in app._live_surface.children
@@ -311,7 +319,7 @@ async def test_context_cleared_event_resets_and_keeps_plan_live(tmp_path: Path) 
         app._committer.drain_lines()
 
         await app._apply_native_context_effects(
-            ContextClearedEvent(plan_file_path=plan_path)
+            _project_one(ContextClearedEvent(plan_file_path=plan_path))
         )
         await pilot.pause()
 
@@ -344,6 +352,12 @@ async def test_unsupported_durable_widget_warns_and_falls_through() -> None:
             app_module.logger.warning = original  # type: ignore[method-assign]
 
         # Fall-through is visible: warned, nothing durable committed, widget hidden.
-        warn.assert_called_once()
+        native_warnings = [
+            call
+            for call in warn.call_args_list
+            if call.args
+            and str(call.args[0]).startswith("native-scroll: %s not consumed")
+        ]
+        assert len(native_warnings) == 1
         assert app._committer.has_pending is False
         assert orphan in app._messages_area.children

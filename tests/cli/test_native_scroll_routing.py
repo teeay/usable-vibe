@@ -10,6 +10,8 @@ from collections.abc import AsyncGenerator
 import pytest
 
 from tests.conftest import build_test_vibe_app
+from tests.stubs.app_server import CoreEventProjection
+from vibe.app_server.events import AppServerEvent
 from vibe.cli.textual_ui.widgets.messages import (
     HookRunContainer,
     UserMessage,
@@ -25,9 +27,11 @@ from vibe.core.hooks.models import (
 from vibe.core.types import AssistantEvent, BaseEvent, WaitingForInputEvent
 
 
-async def _events(*events: BaseEvent) -> AsyncGenerator[BaseEvent]:
+async def _events(*events: BaseEvent) -> AsyncGenerator[AppServerEvent]:
+    projector = CoreEventProjection()
     for event in events:
-        yield event
+        for projected in projector.project(event):
+            yield projected
 
 
 @pytest.mark.asyncio
@@ -55,7 +59,7 @@ async def test_agent_events_route_to_committer() -> None:
         await pilot.pause()
         assert app._committer is not None
 
-        await app._handle_agent_loop_events(
+        await app._handle_turn_events(
             _events(
                 AssistantEvent(content="streamed "),
                 AssistantEvent(content="answer"),
@@ -104,15 +108,15 @@ async def test_hook_run_routes_grouped_block_without_hidden_container() -> None:
         assert app._committer is not None
         app._committer.drain_lines()  # drop the startup-header baseline
 
-        await app._handle_agent_loop_events(
+        await app._handle_turn_events(
             _events(
-                HookRunStartEvent(scope=HookType.POST_AGENT_TURN),
+                HookRunStartEvent(scope=HookType.POST_AGENT),
                 HookEndEvent(
                     hook_name="format",
                     status=HookMessageSeverity.OK,
                     content="formatted 2 files",
                 ),
-                HookRunEndEvent(scope=HookType.POST_AGENT_TURN),
+                HookRunEndEvent(scope=HookType.POST_AGENT),
                 WaitingForInputEvent(task_id="t"),
             )
         )
@@ -134,7 +138,7 @@ async def test_assistant_markdown_renders_with_formatting() -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app._committer is not None
-        await app._handle_agent_loop_events(
+        await app._handle_turn_events(
             _events(
                 AssistantEvent(content="# Heading\n\nsome **bold** words"),
                 WaitingForInputEvent(task_id="t"),

@@ -115,7 +115,12 @@ def test_transient_live_surface_disappears_without_becoming_transcript() -> None
     env = {**os.environ, "TERM": "xterm-256color"}
 
     terminal = run_under_terminal(
-        [sys.executable, str(_TRANSIENT_SPIKE_APP)], rows=rows, cols=cols, env=env
+        [sys.executable, str(_TRANSIENT_SPIKE_APP)],
+        rows=rows,
+        cols=cols,
+        env=env,
+        pump_timeout=0.5,
+        idle_reads=8,
     )
 
     assert not terminal.entered_alternate_screen

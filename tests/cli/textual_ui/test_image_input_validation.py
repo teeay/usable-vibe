@@ -5,20 +5,17 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import (
+    build_test_agent_loop,
     build_test_vibe_app,
     build_test_vibe_config,
     committed_scrollback,
 )
-from vibe.cli.textual_ui.app import _ImageAttachmentRejection
+from vibe.app_server._workspace import PromptPreparationError, prepare_prompt
+from vibe.app_server.models import ImageAttachment
 from vibe.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
-from vibe.core.autocompletion.path_prompt import build_path_prompt_payload
 from vibe.core.config import ModelConfig, ProviderConfig
-from vibe.core.types import (
-    MAX_IMAGE_BYTES,
-    MAX_IMAGES_PER_MESSAGE,
-    Backend,
-    ImageAttachment,
-)
+from vibe.core.types import Backend
+from vibe.utils.images import MAX_IMAGE_BYTES, MAX_IMAGES_PER_MESSAGE
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
@@ -45,83 +42,77 @@ def _vision_config(*, supports_images: bool = True):
     )
 
 
-@pytest.mark.asyncio
-async def test_build_image_attachments_happy_path(tmp_path: Path) -> None:
-    (tmp_path / "shot.png").write_bytes(PNG_BYTES)
-    payload = build_path_prompt_payload("look at @shot.png", base_dir=tmp_path)
-
-    app = build_test_vibe_app(config=_vision_config())
-    result = await app._build_image_attachments(payload)
-
-    assert isinstance(result, list)
-    assert len(result) == 1
-    assert isinstance(result[0], ImageAttachment)
-    assert result[0].alias == "shot.png"
-    assert result[0].mime_type == "image/png"
-
-
-@pytest.mark.asyncio
-async def test_build_image_attachments_returns_empty_when_no_images(
-    tmp_path: Path,
+def test_prepare_prompt_snapshots_images(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "shot.png").write_bytes(PNG_BYTES)
+    agent_loop = build_test_agent_loop(config=_vision_config())
+
+    prompt = prepare_prompt(agent_loop, "look at @shot.png")
+
+    assert len(prompt.images) == 1
+    assert isinstance(prompt.images[0], ImageAttachment)
+    assert prompt.images[0].alias == "shot.png"
+    assert prompt.images[0].mime_type == "image/png"
+
+
+def test_prepare_prompt_returns_empty_images_when_no_images(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
     (tmp_path / "notes.md").write_text("hi")
-    payload = build_path_prompt_payload("read @notes.md", base_dir=tmp_path)
+    agent_loop = build_test_agent_loop(config=_vision_config())
 
-    app = build_test_vibe_app(config=_vision_config())
-    result = await app._build_image_attachments(payload)
+    prompt = prepare_prompt(agent_loop, "read @notes.md")
 
-    assert result == []
+    assert prompt.images == []
 
 
-@pytest.mark.asyncio
-async def test_build_image_attachments_rejects_too_many_images(tmp_path: Path) -> None:
+def test_prepare_prompt_rejects_too_many_images(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
     mentions = []
     for i in range(MAX_IMAGES_PER_MESSAGE + 1):
         name = f"img{i}.png"
         (tmp_path / name).write_bytes(PNG_BYTES)
         mentions.append(f"@{name}")
-    payload = build_path_prompt_payload(" ".join(mentions), base_dir=tmp_path)
+    agent_loop = build_test_agent_loop(config=_vision_config())
 
-    app = build_test_vibe_app(config=_vision_config())
-    result = await app._build_image_attachments(payload)
-
-    assert isinstance(result, _ImageAttachmentRejection)
-    assert not result.no_vision
-    assert "Too many image attachments" in result.message
-    assert str(MAX_IMAGES_PER_MESSAGE) in result.message
+    with pytest.raises(PromptPreparationError) as exc_info:
+        prepare_prompt(agent_loop, " ".join(mentions))
+    assert "Too many image attachments" in str(exc_info.value)
+    assert str(MAX_IMAGES_PER_MESSAGE) in str(exc_info.value)
 
 
-@pytest.mark.asyncio
-async def test_build_image_attachments_rejects_non_vision_model(tmp_path: Path) -> None:
+def test_prepare_prompt_rejects_non_vision_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
     (tmp_path / "shot.png").write_bytes(PNG_BYTES)
-    payload = build_path_prompt_payload("look at @shot.png", base_dir=tmp_path)
+    agent_loop = build_test_agent_loop(config=_vision_config(supports_images=False))
 
-    app = build_test_vibe_app(config=_vision_config(supports_images=False))
-    result = await app._build_image_attachments(payload)
-
-    assert isinstance(result, _ImageAttachmentRejection)
-    assert result.no_vision
-    assert "does not support images" in result.message
-    assert "devstral-latest" in result.message
+    with pytest.raises(PromptPreparationError) as exc_info:
+        prepare_prompt(agent_loop, "look at @shot.png")
+    assert "does not support images" in str(exc_info.value)
+    assert "devstral-latest" in str(exc_info.value)
 
 
-@pytest.mark.asyncio
-async def test_build_image_attachments_rejects_oversize_image(
+def test_prepare_prompt_rejects_oversize_image(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Patch the cap down so we don't need to write 10MB to disk.
-    monkeypatch.setattr("vibe.cli.textual_ui.app.MAX_IMAGE_BYTES", 32)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("vibe.core.session.image_snapshot.MAX_IMAGE_BYTES", 32)
 
     (tmp_path / "shot.png").write_bytes(PNG_BYTES + b"\x00" * 64)
-    payload = build_path_prompt_payload("look at @shot.png", base_dir=tmp_path)
+    agent_loop = build_test_agent_loop(config=_vision_config())
 
-    app = build_test_vibe_app(config=_vision_config())
-    result = await app._build_image_attachments(payload)
-
-    assert isinstance(result, _ImageAttachmentRejection)
-    assert not result.no_vision
-    assert "shot.png" in result.message
-    assert "max" in result.message.lower()
+    with pytest.raises(PromptPreparationError) as exc_info:
+        prepare_prompt(agent_loop, "look at @shot.png")
+    assert "shot.png" in str(exc_info.value)
+    assert "large" in str(exc_info.value).lower()
 
 
 def test_max_image_bytes_default_is_10_mib() -> None:

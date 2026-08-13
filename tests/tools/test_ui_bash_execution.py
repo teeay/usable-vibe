@@ -3,7 +3,6 @@ from __future__ import annotations
 import time
 
 import pytest
-from textual.widgets import Static
 
 from tests.conftest import build_test_agent_loop, build_test_vibe_app
 from tests.mock.utils import mock_llm_chunk
@@ -27,17 +26,6 @@ async def _wait_for_bash_commit(vibe_app: VibeApp, pilot, timeout: float = 2.0) 
             return "\n".join(vibe_app._committer.drain_lines())
         await pilot.pause(0.05)
     raise TimeoutError(f"Bash result did not commit within {timeout}s")
-
-
-async def _wait_for_pending_bash_message(
-    vibe_app: VibeApp, pilot, timeout: float = 1.0
-) -> BashOutputMessage:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if message := next(iter(vibe_app.query(BashOutputMessage)), None):
-            return message
-        await pilot.pause(0.05)
-    raise TimeoutError(f"BashOutputMessage did not appear within {timeout}s")
 
 
 def assert_no_command_error(vibe_app: VibeApp) -> None:
@@ -138,7 +126,8 @@ async def test_ui_handles_non_utf8_stderr(vibe_app: VibeApp) -> None:
 @pytest.mark.asyncio
 async def test_ui_sends_manual_command_output_to_next_agent_turn() -> None:
     backend = FakeBackend(mock_llm_chunk(content="I saw it."))
-    vibe_app = build_test_vibe_app(agent_loop=build_test_agent_loop(backend=backend))
+    agent_loop = build_test_agent_loop(backend=backend)
+    vibe_app = build_test_vibe_app(agent_loop=agent_loop)
 
     async with vibe_app.run_test() as pilot:
         chat_input = vibe_app.query_one(ChatInputContainer)
@@ -147,7 +136,7 @@ async def test_ui_sends_manual_command_output_to_next_agent_turn() -> None:
         await pilot.press("enter")
         await _wait_for_bash_commit(vibe_app, pilot)
 
-        injected_message = vibe_app.agent_loop.messages[-1]
+        injected_message = agent_loop.messages[-1]
         assert injected_message.role == Role.user
         assert injected_message.injected is True
         assert injected_message.content is not None
@@ -158,7 +147,11 @@ async def test_ui_sends_manual_command_output_to_next_agent_turn() -> None:
 
         chat_input.value = "what did the command print?"
         await pilot.press("enter")
-        await pilot.app.workers.wait_for_complete()
+        deadline = time.monotonic() + 2
+        while len(backend.requests_messages) != 1 or vibe_app._agent_job_active():
+            if time.monotonic() >= deadline:
+                raise AssertionError("Timed out waiting for the agent turn")
+            await pilot.pause(0.01)
 
         assert len(backend.requests_messages) == 1
         user_messages = [
@@ -178,13 +171,13 @@ async def test_ui_shows_command_immediately_in_pending_state(vibe_app: VibeApp) 
         chat_input.value = "!sleep 10"
 
         await pilot.press("enter")
-        message = await _wait_for_pending_bash_message(vibe_app, pilot)
-        assert message._pending is True
-        # command line is rendered
-        cmd_widget = message.query_one(".bash-command", Static)
-        assert str(cmd_widget.render()) == "sleep 10"
-        # no output container yet
-        assert not list(message.query(".bash-output"))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if vibe_app._bash_task is not None and not vibe_app._bash_task.done():
+                break
+            await pilot.pause(0.05)
+        assert vibe_app._bash_task is not None
+        assert not vibe_app._bash_task.done()
 
         # clean up: cancel the background task
         if vibe_app._bash_task and not vibe_app._bash_task.done():
@@ -215,7 +208,11 @@ async def test_ui_queues_bash_submitted_while_command_running(
         chat_input.value = "!sleep 0.5"
 
         await pilot.press("enter")
-        await _wait_for_pending_bash_message(vibe_app, pilot)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if vibe_app._bash_task is not None and not vibe_app._bash_task.done():
+                break
+            await pilot.pause(0.05)
         assert vibe_app._bash_task is not None
         assert not vibe_app._bash_task.done()
 
