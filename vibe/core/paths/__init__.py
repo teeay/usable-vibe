@@ -23,6 +23,7 @@ from vibe.core.paths._vibe_home import (
     TRUSTED_FOLDERS_FILE,
     UVIBE_HOME,
     VIBE_HOME,
+    WHOAMI_CACHE_FILE,
     WORKTREES_DIR,
     GlobalPath,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "TRUSTED_FOLDERS_FILE",
     "UVIBE_HOME",
     "VIBE_HOME",
+    "WHOAMI_CACHE_FILE",
     "WORKTREES_DIR",
     "GlobalPath",
     "LocalConfigDirs",

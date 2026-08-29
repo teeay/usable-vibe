@@ -65,6 +65,9 @@ class SessionLoggingConfig(BaseSettings):
     save_dir: str = ""
     session_prefix: str = "session"
     enabled: bool = True
+    # Background LLM-generated session titles (shown in --resume and the
+    # terminal tab). Off falls back to the first-message preview.
+    generate_titles: bool = True
 
     @field_validator("save_dir", mode="before")
     @classmethod
@@ -424,6 +427,7 @@ class ModelConfig(BaseModel):
     name: str
     provider: str
     alias: str
+    display_name: str | None = None
     temperature: float = 0.2
     input_price: float = 0.0  # Price per million input tokens
     output_price: float = 0.0  # Price per million output tokens

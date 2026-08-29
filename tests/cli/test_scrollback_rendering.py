@@ -308,7 +308,7 @@ async def test_question_app_cancel_commits_cancellation() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_result_body_reaches_scrollback() -> None:
-    from vibe.core.tools.builtins.bash import Bash, BashResult
+    from vibe.core.tools.builtins.bash import Bash, CapturedShellResult
 
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
@@ -317,8 +317,8 @@ async def test_bash_result_body_reaches_scrollback() -> None:
             ToolResultEvent(
                 tool_name="bash",
                 tool_class=Bash,
-                result=BashResult(
-                    command="ls", stdout="alpha.txt\n", stderr="", returncode=0
+                result=CapturedShellResult(
+                    command="ls", stdout="alpha.txt\n", stderr="", exit_code=0
                 ),
                 tool_call_id="b1",
             )

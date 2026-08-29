@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 import copy
 from typing import Any
 
@@ -12,8 +13,13 @@ from vibe.core.config.event_bus import EventBus
 from vibe.core.config.layer import ConfigLayer
 from vibe.core.config.layers.default import DefaultConfigLayer
 from vibe.core.config.layers.overrides import OverridesLayer
+from vibe.core.config.layers.project import ProjectConfigLayer
 from vibe.core.config.layers.user import UserConfigLayer
-from vibe.core.config.orchestrator import ConfigOrchestrator, _changed_keys_between
+from vibe.core.config.orchestrator import (
+    ConfigOrchestrator,
+    _changed_keys_between,
+    _durable_model_aliases,
+)
 from vibe.core.config.patch import PatchOp, ensure_parent_paths
 from vibe.core.config.types import ConfigChangeEvent, ConflictStrategy
 from vibe.core.utils.concurrency import run_sync
@@ -92,6 +98,15 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
     async def load_persistence_layer(self) -> RawConfig:
         return await UserConfigLayer().load()
 
+    async def durable_model_aliases(self) -> set[str]:
+        # Mirror the durable stack a real restart rebuilds: schema defaults plus
+        # the on-disk user and project layers the fake persists writes to.
+        return await _durable_model_aliases((
+            DefaultConfigLayer(schema=type(self._config)),
+            UserConfigLayer(),
+            ProjectConfigLayer(),
+        ))
+
     def persisted_active_model(self) -> str:
         # The verbatim fake has no layer stack, so the held config's value is
         # exactly what the test declared as the user's pin.
@@ -104,17 +119,43 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
         reason: str = "No reason",
         *,
         target_layer: str | None = None,
+        preflight: Callable[[C], Awaitable[None]] | None = None,
     ) -> list[BaseException]:
+        data = self._base_config.model_dump()
+        _set_pointer_in_place(data, path, value)
+        candidate = self.copy()
+        candidate._base_config = type(self._base_config).model_validate(data)
+        candidate.rebuild()
+        if preflight is not None:
+            await preflight(candidate.config)
         if target_layer != OverridesLayer.NAME:
             orchestrator = await self._persistence_orchestrator()
             await orchestrator.set_field(path, value, reason)
         before = self._config.model_dump(mode="json")
-        data = self._base_config.model_dump()
-        _set_pointer_in_place(data, path, value)
         self._base_config = type(self._base_config).model_validate(data)
         self.rebuild()
         self._publish(before, reason)
         return []
+
+    async def mutate_field(
+        self,
+        path: str,
+        mutate: Callable[[Any], Any],
+        reason: str = "No reason",
+        *,
+        default: Any = None,
+        target_layer: str | None = None,
+        preflight: Callable[[C], Awaitable[None]] | None = None,
+    ) -> list[BaseException]:
+        raw = (await self.load_persistence_layer()).model_dump()
+        current = JsonPointer(path).resolve(raw, default=copy.deepcopy(default))
+        return await self.set_field(
+            path,
+            mutate(copy.deepcopy(current)),
+            reason,
+            target_layer=target_layer,
+            preflight=preflight,
+        )
 
     async def apply_patch(
         self,
@@ -122,7 +163,17 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
         reason: str = "No reason",
         *,
         on_conflict: ConflictStrategy = ConflictStrategy.CANCEL,
+        preflight: Callable[[C], Awaitable[None]] | None = None,
     ) -> list[BaseException]:
+        data = ensure_parent_paths(self._base_config.model_dump(), operations)
+        data = json_apply_patch(
+            data, [op.to_json_patch() for op in operations], in_place=False
+        )
+        candidate = self.copy()
+        candidate._base_config = type(self._base_config).model_validate(data)
+        candidate.rebuild()
+        if preflight is not None:
+            await preflight(candidate.config)
         before = self._config.model_dump(mode="json")
         persistent_operations = [
             operation
@@ -136,10 +187,6 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
             )
             if failures:
                 return failures
-        data = ensure_parent_paths(self._base_config.model_dump(), operations)
-        data = json_apply_patch(
-            data, [op.to_json_patch() for op in operations], in_place=False
-        )
         self._base_config = type(self._base_config).model_validate(data)
         self.rebuild()
         self._publish(before, reason)

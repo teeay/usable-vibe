@@ -22,6 +22,7 @@ from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from vibe.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
     ToolPath,
+    display_file_path,
     resolve_file_tool_permission,
     resolve_tool_path,
 )
@@ -111,8 +112,7 @@ class ReadFile(
             denylist=self.config.denylist,
             config_permission=self.config.permission,
             sensitive_patterns=self.config.sensitive_patterns,
-            cwd=self.cwd,
-            project_roots=self.harness_files.project_roots,
+            workspace=self.workspace,
             scratchpad_dir=self.scratchpad_dir,
         )
 
@@ -229,7 +229,7 @@ class ReadFile(
     @classmethod
     def format_call_display(cls, args: ReadFileArgs) -> ToolCallDisplay:
         suffix = "(scratchpad)" if is_scratchpad_display_path(args.file_path) else ""
-        message = args.file_path
+        message = display_file_path(args.file_path)
         extras: list[str] = []
         if args.offset:
             extras.append(f"from line {args.offset}")
@@ -253,10 +253,9 @@ class ReadFile(
                 success=False, message=event.error or event.skip_reason or "No result"
             )
 
-        path_obj = Path(event.result.file_path)
         n = event.result.num_lines
         word = "line" if n == 1 else "lines"
-        message = f"{n} {word} from {path_obj.name}"
+        message = f"{n} {word} from {display_file_path(event.result.file_path)}"
         suffix_parts: list[str] = []
         if is_scratchpad_display_path(event.result.file_path):
             suffix_parts.append("(scratchpad)")

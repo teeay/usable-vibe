@@ -22,6 +22,7 @@ from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from vibe.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
     ToolPath,
+    display_file_path,
     resolve_file_tool_permission,
     resolve_tool_path,
 )
@@ -92,8 +93,7 @@ class Edit(
             denylist=self.config.denylist,
             config_permission=self.config.permission,
             sensitive_patterns=self.config.sensitive_patterns,
-            cwd=self.cwd,
-            project_roots=self.harness_files.project_roots,
+            workspace=self.workspace,
             scratchpad_dir=self.scratchpad_dir,
         )
 
@@ -103,14 +103,15 @@ class Edit(
     @classmethod
     def format_call_display(cls, args: EditArgs) -> ToolCallDisplay:
         suffix = "(scratchpad)" if is_scratchpad_display_path(args.file_path) else ""
+        shown = display_file_path(args.file_path)
         return ToolCallDisplay(
-            summary=f"Editing {Path(args.file_path).name}",
+            summary=f"Editing {shown}",
             content=f"old_string: {args.old_string!r}\nnew_string: {args.new_string!r}",
             suffix=suffix,
             verb="Editing",
-            message=Path(args.file_path).name,
+            message=shown,
             settled_verb="Edited",
-            settled_message=Path(args.file_path).name,
+            settled_message=shown,
         )
 
     @classmethod
@@ -122,7 +123,7 @@ class Edit(
             return ToolResultDisplay(
                 success=True,
                 verb="Edited",
-                message=Path(event.result.file).name,
+                message=display_file_path(event.result.file),
                 suffix=suffix,
             )
         return ToolResultDisplay(

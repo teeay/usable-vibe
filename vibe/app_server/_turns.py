@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import cast
 from uuid import uuid4
@@ -34,6 +35,8 @@ from vibe.app_server.models import (
     PublicHistoryEntry,
     PublicMessageSource,
     PublicRetryCategory,
+    PublicRetryState,
+    PublicSessionState,
     PublicTurn,
     PublicTurnStatus,
     PublicTurnStopReason,
@@ -49,6 +52,7 @@ from vibe.app_server.protocol import (
     JsonPatchOperation,
     SessionCompactedParams,
     SessionContextClearedParams,
+    SessionSnapshotParams,
     SessionUpdatedParams,
     StatsUpdatedParams,
     TurnCompletedParams,
@@ -84,6 +88,13 @@ from vibe.user_content import UserResource
 type Notify = Callable[[str, ProtocolModel], Awaitable[None]]
 type DeliverCallback = Callable[[PublicCallbackEntry], Awaitable[None]]
 type CoreEventSink = Callable[[BaseEvent], Awaitable[None]]
+type SnapshotState = Callable[[], PublicSessionState]
+
+# Retry hooks may cross a worker thread. Context keeps each notice tied to the
+# turn whose model request produced it, even if delivery happens later.
+_retry_turn_id: ContextVar[str | None] = ContextVar(
+    "app_server_retry_turn_id", default=None
+)
 
 
 class TurnConflictError(RuntimeError):
@@ -101,6 +112,10 @@ class CallbackNotFoundError(RuntimeError):
 
 
 class CallbackConflictError(RuntimeError):
+    pass
+
+
+class CallbackClosedError(RuntimeError):
     pass
 
 
@@ -139,6 +154,8 @@ class TurnController:
         deliver_callback: DeliverCallback,
         execution: SessionExecution,
         subagent_runner: SubagentRunnerPort,
+        *,
+        snapshot_state: SnapshotState,
         tool_io: ToolIOPort | None = None,
         event_sink: CoreEventSink | None = None,
         session_coordinator: SessionCoordinator | None = None,
@@ -148,11 +165,13 @@ class TurnController:
         self._deliver_callback = deliver_callback
         self._execution = execution
         self._subagent_runner = subagent_runner
+        self._snapshot_state = snapshot_state
         self._tool_io = tool_io
         self._event_sink = event_sink
         self._session_coordinator = session_coordinator
         self._session_execution: ActiveSessionExecution | None = None
         self._active_turn: PublicTurn | None = None
+        self._retrying: PublicRetryState | None = None
         self._completed_turns: list[PublicTurn] = []
         self._active_task: asyncio.Task[None] | None = None
         self._projector: EventProjector | None = None
@@ -164,6 +183,10 @@ class TurnController:
     @property
     def active_turn(self) -> PublicTurn | None:
         return self._active_turn
+
+    @property
+    def retrying(self) -> PublicRetryState | None:
+        return self._retrying
 
     @property
     def completed_turns(self) -> list[PublicTurn]:
@@ -201,6 +224,7 @@ class TurnController:
     ) -> tuple[TurnStartResponse, Callable[[], None]]:
         if self._active_task is not None and not self._active_task.done():
             raise TurnConflictError("A turn is already running")
+        self._retrying = None
         decoded = decode_input(
             params, session_dir=self._agent_loop.session_logger.session_dir
         )
@@ -221,17 +245,21 @@ class TurnController:
         )
 
         def start_turn() -> None:
-            self._active_task = asyncio.create_task(
-                self._run_turn(
-                    turn,
-                    decoded.prompt,
-                    session_execution=session_execution,
-                    params=params,
-                    images=decoded.images,
-                    input_text=(decoded.input_text if decoded.resources else None),
-                    resources=decoded.resources,
+            retry_turn_token = _retry_turn_id.set(turn.id)
+            try:
+                self._active_task = asyncio.create_task(
+                    self._run_turn(
+                        turn,
+                        decoded.prompt,
+                        session_execution=session_execution,
+                        params=params,
+                        images=decoded.images,
+                        input_text=(decoded.input_text if decoded.resources else None),
+                        resources=decoded.resources,
+                    )
                 )
-            )
+            finally:
+                _retry_turn_id.reset(retry_turn_token)
 
         return TurnStartResponse(turn=turn), start_turn
 
@@ -297,9 +325,14 @@ class TurnController:
 
     async def complete_effect(self, entry_id: str, state: EffectState) -> None:
         projector = self._require_harness_effect(entry_id)
-        await self._emit_projected(projector.complete_effect(entry_id, state))
+        events = projector.complete_effect(entry_id, state)
+        # Retired before the emit, which can fail. The effect is already finished
+        # in the projector's own history, so a registration left behind would
+        # make `history` report it as still running for the rest of the session
+        # - a worse account of a finished effect than a dropped notification.
         self._history.extend(projector.history)
         self._harness_effects.pop(entry_id, None)
+        await self._emit_projected(events)
 
     async def steer(self, params: TurnSteerParams) -> TurnSteerResponse:
         self._require_active_turn(params.expected_turn_id)
@@ -364,6 +397,8 @@ class TurnController:
         if record is None:
             raise CallbackNotFoundError(f"Callback not found: {callback_id}")
         async with record.resolution_lock:
+            if record.core_resolved and record.resolution is None:
+                raise CallbackClosedError(f"Callback is closed: {callback_id}")
             if record.resolution is not None:
                 if record.resolution.model_dump(mode="json") == output.model_dump(
                     mode="json"
@@ -393,6 +428,8 @@ class TurnController:
         if record is None:
             raise CallbackNotFoundError(f"Callback not found: {callback_id}")
         async with record.resolution_lock:
+            if record.core_resolved and record.resolution is None:
+                raise CallbackClosedError(f"Callback is closed: {callback_id}")
             if record.resolution is not None:
                 if record.resolution.model_dump(mode="json") == error.model_dump(
                     mode="json"
@@ -407,6 +444,10 @@ class TurnController:
         errors: list[BaseException] = []
         if self._active_task is not None:
             errors.extend(await cancel_tasks([self._active_task], label="active turn"))
+        try:
+            await self._clear_retrying()
+        except BaseException as exc:
+            errors.append(exc)
         if self._session_execution is not None:
             self._execution.finish(self._session_execution)
             self._session_execution = None
@@ -470,6 +511,7 @@ class TurnController:
                 )
             ) as events:
                 async for event in events:
+                    await self._clear_retrying()
                     if self._event_sink is not None:
                         await self._event_sink(event)
                     if isinstance(event, ApprovalRequestEvent | UserInputRequestEvent):
@@ -526,6 +568,7 @@ class TurnController:
         stop_reason: PublicTurnStopReason | None,
         session_execution: ActiveSessionExecution,
     ) -> None:
+        await self._clear_retrying()
         projector = self._projector
         if projector is not None:
             for update in projector.finalize(
@@ -744,12 +787,40 @@ class TurnController:
         await self._notify(update.method, update.params)
 
     async def _emit_retrying(self, reason: RetryReason) -> None:
+        turn = self._active_turn
+        if turn is None or _retry_turn_id.get() != turn.id:
+            return
+        retrying = PublicRetryState(
+            turn_id=turn.id,
+            category=_public_retry_category(reason.category),
+            detail=reason.detail,
+        )
+        self._retrying = retrying
+        await self._emit_retry_snapshot()
         await self._notify(
             "turn/retrying",
             TurnRetryingParams(
                 session_id=self._agent_loop.session_id,
-                category=_public_retry_category(reason.category),
-                detail=reason.detail,
+                category=retrying.category,
+                detail=retrying.detail,
+            ),
+        )
+
+    async def _clear_retrying(self) -> None:
+        if self._retrying is None:
+            return
+        self._retrying = None
+        await self._emit_retry_snapshot()
+
+    async def _emit_retry_snapshot(self) -> None:
+        state = self._snapshot_state()
+        await self._notify(
+            "session/snapshot",
+            SessionSnapshotParams(
+                event_id=0,
+                session_id=state.session.id,
+                state=state,
+                emitted_at=now_ms(),
             ),
         )
 

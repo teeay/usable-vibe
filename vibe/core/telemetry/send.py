@@ -15,6 +15,7 @@ from vibe.core.llm.format import ResolvedToolCall
 from vibe.core.telemetry.build_metadata import build_base_metadata
 from vibe.core.telemetry.types import (
     AttachmentKind,
+    ExperimentAssignment,
     LaunchContext,
     ProjectPickerTelemetryPayload,
     RemoteProjectOutcome,
@@ -34,6 +35,7 @@ from vibe.utils.http import (
 
 if TYPE_CHECKING:
     from vibe.core.agent_loop import ToolDecision
+    from vibe.core.experiments.models import ExperimentAttributes
 
 _DEFAULT_TELEMETRY_BASE_URL = "https://api.mistral.ai"
 _DATALAKE_EVENTS_PATH = "/v1/datalake/events"
@@ -77,8 +79,11 @@ class TelemetryClient:
         session_id_getter: Callable[[], str | None] | None = None,
         parent_session_id_getter: Callable[[], str | None] | None = None,
         launch_context: LaunchContext | None = None,
-        experiments_getter: Callable[[], dict[str, str]] | None = None,
+        experiments_getter: Callable[[], list[ExperimentAssignment]] | None = None,
         user_plan_getter: Callable[[], str | None] | None = None,
+        experiment_attributes_getter: (
+            Callable[[], ExperimentAttributes | None] | None
+        ) = None,
     ) -> None:
         self._config_getter = config_getter
         self._session_id_getter = session_id_getter
@@ -86,6 +91,7 @@ class TelemetryClient:
         self._launch_context = launch_context
         self._experiments_getter = experiments_getter
         self._user_plan_getter = user_plan_getter
+        self._experiment_attributes_getter = experiment_attributes_getter
         self._client: VibeAsyncHTTPClient | None = None
         self._pending_tasks: set[asyncio.Task[Any]] = set()
         self.last_correlation_id: str | None = None
@@ -139,15 +145,23 @@ class TelemetryClient:
         return self._user_plan_getter()
 
     def build_client_event_metadata(self) -> dict[str, Any]:
-        experiments = (
+        experiment_assignments = (
             self._experiments_getter() if self._experiments_getter is not None else None
+        )
+        attributes = (
+            self._experiment_attributes_getter()
+            if self._experiment_attributes_getter is not None
+            else None
         )
         return build_base_metadata(
             launch_context=self._launch_context,
             session_id=self.session_id,
             parent_session_id=self.parent_session_id,
-            experiments=experiments,
+            experiment_assignments=experiment_assignments,
             user_plan=self.user_plan,
+            experiment_attributes=(
+                attributes.model_dump(exclude_none=True) if attributes else None
+            ),
         )
 
     def send_telemetry_event(

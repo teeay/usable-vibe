@@ -11,6 +11,7 @@ from vibe.core.experiments.models import (
     FeatureDefinition,
     TrackData,
 )
+from vibe.core.telemetry.types import ExperimentAssignment
 from vibe.observability.logging import logger
 
 
@@ -30,15 +31,50 @@ class ExperimentManager:
     def __init__(self, client: RemoteEvalClient | None = None) -> None:
         self._client = client if client is not None else RemoteEvalClient()
         self._response: EvalResponse | None = None
+        self._attributes: ExperimentAttributes | None = None
 
     async def initialize(self, attributes: ExperimentAttributes) -> None:
+        # Retain the exact attribute snapshot sent to GrowthBook for bucketing so
+        # telemetry can emit it on the exposure event. Keeping the two in sync is
+        # what lets the datalake exposures be segmented by the same dimensions
+        # GrowthBook assigns on (see ``attributes``).
+        self._attributes = attributes
         response = await self._client.evaluate(attributes)
         if response is None:
             return
         self._response = self._filter_to_known_experiments(response)
         self._log_resolved_variants("resolved")
 
-    def hydrate(self, response: EvalResponse, *, source: str = "session") -> None:
+    def attributes(self) -> ExperimentAttributes | None:
+        """Return the attribute snapshot used for the last GrowthBook eval.
+
+        This is the exact payload sent to the proxy for variant bucketing. It is
+        emitted on the exposure telemetry event so warehouse-side analysis can
+        dimension on the same attributes GrowthBook assigned on. ``None`` until
+        :meth:`initialize` has run (e.g. resumed sessions hydrated from state).
+        """
+        return self._attributes
+
+    def set_attributes(self, attributes: ExperimentAttributes) -> None:
+        """Set the attribute snapshot without a remote eval.
+
+        Used when there is nothing to evaluate (no Mistral provider, so no
+        A/B bucketing) but telemetry still needs ``experiment_attributes`` to
+        carry the sentinel plan fields (planType/planName = NO_PLAN_DATA).
+        """
+        self._attributes = attributes
+
+    def hydrate(
+        self,
+        response: EvalResponse,
+        *,
+        attributes: ExperimentAttributes | None = None,
+        source: str = "session",
+    ) -> None:
+        # Restore the bucketing snapshot too, not just the eval response. The
+        # snapshot is what telemetry emits as ``experiment_attributes``; without
+        # it every event on a resumed session would miss planName/planType.
+        self._attributes = attributes
         self._response = self._filter_to_known_experiments(response)
         self._log_resolved_variants(f"restored from {source}")
 
@@ -85,7 +121,9 @@ class ExperimentManager:
 
     def config_variants(self) -> dict[str, str]:
         """Return experiment values allowed to override config layers."""
-        result = self.assignments()
+        result: dict[str, str] = {
+            a.experiment_id: a.variation_name for a in self.assignments()
+        }
         if self._response is None:
             return result
 
@@ -99,20 +137,36 @@ class ExperimentManager:
                 result[name.value] = variant
         return result
 
-    def assignments(self) -> dict[str, str]:
-        """Return confirmed experiment exposures for telemetry only."""
-        result: dict[str, str] = {}
+    def assignments(self) -> list[ExperimentAssignment]:
+        """Return confirmed experiment exposures for telemetry only.
+
+        At most one assignment per experiment_id (last confirmed track wins).
+        The dbt exposures model treats one row per (session_id, experiment_id),
+        so a duplicated experiment_id would read as a GrowthBook
+        multiple-exposure conflict.
+        """
+        by_experiment: dict[str, ExperimentAssignment] = {}
         if self._response is None:
-            return {}
+            return []
         for feature_key, feature in self._response.features.items():
             for rule in feature.rules:
                 for track in rule.tracks:
                     if not track.result.inExperiment:
                         continue
-                    label = self._variant_label(feature, track)
-                    if label:
-                        result[feature_key] = label
-        return result
+                    variation_name = self._variant_label(feature, track)
+                    if not variation_name:
+                        continue
+                    by_experiment[feature_key] = ExperimentAssignment(
+                        experiment_id=feature_key,
+                        experiment_name=track.experiment.key,
+                        variation_name=variation_name,
+                        variation_id=track.result.variationId,
+                        in_experiment=track.result.inExperiment,
+                        hash_attribute=track.result.hashAttribute,
+                        hash_value=track.result.hashValue,
+                        feature_id=track.result.featureId,
+                    )
+        return list(by_experiment.values())
 
     @staticmethod
     def _forced_variant_or_none(feature: FeatureDefinition) -> str | None:

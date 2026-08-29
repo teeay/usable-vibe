@@ -47,6 +47,8 @@ from vibe.app_server._effect_models import (
     WebSearchEffectInput as WebSearchEffectInput,
     WebSearchEffectOutput as WebSearchEffectOutput,
     WebSearchEffectSource as WebSearchEffectSource,
+    WorktreeEffectDetail as WorktreeEffectDetail,
+    WorktreeEffectInput as WorktreeEffectInput,
     effect_input_json as effect_input_json,
 )
 from vibe.app_server._model import ProtocolModel
@@ -269,6 +271,12 @@ class PublicRetryCategory(StrEnum):
     UNKNOWN = auto()
 
 
+class PublicRetryState(ProtocolModel):
+    turn_id: str
+    category: PublicRetryCategory
+    detail: str
+
+
 class TurnErrorCode(StrEnum):
     RATE_LIMIT = auto()
     CONTEXT_TOO_LONG = auto()
@@ -487,11 +495,44 @@ class SkillSummary(ProtocolModel):
 
 class ToolSummary(ProtocolModel):
     name: str
+    is_custom: bool = False
+
+
+# The closed set the App Server contract declares. Vibe never emits "unknown";
+# it is here so a component kind Vibe does not model still round-trips.
+type PluginComponentKind = Literal[
+    "skill",
+    "knowledge",
+    "library",
+    "mcp_server",
+    "connector",
+    "hook",
+    "agent",
+    "subagent",
+    "tool",
+    "unknown",
+]
+
+
+class PluginComponent(ProtocolModel):
+    kind: PluginComponentKind
+    name: str
+    # Absolute, and joined against the plugin root at read time. The snapshot
+    # stores a portable reference; absolute paths never enter a digested
+    # artifact. A component with no file on disk has no source path.
+    source_path: str | None = None
+    config: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class PluginInfo(ProtocolModel):
+    workdir: str | None = None
+    components: list[PluginComponent] = Field(default_factory=list)
+    raw: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class ConnectorCounts(ProtocolModel):
     connected: int = 0
-    total: int = 0
+    total: int | None = None
 
 
 class MCPSourceKind(StrEnum):
@@ -520,11 +561,13 @@ class MCPSourceSummary(ProtocolModel):
     transport: str
     status: MCPSourceStatus
     tools: list[MCPToolSummary] = Field(default_factory=list)
+    error: str | None = None
 
 
 class MCPState(ProtocolModel):
     sources: list[MCPSourceSummary] = Field(default_factory=list)
     discovery_errors: dict[str, str] = Field(default_factory=dict)
+    connector_error: str | None = None
 
     @property
     def needs_auth(self) -> list[str]:
@@ -849,16 +892,11 @@ class FailedSessionStatus(ProtocolModel):
     message: str
 
 
-class ArchivedSessionStatus(ProtocolModel):
-    type: Literal["archived"] = "archived"
-
-
 PublicSessionStatus = Annotated[
     IdleSessionStatus
     | RunningSessionStatus
     | BlockedSessionStatus
-    | FailedSessionStatus
-    | ArchivedSessionStatus,
+    | FailedSessionStatus,
     Field(discriminator="type"),
 ]
 
@@ -897,6 +935,7 @@ class PublicSessionState(ProtocolModel):
     history_before_cursor: str | None = None
     turns: list[PublicTurn] | None = None
     active_callbacks: list[PublicCallbackEntry] = Field(default_factory=list)
+    retrying: PublicRetryState | None = None
 
     @property
     def latest_turn(self) -> PublicTurn | None:

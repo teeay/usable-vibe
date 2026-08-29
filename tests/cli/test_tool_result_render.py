@@ -10,7 +10,7 @@ from vibe.cli.textual_ui.tool_result_render import (
     render_result_body,
 )
 from vibe.core.tools.builtins.ask_user_question import AskUserQuestionResult
-from vibe.core.tools.builtins.bash import BashResult
+from vibe.core.tools.builtins.bash import CapturedShellResult
 from vibe.core.tools.builtins.edit import EditResult
 from vibe.core.tools.builtins.experimental_bash import (
     BashLogFileResult,
@@ -41,30 +41,17 @@ def _edit_result(old: str, new: str, *, start_line: int | None = None) -> EditRe
 
 
 def test_bash_body_includes_stdout_and_stderr() -> None:
-    result = BashResult(
-        command="ls", stdout="line-out\n", stderr="line-err\n", returncode=1
+    result = CapturedShellResult(
+        command="ls", stdout="line-out\n", stderr="line-err\n", exit_code=1
     )
     text = _plain(render_result_body("bash", result, dark=True, ansi=False))
     assert "line-out" in text
     assert "line-err" in text
 
 
-def test_experimental_bash_body_uses_compat_stdout() -> None:
+def test_experimental_bash_body_uses_pty_output() -> None:
     result = ExperimentalBashResult(
-        command="printf",
-        stdout="line-out\n",
-        stderr="",
-        output="ignored fallback\n",
-        returncode=0,
-    )
-    text = _plain(render_result_body("bash", result, dark=True, ansi=False))
-    assert "line-out" in text
-    assert "ignored fallback" not in text
-
-
-def test_experimental_bash_body_falls_back_to_output() -> None:
-    result = ExperimentalBashResult(
-        command="printf", stdout="", stderr="", output="pty output\n", returncode=0
+        command="printf", output="pty output\n", exit_code=0
     )
     text = _plain(render_result_body("bash", result, dark=True, ansi=False))
     assert "pty output" in text
@@ -151,11 +138,11 @@ def test_shorten_text_middle_keeps_full_text_when_only_one_line_omitted() -> Non
 
 
 def test_bash_body_shortens_long_output_by_default() -> None:
-    result = BashResult(
+    result = CapturedShellResult(
         command="ls",
         stdout="\n".join(f"file-{i}" for i in range(1, 11)),
         stderr="",
-        returncode=0,
+        exit_code=0,
     )
     text = _plain(render_result_body("bash", result, dark=True, ansi=False))
     assert "file-1" in text
@@ -168,11 +155,11 @@ def test_bash_body_shortens_long_output_by_default() -> None:
 
 
 def test_bash_body_can_disable_shortening() -> None:
-    result = BashResult(
+    result = CapturedShellResult(
         command="ls",
         stdout="\n".join(f"file-{i}" for i in range(1, 11)),
         stderr="",
-        returncode=0,
+        exit_code=0,
     )
     text = _plain(
         render_result_body("bash", result, dark=True, ansi=False, shorten=False)
@@ -183,7 +170,7 @@ def test_bash_body_can_disable_shortening() -> None:
 
 
 def test_bash_empty_output_renders_no_content() -> None:
-    result = BashResult(command="true", stdout="", stderr="", returncode=0)
+    result = CapturedShellResult(command="true", stdout="", stderr="", exit_code=0)
     text = _plain(render_result_body("bash", result, dark=True, ansi=False))
     assert "(no content)" in text
 
@@ -429,12 +416,12 @@ def test_todo_empty_renders_no_todos() -> None:
 
 
 def test_unknown_tool_has_no_body() -> None:
-    result = BashResult(command="ls", stdout="x", stderr="", returncode=0)
+    result = CapturedShellResult(command="ls", stdout="x", stderr="", exit_code=0)
     assert render_result_body("web_fetch", result, dark=True, ansi=False) is None
 
 
 def test_mismatched_result_type_has_no_body() -> None:
-    result = BashResult(command="ls", stdout="x", stderr="", returncode=0)
+    result = CapturedShellResult(command="ls", stdout="x", stderr="", exit_code=0)
     assert render_result_body("edit", result, dark=True, ansi=False) is None
 
 

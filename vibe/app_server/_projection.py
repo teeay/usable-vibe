@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 import hashlib
 import json
 from pathlib import Path
@@ -14,6 +14,7 @@ from vibe.app_server._tool_projection import (
     project_effect_output_value,
 )
 from vibe.app_server._utils import now_ms
+from vibe.app_server._worktree_effects import WorktreeEffect
 from vibe.app_server.config import (
     AudioProviderView,
     ConfigView,
@@ -80,6 +81,7 @@ from vibe.core.types import (
     LLMMessage,
     Role,
     SessionMetadata,
+    WorktreeContext,
 )
 from vibe.core.utils import CANCELLATION_TAG, TOOL_ERROR_TAG, TaggedText
 from vibe.user_content import UserResource
@@ -115,6 +117,7 @@ def project_config_view(
         awaiting_experiment_model=awaiting_experiment_model,
         default_model_alias=default_model_alias,
         theme=config.theme,
+        log_level=config.log_level,
         disable_welcome_banner_animation=config.disable_welcome_banner_animation,
         show_greeting=config.show_greeting,
         autocopy_to_clipboard=config.autocopy_to_clipboard,
@@ -168,6 +171,7 @@ def _project_model_config(model: ModelConfig) -> ModelConfigView:
         alias=model.alias,
         thinking=model.thinking,
         supports_images=model.supports_images,
+        display_name=model.display_name or model.alias,
     )
 
 
@@ -230,13 +234,15 @@ def project_stats(agent_loop: AgentLoop) -> AgentStatsSnapshot:
     )
 
 
+def project_agent_summaries(
+    active: AgentProfile, available: Iterable[AgentProfile]
+) -> tuple[AgentSummary, list[AgentSummary]]:
+    return _project_agent(active), [_project_agent(profile) for profile in available]
+
+
 def project_agents(agent_loop: AgentLoop) -> tuple[AgentSummary, list[AgentSummary]]:
-    return (
-        _project_agent(agent_loop.agent_profile),
-        [
-            _project_agent(profile)
-            for profile in agent_loop.agent_manager.available_agents.values()
-        ],
+    return project_agent_summaries(
+        agent_loop.agent_profile, agent_loop.agent_manager.available_agents.values()
     )
 
 
@@ -254,7 +260,11 @@ def project_skills(agent_loop: AgentLoop) -> list[SkillSummary]:
 
 
 def project_tools(agent_loop: AgentLoop) -> list[ToolSummary]:
-    return [ToolSummary(name=name) for name in agent_loop.tool_manager.available_tools]
+    custom_tool_names = agent_loop.tool_manager.custom_tool_names
+    return [
+        ToolSummary(name=name, is_custom=name in custom_tool_names)
+        for name in agent_loop.tool_manager.available_tools
+    ]
 
 
 def project_connectors(agent_loop: AgentLoop) -> ConnectorCounts:
@@ -269,12 +279,17 @@ def project_mcp(
 ) -> MCPState:
     tools = _project_mcp_tools(agent_loop)
     discovery_errors_set = set(discovery_errors) if discovery_errors else set()
+    connector_registry = agent_loop.connector_registry
+    connector_error = (
+        connector_registry.bootstrap_error() if connector_registry is not None else None
+    )
     return MCPState(
         sources=[
             *_project_mcp_servers(agent_loop, tools, discovery_errors_set),
             *_project_mcp_connectors(agent_loop, tools),
         ],
         discovery_errors=dict(discovery_errors or {}),
+        connector_error=connector_error,
     )
 
 
@@ -373,16 +388,32 @@ def _project_mcp_connectors(
                     status = MCPSourceStatus.NEEDS_SETUP
                 case _:
                     status = MCPSourceStatus.UNAVAILABLE
+        error = (
+            connector_registry.connector_error_for(name)
+            if connector_registry is not None
+            else None
+        )
+        source_tools = {
+            tool.name: tool for tool in tools.get((MCPSourceKind.CONNECTOR, name), [])
+        }
+        if connector_registry is not None:
+            for descriptor in connector_registry.get_catalog_tools(name):
+                source_tools.setdefault(
+                    descriptor.name,
+                    MCPToolSummary(
+                        name=descriptor.name,
+                        description=descriptor.description or "",
+                        enabled=False,
+                    ),
+                )
         sources.append(
             MCPSourceSummary(
                 name=name,
                 kind=MCPSourceKind.CONNECTOR,
                 transport="connector",
                 status=status,
-                tools=sorted(
-                    tools.get((MCPSourceKind.CONNECTOR, name), []),
-                    key=lambda tool: tool.name,
-                ),
+                tools=sorted(source_tools.values(), key=lambda tool: tool.name),
+                error=error,
             )
         )
     return sources
@@ -469,6 +500,9 @@ def project_message_history(
         if metadata is not None
         else {}
     )
+    # First: the worktree is created before the session has a single message.
+    if metadata is not None and metadata.created_worktree is not None:
+        entries.append(_history_worktree(session_id, metadata.created_worktree))
     for index, message in enumerate(messages):
         _project_stored_message(
             session_id,
@@ -524,6 +558,16 @@ def _project_stored_message(
                 effect_indices,
                 child_sessions,
             )
+
+
+def _history_worktree(session_id: str, worktree: WorktreeContext) -> PublicEffectEntry:
+    restored = WorktreeEffect.restored(worktree)
+    return PublicEffectEntry(
+        **_history_fields(session_id, worktree.entry_id, worktree.created_at),
+        title="worktree",
+        detail=restored.detail,
+        state=restored.state,
+    )
 
 
 def _append_injected_history(

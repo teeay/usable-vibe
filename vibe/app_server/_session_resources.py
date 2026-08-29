@@ -59,6 +59,10 @@ from vibe.app_server.protocol import (
     SessionListResponse,
     SessionLogReadParams,
     SessionLogReadResponse,
+    SessionReadParams,
+    SessionReadResponse,
+    SessionRelocateParams,
+    SessionRelocateResponse,
     SessionResumeParams,
     SessionResumeResponse,
     SessionRewindParams,
@@ -187,6 +191,15 @@ class SessionResource:
             cursor = response.next_cursor
         return sessions
 
+    async def resolve_continue_session(self, cwd: str | None = None) -> str | None:
+        """The session `--continue` resumes, resolved server-side (pointer-first)."""
+        client = await self._connection.connect()
+        response = validate_wire(
+            SessionListResponse,
+            await client.request("session/list", SessionListParams(cwd=cwd)),
+        )
+        return response.continue_session_id
+
     @property
     def history_before_cursor(self) -> str | None:
         return self._state.projection.history_before_cursor
@@ -243,6 +256,23 @@ class SessionResource:
         self._state.projection = ClientProjection(response.state)
         self._state.reset_usage_baseline()
         self._connection.mark_session_attached()
+
+    async def get_session_history(
+        self, session_id: str, history_limit: int = 200
+    ) -> list[PublicHistoryEntry]:
+        client = await self._connection.connect()
+        response = validate_wire(
+            SessionReadResponse,
+            await client.request(
+                "session/read",
+                SessionReadParams(
+                    session_id=session_id,
+                    history=PageRequest(limit=history_limit),
+                    turns=None,
+                ),
+            ),
+        )
+        return response.state.history or []
 
     async def update_settings(
         self, *, max_turns: int | None = None, max_tokens: int | None = None
@@ -398,6 +428,18 @@ class SessionResource:
         self._state.projection.replace_state(response.state)
         self._state.session_log = response.session_log
         self._connection.mark_session_attached()
+        return response
+
+    async def relocate(self, cwd: str) -> SessionRelocateResponse:
+        client = await self._connection.connect()
+        response = validate_wire(
+            SessionRelocateResponse,
+            await client.request(
+                "session/relocate",
+                SessionRelocateParams(session_id=self._state.session_id, cwd=cwd),
+            ),
+        )
+        self._state.projection.replace_state(response.state)
         return response
 
 

@@ -14,7 +14,6 @@ from vibe.app_server._execution import (
     SessionExecutionConflict,
     SessionExecutionKind,
 )
-from vibe.app_server._host import project_session_list
 from vibe.app_server._model import ProtocolModel, validate_wire
 from vibe.app_server._projection import (
     history_user_message_index,
@@ -34,6 +33,7 @@ from vibe.app_server._shell import ShellConflictError
 from vibe.app_server._shell_requests import ShellRequestHandler
 from vibe.app_server._state import build_public_state, history_page
 from vibe.app_server._turns import (
+    CallbackClosedError,
     CallbackConflictError,
     CallbackNotFoundError,
     StaleTurnError,
@@ -69,6 +69,7 @@ from vibe.app_server.protocol import (
     EmptyResponse,
     ProtocolErrorCode,
     RuntimeMutationResponse,
+    RuntimeUpdatedParams,
     SessionCompactParams,
     SessionCompactResponse,
     SessionContinueParams,
@@ -79,7 +80,7 @@ from vibe.app_server.protocol import (
     SessionHistoryClearResponse,
     SessionHistoryListParams,
     SessionHistoryListResponse,
-    SessionListParams,
+    SessionKind,
     SessionLogReadParams,
     SessionLogReadResponse,
     SessionReadParams,
@@ -88,6 +89,8 @@ from vibe.app_server.protocol import (
     SessionReadyReadResponse,
     SessionReadyWaitParams,
     SessionReadyWaitResponse,
+    SessionRelocateParams,
+    SessionRelocateResponse,
     SessionResumeParams,
     SessionResumeResponse,
     SessionRewindParams,
@@ -131,15 +134,17 @@ from vibe.app_server.protocol import (
     WorkspacePromptPrepareResponse,
     WorkspaceTrustDecisionParams,
 )
-from vibe.core.agent_loop import AgentLoop
+from vibe.core.agent_loop import AgentLoop, AgentLoopStateError
 from vibe.core.compaction import CompactionFailedError
-from vibe.core.session.saved_sessions import update_saved_session_title_at_path
+from vibe.core.git.worktree import ManagedWorktree
+from vibe.observability.logging import logger
 
 DEFAULT_HISTORY_LIMIT = 200
 
 type ReplaceRoot = Callable[[str, int], Awaitable[PublicSessionState]]
 type AdoptRoot = Callable[[AgentLoop, int], Awaitable[PublicSessionState]]
 type StageRoot = Callable[[AgentLoop], Awaitable[None]]
+type SpawnResumeTask = Callable[[asyncio.Task[None]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +152,19 @@ class RootLifecycle:
     replace: ReplaceRoot
     adopt: AdoptRoot
     stage: StageRoot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeOrchestration:
+    """Server-owned callbacks that manage the fast-resume background lifecycle.
+
+    Grouped separately from ``RootLifecycle`` because they are server concerns
+    (task tracking, post-response notification) rather than session-state concerns.
+    """
+
+    runtime_factory: AgentRuntimeFactory
+    current_event_id: Callable[[str], int]
+    spawn_resume_task: SpawnResumeTask
 
 
 class CoreRequestHandler:
@@ -160,15 +178,15 @@ class CoreRequestHandler:
         resources: ResourceRequestHandler,
         root_session: RootSessionCoordinator,
         root_lifecycle: RootLifecycle,
-        runtime_factory: AgentRuntimeFactory,
-        current_event_id: Callable[[str], int],
+        resume_orchestration: ResumeOrchestration,
     ) -> None:
         self._agent_loop = agent_loop
         self._turns = turns
         self._execution = execution
+        self._notify = notify
         self._sessions = sessions
         self._root_session = root_session
-        self._current_event_id = current_event_id
+        self._current_event_id = resume_orchestration.current_event_id
         self._shell = ShellRequestHandler(
             agent_loop, turns, execution, self._require_attached, self._current_event_id
         )
@@ -182,8 +200,9 @@ class CoreRequestHandler:
             self._execution.require_idle,
         )
         self._root_lifecycle = root_lifecycle
-        self._runtime_factory = runtime_factory
+        self._runtime_factory = resume_orchestration.runtime_factory
         self._closed = False
+        self._spawn_resume_task = resume_orchestration.spawn_resume_task
 
     async def dispatch(self, method: str, raw_params: dict[str, Any]) -> DispatchResult:
         try:
@@ -203,6 +222,8 @@ class CoreRequestHandler:
             ) from exc
         except CallbackNotFoundError as exc:
             raise RequestFailure(ProtocolErrorCode.NOT_FOUND, str(exc)) from exc
+        except CallbackClosedError as exc:
+            raise RequestFailure(ProtocolErrorCode.CALLBACK_CLOSED, str(exc)) from exc
         except CallbackConflictError as exc:
             raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
         except (PromptPreparationError, WorkspaceTrustError) as exc:
@@ -386,7 +407,6 @@ class CoreRequestHandler:
             in {
                 "session/history/list",
                 "session/turns/list",
-                "session/archive",
                 "session/rename",
                 "session/compact",
             }
@@ -418,14 +438,14 @@ class CoreRequestHandler:
                 response = self._session_settings_update(
                     validate_wire(SessionSettingsUpdateParams, raw_params)
                 )
+            case "session/relocate":
+                response = await self._relocate(
+                    validate_wire(SessionRelocateParams, raw_params)
+                )
+                runtime_updated = True
             case "session/log/read":
                 response = self._session_log_read(
                     validate_wire(SessionLogReadParams, raw_params)
-                )
-            case "session/list":
-                params = validate_wire(SessionListParams, raw_params)
-                response = await asyncio.to_thread(
-                    project_session_list, self._agent_loop.config, params
                 )
             case "session/context/inject":
                 params = validate_wire(ContextInjectParams, raw_params)
@@ -450,7 +470,7 @@ class CoreRequestHandler:
             return await self._dispatch_rewind(method, raw_params)
         if method == "session/rename":
             return DispatchResult(
-                await self._session_rename(
+                await self._session_title_update(
                     validate_wire(SessionTitleUpdateParams, raw_params)
                 )
             )
@@ -475,12 +495,6 @@ class CoreRequestHandler:
                     await self._session_turns_list(
                         validate_wire(SessionTurnsListParams, raw_params)
                     )
-                )
-            case "session/archive":
-                # Reserved for future clients; Vibe has no archive backing yet.
-                raise RequestFailure(
-                    ProtocolErrorCode.NOT_IMPLEMENTED,
-                    "Archiving sessions is not supported",
                 )
         raise method_not_found(method)
 
@@ -531,7 +545,9 @@ class CoreRequestHandler:
                     "The app server was started in a different working directory",
                 )
             self._root_session.attach(self._agent_loop.session_id)
-            self._agent_loop.start_initialize_experiments()
+            self._agent_loop.start_initialize_experiments(
+                defer_new_session_telemetry=params.kind is SessionKind.EPHEMERAL
+            )
             return DispatchResult(
                 SessionStartResponse(
                     state=(state := self._public_state(params.history_limit)),
@@ -714,8 +730,16 @@ class CoreRequestHandler:
             state = await self._root_lifecycle.replace(
                 params.session_id, params.history_limit
             )
+            agent_loop = self._agent_loop
+            session_id = params.session_id
+
+            def _spawn() -> None:
+                task = asyncio.create_task(self._finish_resume(agent_loop, session_id))
+                self._spawn_resume_task(task)
+
             return DispatchResult(
                 SessionResumeResponse(state=state, last_event_id=state.event_id),
+                after_response=_spawn,
                 session_attached=True,
                 runtime_updated=True,
             )
@@ -729,41 +753,40 @@ class CoreRequestHandler:
             runtime_updated=True,
         )
 
+    async def _finish_resume(self, agent_loop: AgentLoop, session_id: str) -> None:
+        await self._runtime_factory.finish_resume_root(agent_loop, session_id)
+        try:
+            await self._notify(
+                "runtime/updated",
+                RuntimeUpdatedParams(
+                    session_id=session_id, runtime=self._resources.runtime_snapshot()
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to emit runtime/updated after resuming session_id=%s",
+                session_id,
+            )
+
     async def _session_title_update(
         self, params: SessionTitleUpdateParams
     ) -> SessionTitleUpdateResponse:
         self._require_session(params.session_id)
         session_logger = self._agent_loop.session_logger
-        updated_at: str | None = None
-        if (
-            session_logger.session_dir is not None
-            and session_logger.metadata_filepath.exists()
-        ):
-            try:
-                metadata = await update_saved_session_title_at_path(
-                    session_logger.session_dir, params.title
-                )
-            except ValueError as exc:
-                raise RequestFailure(
-                    ProtocolErrorCode.INVALID_PARAMS, str(exc)
-                ) from exc
-            value = metadata.get("end_time")
-            updated_at = value if isinstance(value, str) else None
         try:
-            session_logger.set_title(params.title)
+            updated_at = await session_logger.apply_manual_title(params.title)
         except ValueError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
+        except RuntimeError as exc:
+            # Corrupt on-disk metadata is a genuine internal fault; keep its
+            # message instead of collapsing to an opaque INTERNAL_ERROR.
+            raise RequestFailure(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
         title = session_logger.title
         if title is None:
             raise RuntimeError("The session title was not updated")
         if updated_at is None and session_logger.session_metadata is not None:
             updated_at = session_logger.session_metadata.end_time
         return SessionTitleUpdateResponse(title=title, updated_at=updated_at)
-
-    async def _session_rename(
-        self, params: SessionTitleUpdateParams
-    ) -> SessionTitleUpdateResponse:
-        return await self._session_title_update(params)
 
     async def _session_fork(self, params: SessionForkParams) -> SessionForkResponse:
         self._require_attached(params.source_session_id)
@@ -819,11 +842,14 @@ class CoreRequestHandler:
                     history=history,
                     current_history=[],
                     callbacks=[],
-                    active_turn=None,
-                    completed_turns=[],
+                    turns=[],
+                    retrying=None,
                     history_limit=params.history_limit,
                 )
-                if self._root_lifecycle.stage is not None:
+                if (
+                    self._root_lifecycle.stage is not None
+                    and not forked.session_logger.enabled
+                ):
                     await self._root_lifecycle.stage(forked)
                     forked = None
             finally:
@@ -1097,6 +1123,74 @@ class CoreRequestHandler:
             summary=summary, state=handoff.state, session_log=handoff.session_log
         )
 
+    async def _relocate(self, params: SessionRelocateParams) -> SessionRelocateResponse:
+        self._require_attached(params.session_id)
+        # The reserve is stricter than the loop's own guards, and it is what
+        # makes every busy case a conflict rather than a bad request: a turn, a
+        # teleport and another lifecycle transition all hold the same slot. What
+        # reaches the loop is therefore only ever a target it rejects on merit.
+        with self._execution.reserve(SessionExecutionKind.LIFECYCLE, "relocate"):
+            previous_cwd = self._agent_loop.cwd
+            session_id = self._agent_loop.session_id
+            # Expanded here rather than passed through raw, because the loop
+            # expands before it moves: a `~` target would relocate the session
+            # and leave the holder on a path that never existed.
+            target = Path(params.cwd).expanduser().resolve()
+            # A move that stays inside one managed worktree -- into a
+            # subdirectory of it, or to a sibling path the loop then refuses --
+            # resolves to the claim the session already holds. Taking that hold
+            # is a no-op, so giving it back would drop the one the session is
+            # still standing on and leave the checkout readable as idle for
+            # another session to delete.
+            changes_worktree = _worktree_root(target) != _worktree_root(previous_cwd)
+            # A session is held only where it was opened, and a move would
+            # otherwise leave the destination unheld: another session reading it
+            # as idle may remove the checkout this one is standing in. Taken
+            # before the move so nothing can reclaim it in between, and given
+            # back if the move is refused.
+            if changes_worktree:
+                await asyncio.to_thread(_hold_worktree, target, session_id)
+            try:
+                await self._agent_loop.relocate(target)
+            except AgentLoopStateError as exc:
+                if changes_worktree:
+                    await asyncio.to_thread(_release_worktree, target, session_id)
+                raise RequestFailure(
+                    ProtocolErrorCode.INVALID_PARAMS, str(exc)
+                ) from exc
+            except BaseException:
+                # A refusal is not the only way the move can fail: re-rooting the
+                # workspace raises config and IO errors too. Closing the session
+                # would not give this hold back, because close releases the cwd
+                # the loop has rolled back to, not the one taken above.
+                if changes_worktree:
+                    await asyncio.to_thread(_release_worktree, target, session_id)
+                raise
+            destination = self._agent_loop.cwd
+            if destination == previous_cwd:
+                return SessionRelocateResponse(
+                    state=self._public_state(DEFAULT_HISTORY_LIMIT)
+                )
+            # The checkpoint folds the turns into the stored history and hands
+            # back a state carrying none of its own, so the controller has to
+            # let go of them too. Left in place they are read a second time
+            # beside the copy now in history, with the relocation mark between
+            # the two. Clear and compact do the same thing for the same reason.
+            # Only now that the move has committed. Released after the hold
+            # above rather than before it, so the session is never briefly
+            # holding neither checkout.
+            if changes_worktree:
+                await asyncio.to_thread(_release_worktree, previous_cwd, session_id)
+            previous_history = self._turns.history
+            await self._turns.reset()
+            state = self._root_session.append_checkpoint(
+                current_history=previous_history,
+                kind="relocation",
+                message=f"Moved to {destination}",
+                details={"cwd": str(destination), "previousCwd": str(previous_cwd)},
+            )
+        return SessionRelocateResponse(state=state)
+
     def _public_state(
         self,
         history_limit: int,
@@ -1113,8 +1207,8 @@ class CoreRequestHandler:
         return self._root_session.public_state(
             current_history=self._turns.history,
             callbacks=callbacks,
-            active_turn=self._turns.active_turn,
-            completed_turns=self._turns.completed_turns,
+            turns=self._turns.turns,
+            retrying=self._turns.retrying,
             history_limit=history_limit,
             turns_limit=turns_limit,
             include_history=include_history,
@@ -1145,3 +1239,24 @@ class CoreRequestHandler:
             raise RequestFailure(
                 ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
             )
+
+
+# The marker that says a session is working in a managed worktree. `at` answers
+# None for a directory Vibe did not create, which is most of them, so both of
+# these do nothing outside one.
+def _hold_worktree(cwd: Path, session_id: str) -> None:
+    if managed := ManagedWorktree.at(cwd):
+        managed.hold(session_id)
+
+
+def _release_worktree(cwd: Path, session_id: str) -> None:
+    if managed := ManagedWorktree.at(cwd):
+        managed.release_holder(session_id)
+
+
+# None for a path outside every managed worktree, which compares unequal to any
+# root and equal to another such path: two unmanaged directories share no hold
+# to preserve, and there is nothing to take or give back either way.
+def _worktree_root(cwd: Path) -> Path | None:
+    managed = ManagedWorktree.at(cwd)
+    return None if managed is None else managed.root

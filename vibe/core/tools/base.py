@@ -7,7 +7,6 @@ import functools
 import inspect
 from pathlib import Path
 import re
-import sys
 import types
 from typing import (
     TYPE_CHECKING,
@@ -34,6 +33,7 @@ from vibe.core.tools.models import (
 )
 from vibe.core.tools.terminal_runtime import TerminalRuntime
 from vibe.core.types import ToolStreamEvent
+from vibe.core.workspace import Workspace
 from vibe.observability.logging import logger
 from vibe.utils.io import read_safe
 
@@ -97,7 +97,14 @@ class InvokeContext:
 
 
 class ToolError(Exception):
-    """Raised when the tool encounters an unrecoverable problem."""
+    """Raised when the tool encounters an unrecoverable problem.
+
+    ``model_detail`` is appended for the model only; ``display`` stays the head.
+    """
+
+    def __init__(self, message: str, *, model_detail: str | None = None) -> None:
+        super().__init__(f"{message}\n\n{model_detail}" if model_detail else message)
+        self.display = message
 
 
 class CancellableToolResult(BaseModel):
@@ -183,6 +190,12 @@ class BaseTool[
             except RuntimeError:
                 harness_files = HarnessFilesManager(sources=(), cwd=self.cwd)
         self.harness_files = replace(harness_files, cwd=self.cwd)
+        # project_roots omits an untrusted cwd, since config is only discovered
+        # under trusted roots. for_session adds it back, so such a directory
+        # stays writable without becoming a place config is read from.
+        self.workspace = Workspace.for_session(
+            self.cwd, self.harness_files.project_roots
+        )
         self.scratchpad_dir = scratchpad_dir
         self.terminal_runtime = terminal_runtime or TerminalRuntime()
 
@@ -328,16 +341,9 @@ class BaseTool[
         """
         run_fn = cls.run.__func__ if isinstance(cls.run, classmethod) else cls.run
 
-        type_hints = get_type_hints(
-            run_fn,
-            globalns=vars(sys.modules[cls.__module__]),
-            localns={
-                cls.__name__: cls,
-                "InvokeContext": InvokeContext,
-                "AsyncGenerator": AsyncGenerator,
-                "ToolStreamEvent": ToolStreamEvent,
-            },
-        )
+        # `get_type_hints` resolves against `run_fn.__globals__`, which is the
+        # module that wrote the annotation even when a subclass inherits `run`.
+        type_hints = get_type_hints(run_fn)
 
         try:
             args_model = type_hints["args"]

@@ -169,6 +169,19 @@ class ChildSessionLink(BaseModel):
     relative_path: str | None = None
 
 
+# Session state rather than a message, because the worktree is created before
+# the session has a first turn: there is no message it could belong to, and the
+# transcript is rebuilt on every resume from what was persisted here.
+class WorktreeContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entry_id: str
+    name: str
+    branch: str
+    path: str
+    created_at: int
+
+
 class SessionMetadata(BaseModel):
     session_id: str
     parent_session_id: str | None = None
@@ -177,12 +190,24 @@ class SessionMetadata(BaseModel):
     git_commit: str | None
     git_branch: str | None
     environment: dict[str, str | None]
+    # Where the session began. ``environment.working_directory`` follows it as
+    # it moves, so between them the record names both the directory the user
+    # started in and the one the session is working in. Neither on its own can
+    # do that, which is the whole reason this field exists.
+    origin_directory: str | None = None
     username: str
     child_sessions: list[ChildSessionLink] = Field(default_factory=list)
     loops: list[ScheduledLoop] = Field(default_factory=list)
     title: str | None = None
     title_source: Literal["auto", "manual"] = "auto"
+    # The sticky GrowthBook variant assignment, persisted so a resumed session
+    # keeps its buckets. NOTE: plan/org attributes and user_plan are user-scoped,
+    # not session-scoped, so they are deliberately NOT persisted here — they are
+    # re-resolved from the user-scoped whoami/identity cache on every session, so
+    # resuming never reports a stale plan.
     experiments: EvalResponse | None = None
+    import_provenance: dict[str, JsonValue] | None = None
+    created_worktree: WorktreeContext | None = None
 
 
 StrToolChoice = Literal["auto", "none", "any", "required"]
@@ -525,6 +550,7 @@ class ToolResultEvent(BaseEvent):
     tool_class: type[BaseTool] | None
     result: BaseModel | None = None
     error: str | None = None
+    error_display: str | None = None
     skipped: bool = False
     skip_reason: str | None = None
     cancelled: bool = False
@@ -609,6 +635,7 @@ class ContextClearedEvent(BaseEvent):
 
 class SessionTitleUpdatedEvent(BaseEvent):
     title: str
+    session_id: str
 
 
 type SwitchAgentCallback = Callable[[str], Awaitable[None]]

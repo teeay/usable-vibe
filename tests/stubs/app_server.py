@@ -5,9 +5,12 @@ from pathlib import Path
 
 from vibe.app_server._account import AccountGateway
 from vibe.app_server._identity import IdentityGateway
+from vibe.app_server._legacy_composition import create_legacy_app_server
+from vibe.app_server._legacy_session_backend import LegacySessionBackend
 from vibe.app_server._projector import EventProjector
 from vibe.app_server._runtime import AgentRuntimeFactory, RootOpenRequest
 from vibe.app_server.client import AppServerClient
+from vibe.app_server.connector_catalog import ConnectorCatalogService
 from vibe.app_server.events import AppServerEvent, ClientProjection
 from vibe.app_server.models import (
     IdleSessionStatus,
@@ -94,6 +97,7 @@ def start_test_app_server(
     *,
     account_gateway: AccountGateway | None = None,
     identity_gateway: IdentityGateway | None = None,
+    connector_catalog_service: ConnectorCatalogService | None = None,
 ) -> AppServerClient:
     client_transport, server_transport = memory_transport_pair()
     server = build_test_app_server(
@@ -101,6 +105,7 @@ def start_test_app_server(
         server_transport,
         account_gateway=account_gateway,
         identity_gateway=identity_gateway,
+        connector_catalog_service=connector_catalog_service,
     )
     return AppServerClient(client_transport, run_peer=server.serve)
 
@@ -111,6 +116,7 @@ def build_test_app_server(
     *,
     account_gateway: AccountGateway | None = None,
     identity_gateway: IdentityGateway | None = None,
+    connector_catalog_service: ConnectorCatalogService | None = None,
 ) -> AppServer:
     runtime_factory = AgentRuntimeFactory()
 
@@ -121,16 +127,23 @@ def build_test_app_server(
                 agent_loop, Path(request.options.cwd or agent_loop.cwd)
             )
         if session_id is not None:
-            return await runtime_factory.resume_root(agent_loop, session_id)
+            await runtime_factory.resume_root(agent_loop, session_id)
         return agent_loop
 
-    return AppServer(
+    return create_legacy_app_server(
         transport,
         open_root=open_root,
         runtime_factory=runtime_factory,
         account_gateway=account_gateway,
         identity_gateway=identity_gateway,
+        connector_catalog_service=connector_catalog_service,
     )
+
+
+def legacy_backend(server: AppServer) -> LegacySessionBackend:
+    root = server._root
+    assert isinstance(root, LegacySessionBackend)
+    return root
 
 
 async def create_test_app_server_session(
@@ -138,12 +151,14 @@ async def create_test_app_server_session(
     *,
     account_gateway: AccountGateway | None = None,
     identity_gateway: IdentityGateway | None = None,
+    connector_catalog_service: ConnectorCatalogService | None = None,
 ) -> AppServerSession:
     return await attach_test_app_server_session(
         start_test_app_server(
             agent_loop,
             account_gateway=account_gateway,
             identity_gateway=identity_gateway,
+            connector_catalog_service=connector_catalog_service,
         )
     )
 

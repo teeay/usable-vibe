@@ -51,6 +51,20 @@ from vibe.utils import keyring as keyring_utils
 from vibe.utils.platform import resolve_windows_shell
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--experimental-harness",
+        action="store_true",
+        default=False,
+        help="Run backend contract tests with the experimental Unified Harness backend.",
+    )
+
+
+@pytest.fixture
+def experimental_harness(pytestconfig: pytest.Config) -> bool:
+    return bool(pytestconfig.getoption("--experimental-harness"))
+
+
 class _EmptyKeyring(KeyringBackend):
     """A keyring backend that stores nothing, used to keep tests off the real OS keyring."""
 
@@ -253,6 +267,16 @@ def _mock_update_commands(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _disable_feedback_bar(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("vibe.core.feedback.FEEDBACK_PROBABILITY", 0)
+
+
+@pytest.fixture(autouse=True)
+def _disable_auto_title_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Auto-title generation fires a background model call after turns; off by
+    # default so it never consumes mocked responses. Title tests re-patch this.
+    async def _noop(messages: Any, *, config: Any, previous_title: Any = None) -> None:
+        return None
+
+    monkeypatch.setattr("vibe.core.session.title_model.generate_session_title", _noop)
 
 
 @pytest.fixture(autouse=True)

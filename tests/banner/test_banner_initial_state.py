@@ -18,11 +18,18 @@ from vibe.cli.textual_ui.widgets.spinner_text import SpinnerText
 
 
 def _make_config(
-    active_model: str = "test-model", thinking: ThinkingLevel = "off"
+    active_model: str = "test-model",
+    thinking: ThinkingLevel = "off",
+    display_name: str | None = None,
 ) -> ConfigView:
     config = build_test_app_config()
     model = config.active_model.model_copy(
-        update={"name": active_model, "alias": active_model, "thinking": thinking}
+        update={
+            "name": active_model,
+            "alias": active_model,
+            "thinking": thinking,
+            "display_name": display_name or active_model,
+        }
     )
     return config.model_copy(
         update={
@@ -88,12 +95,22 @@ class TestBannerInitialState:
         banner = Banner(config=_make_config(), skills_count=0)
 
         assert banner._initial_state.connectors_connected == 0
-        assert banner._initial_state.connectors_total == 0
+        assert banner._initial_state.connectors_total is None
 
     def test_banner_shows_thinking_level(self) -> None:
         banner = Banner(config=_make_config(thinking="max"), skills_count=0)
 
         assert banner._initial_state.active_model == "test-model[max]"
+
+    def test_banner_shows_display_name(self) -> None:
+        banner = Banner(
+            config=_make_config(
+                active_model="glm-5-2", display_name="glm-5.2 (Mistral Hosted)"
+            ),
+            skills_count=0,
+        )
+
+        assert banner._initial_state.active_model == "glm-5.2 (Mistral Hosted)[off]"
 
     def test_format_meta_counts_includes_connectors(self) -> None:
         banner = Banner(config=_make_config(), skills_count=0)
@@ -122,7 +139,10 @@ class TestBannerInitialState:
         )
         result = banner._format_meta_counts()
         assert "2 models" in result
-        assert "connectors" not in result
+        # A real zero-connector session shows "0 connectors", not the unknown
+        # placeholder; only `None` renders as "0/? connector".
+        assert "0 connectors" in result
+        assert "0/?" not in result
         assert "1/2 MCP servers" in result
         assert "5 skills" in result
 
@@ -207,6 +227,7 @@ class TestBannerMCPServersCount:
             config=_make_config(),
             skills_count=0,
             mcp=_mcp_state(_mcp_server("s1"), _mcp_server("s2")),
+            connectors_total=None,
         )
 
         assert banner._initial_state.mcp_servers_enabled == 2
@@ -214,7 +235,7 @@ class TestBannerMCPServersCount:
         banner.state = banner._initial_state
         result = banner._format_meta_counts()
         assert "2 MCP servers" in result
-        assert "/" not in result
+        assert "1/2" not in result
 
 
 class TestBannerConnectorsCount:

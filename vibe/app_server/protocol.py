@@ -46,6 +46,9 @@ from vibe.app_server.models import (
     JsonPatchOperation,
     MCPState,
     MentionStats,
+    PluginComponent as PluginComponent,
+    PluginComponentKind as PluginComponentKind,
+    PluginInfo,
     PreparedPrompt,
     PublicCallbackEntry,
     PublicError,
@@ -93,11 +96,16 @@ SERVER_METHODS: tuple[str, ...] = (
     "connectors/auth/read",
     "connectors/read",
     "connectors/refresh",
+    "connector_catalog/auth/request",
+    "connector_catalog/read",
+    "connector_catalog/refresh",
+    "connector_catalog/toggle",
     "diagnostics/list",
     "diagnostics/logs/read",
     "events/read",
     "feedback/record",
     "feedback/shouldShow",
+    "session/history/get",
     "identity/read",
     "loops/clear",
     "loops/create",
@@ -109,6 +117,13 @@ SERVER_METHODS: tuple[str, ...] = (
     "mcp/read",
     "mcp/refresh",
     "mcp/toggle",
+    "mcp_catalog/add",
+    "mcp_catalog/login",
+    "mcp_catalog/logout",
+    "mcp_catalog/read",
+    "mcp_catalog/refresh",
+    "mcp_catalog/remove",
+    "mcp_catalog/toggle",
     "narration/summarize",
     "plugin/info",
     "plugin/reload",
@@ -129,7 +144,6 @@ SERVER_METHODS: tuple[str, ...] = (
     "review/turnDiff",
     "runtime/read",
     "session/agent/update",
-    "session/archive",
     "session/compact",
     "session/continue",
     "session/context/inject",
@@ -142,6 +156,7 @@ SERVER_METHODS: tuple[str, ...] = (
     "session/read",
     "session/ready/read",
     "session/ready/wait",
+    "session/relocate",
     "session/rename",
     "session/resume",
     "session/rewind",
@@ -168,11 +183,13 @@ SERVER_METHODS: tuple[str, ...] = (
     "vibeCode/teleport/cancel",
     "vibeCode/teleport/push/respond",
     "vibeCode/teleport/start",
+    "workspace/git/checkouts",
+    "workspace/git/worktrees/list",
+    "workspace/git/worktrees/remove",
     "workspace/prompt/prepare",
     "workspace/trust/decision",
     "workspace/trust/untrustedConfig",
     "workspace/trust/status",
-    "workspace/worktrees/list",
 )
 
 
@@ -306,8 +323,24 @@ class SessionOpenParams(ProtocolModel):
         return self.agent_config.cwd or self.agent_config.workdir
 
 
+class SessionKind(StrEnum):
+    """Lifecycle role of a session as seen by the server.
+
+    ``NORMAL`` — a genuine user-initiated session; emits new-session telemetry
+    and is persisted to disk as soon as a turn runs.
+
+    ``EPHEMERAL`` — a throwaway session used to warm up the runtime while the
+    in-app picker is shown; it is discarded on resume and must not emit
+    new-session telemetry or be counted as a new session.
+    """
+
+    NORMAL = auto()
+    EPHEMERAL = auto()
+
+
 class SessionStartParams(SessionOpenParams):
     idempotency_key: str | None = None
+    kind: SessionKind = SessionKind.NORMAL
 
 
 class SessionStartResponse(EventWatermarkResponse):
@@ -391,7 +424,6 @@ class SessionCloseResponse(ProtocolModel):
 class SessionListParams(ProtocolModel):
     cursor: str | None = None
     limit: int = Field(default=50, ge=1, le=500)
-    include_archived: bool = False
     root_session_id: str | None = None
     parent_session_id: str | None = None
     cwd: str | None = None
@@ -401,6 +433,10 @@ class SessionListResponse(ProtocolModel):
     items: list[PublicSession] = Field(default_factory=list)
     next_cursor: str | None = None
     previous_cursor: str | None = None
+    # The session `--continue` would resume: the tty-scoped last-session
+    # pointer when it still exists, else the most recently updated session.
+    # Resolved server-side so the pointer stays behind the app-server boundary.
+    continue_session_id: str | None = None
 
     @property
     def data(self) -> list[PublicSession]:
@@ -452,6 +488,15 @@ class SessionHistoryListResponse(ProtocolModel):
     @property
     def backwards_cursor(self) -> str | None:
         return self.previous_cursor
+
+
+class SessionHistoryGetParams(ProtocolModel):
+    session_id: str
+    history_limit: int = Field(default=200, ge=1, le=500)
+
+
+class SessionHistoryGetResponse(ProtocolModel):
+    history: list[PublicHistoryEntry]
 
 
 class SessionTurnsListParams(ProtocolModel):
@@ -563,6 +608,15 @@ class SessionRewindResponse(ProtocolModel):
     restored_paths: list[str]
     state: PublicSessionState
     session_log: SessionLogSummary
+
+
+class SessionRelocateParams(ProtocolModel):
+    session_id: str
+    cwd: str
+
+
+class SessionRelocateResponse(ProtocolModel):
+    state: PublicSessionState
 
 
 class ReviewStateParams(ProtocolModel):
@@ -680,6 +734,14 @@ class RuntimeSnapshot(ProtocolModel):
     mcp: MCPState
 
 
+class PluginInfoParams(ProtocolModel):
+    session_id: str
+
+
+class PluginInfoResponse(ProtocolModel):
+    info: PluginInfo
+
+
 class RuntimeReadParams(ProtocolModel):
     session_id: str
 
@@ -786,6 +848,10 @@ class ConfigReadParams(ProtocolModel):
 class ConfigReadResponse(ProtocolModel):
     config: ConfigView
     stripped_history_images: int = 0
+    skills_count: int = 0
+    hooks_count: int = 0
+    mcp_servers_total: int = 0
+    mcp_servers_enabled: int = 0
 
 
 class AgentInstallParams(ProtocolModel):
@@ -937,6 +1003,114 @@ class TeleportEventParams(ProtocolModel):
     event: TeleportEvent
 
 
+class ConnectorCatalogToolView(ProtocolModel):
+    name: str
+    description: str | None = None
+
+
+class ConnectorCatalogEntryView(ProtocolModel):
+    alias: str
+    display_name: str
+    readiness: Literal["ready", "needs_auth", "needs_setup", "unavailable"]
+    auth_action: Literal["none", "oauth", "credentials_setup", "unknown"]
+    tools: list[ConnectorCatalogToolView] = Field(default_factory=list)
+    diagnostic: str | None = None
+
+
+class ConnectorCatalogView(ProtocolModel):
+    disposition: Literal["memory", "fresh_cache", "not_loaded", "unavailable"]
+    catalog_revision: str | None = None
+    connectors: list[ConnectorCatalogEntryView] = Field(default_factory=list)
+
+
+class ConnectorSelectionView(ProtocolModel):
+    alias: str
+    disabled: bool
+    disabled_tools: list[str] = Field(default_factory=list)
+    state: Literal["resolved", "pending"]
+
+
+class SessionConnectorToolView(ProtocolModel):
+    name: str
+    description: str | None = None
+    enabled: bool
+
+
+class SessionConnectorSourceView(ProtocolModel):
+    alias: str
+    display_name: str
+    status: Literal["disabled", "connected", "needs_auth", "needs_setup", "unavailable"]
+    tools: list[SessionConnectorToolView] = Field(default_factory=list)
+    error: str | None = None
+
+
+class SessionConnectorStateView(ProtocolModel):
+    accepted_catalog_revision: str
+    accepted_selection_revision: str
+    route_revision: str
+    sources: list[SessionConnectorSourceView] = Field(default_factory=list)
+
+
+class ConnectorCatalogReadParams(ProtocolModel):
+    session_id: str | None = None
+
+
+class ConnectorCatalogReadResponse(ProtocolModel):
+    catalog: ConnectorCatalogView
+    selections: list[ConnectorSelectionView] = Field(default_factory=list)
+    session: SessionConnectorStateView | None = None
+
+
+class ConnectorCatalogRefreshParams(ProtocolModel):
+    session_id: str | None = None
+
+
+class ConnectorCatalogMutationResponse(ProtocolModel):
+    catalog_revision: str | None = None
+    selection_revision: str | None = None
+    accepted_catalog_revision: str | None = None
+    accepted_selection_revision: str | None = None
+    route_revision: str | None = None
+    runtime: RuntimeSnapshot | None = None
+    pending_selection: bool = False
+
+
+class ConnectorCatalogToggleParams(ProtocolModel):
+    alias: str
+    disabled: bool
+    tool_name: str | None = None
+    session_id: str | None = None
+
+
+class ConnectorCatalogAuthRequestParams(ProtocolModel):
+    session_id: str
+    alias: str
+
+
+class ConnectorCatalogAuthRequestResponse(ProtocolModel):
+    request_id: str
+    session_id: str
+    alias: str
+    accepted_catalog_revision: str
+
+
+class ConnectorAuthRequiredParams(ProtocolModel):
+    session_id: str
+    alias: str
+    accepted_catalog_revision: str
+    reason: Literal["needs_auth", "needs_setup", "gateway_rejected"]
+
+
+class ConnectorAuthUrlParams(ConnectorAuthRequiredParams):
+    request_id: str
+    url: str
+
+
+class ConnectorAuthFailedParams(ConnectorAuthRequiredParams):
+    request_id: str
+    code: Literal["auth_url_unavailable", "stale_request"]
+
+
 class ConnectorsReadParams(ProtocolModel):
     session_id: str
 
@@ -977,7 +1151,7 @@ class MCPRefreshParams(ProtocolModel):
 
 
 class MCPToggleParams(ProtocolModel):
-    session_id: str
+    session_id: str | None = None
     name: str
     source: Literal["server", "connector"]
     disabled: bool
@@ -985,7 +1159,7 @@ class MCPToggleParams(ProtocolModel):
 
 
 class MCPAddParams(ProtocolModel):
-    session_id: str
+    session_id: str | None = None
     url: str
     name: str | None = None
     scopes: list[str] = Field(default_factory=list)
@@ -996,22 +1170,44 @@ class MCPAddResponse(ProtocolModel):
     name: str
     url: str
     created: bool
-    runtime: RuntimeSnapshot
+    runtime: RuntimeSnapshot | None = None
+
+
+class MCPCatalogMutationResponse(ProtocolModel):
+    runtime: RuntimeSnapshot | None = None
+
+
+class MCPRemoveParams(ProtocolModel):
+    session_id: str | None = None
+    name: str
+
+
+class MCPRemoveResponse(ProtocolModel):
+    name: str
+    removed: bool
+    runtime: RuntimeSnapshot | None = None
 
 
 class MCPLogoutParams(ProtocolModel):
-    session_id: str
+    session_id: str | None = None
     name: str
 
 
 class MCPLoginParams(ProtocolModel):
-    session_id: str
+    session_id: str | None = None
     name: str
 
 
 class MCPAuthUrlParams(ProtocolModel):
     name: str
     url: str
+
+
+class MCPAuthRequiredParams(ProtocolModel):
+    session_id: str
+    name: str
+    descriptor_revision: str
+    observed_connection_revision: str | None = None
 
 
 class ShellRunParams(ProtocolModel):
@@ -1066,6 +1262,17 @@ class WorkspaceTrustStatusResponse(ProtocolModel):
 
 class WorkspaceWorktreeListParams(ProtocolModel):
     cwd: str = Field(min_length=1)
+    # Off by default because this listing sits on the read path: it resolves
+    # the checkout behind every session read and enumerates a project's
+    # directories for every session list. The details cost a merge base and a
+    # diff per branch plus a second repository open, which only a caller that
+    # renders them should pay.
+    include_details: bool = False
+
+
+class WorkspaceGitBranchChanges(ProtocolModel):
+    additions: int
+    deletions: int
 
 
 class WorkspaceLinkedWorktree(ProtocolModel):
@@ -1074,10 +1281,88 @@ class WorkspaceLinkedWorktree(ProtocolModel):
     cwd: str
     root: str
     repo_root: str
+    # Absent unless asked for, and null when there is no base to measure
+    # against, which is not the same as a branch that has changed nothing.
+    branch_changes: WorkspaceGitBranchChanges | None = None
 
 
 class WorkspaceWorktreeListResponse(ProtocolModel):
     worktrees: list[WorkspaceLinkedWorktree]
+    # The branch the main checkout is on. Absent unless details were asked for,
+    # and null for a detached one. The worktree entries never name it: this
+    # listing reports the linked worktrees, and the main checkout is not one.
+    repository_branch: str | None = None
+    # Where the position this listing was taken from sits in the main checkout,
+    # under the same checks the worktree entries pass. Null when it does not
+    # sit there at all -- a subdirectory that exists only on a feature branch
+    # has no counterpart. A caller offering the main checkout as a destination
+    # must take this rather than joining the root itself, because a path this
+    # omits is one a move would refuse.
+    repository_cwd: str | None = None
+
+
+# No session_id on the wire: the caller is deleting a session that has already
+# closed and dropped its holder, and accepting one would let a client name an
+# arbitrary holder file to unlink.
+class WorkspaceWorktreeRemoveParams(ProtocolModel):
+    cwd: str = Field(min_length=1)
+
+
+# Spelled out here rather than imported from vibe.core.git.worktree: the protocol
+# is the wire contract and must not pull core into the app-server clients.
+type WorktreeRemoveOutcome = Literal[
+    "removed",
+    "kept_dirty",
+    "kept_in_use",
+    "kept_unmanaged",
+    # Distinct from kept_unmanaged: the worktree is Vibe's and the removal
+    # itself failed. Collapsing the two would report a failure as "not ours".
+    "kept_error",
+    "not_found",
+]
+
+
+class WorkspaceWorktreeRemoveResponse(ProtocolModel):
+    # A kept worktree is a normal outcome the caller has to render, not a fault,
+    # so every case answers with a result rather than a JSON-RPC error.
+    outcome: WorktreeRemoveOutcome
+    root: str | None = None
+    branch: str | None = None
+    branch_deleted: bool = False
+    reasons: list[str] = Field(default_factory=list)
+
+
+class WorkspaceGitCheckoutsParams(ProtocolModel):
+    # Every repository the project links, asked for together, because which one
+    # holds the session cannot be decided from any single one. A managed
+    # worktree lives outside the repository it belongs to, and a repository
+    # linked inside another would otherwise let both claim the session.
+    repo_local_paths: list[str]
+    # Absent for a session with no working directory, which on a cloud host is
+    # every session.
+    session_cwd: str | None = None
+
+
+class WorkspaceGitCheckout(ProtocolModel):
+    repo_local_path: str
+    # False when the repository could not be read; `message` says why and the
+    # rest is absent. Carried rather than raised so one unreadable repository
+    # does not cost the answer for the others.
+    ok: bool
+    # The repository the session is standing in. At most one is.
+    is_primary: bool = False
+    repo_url: str | None = None
+    root: str | None = None
+    # Absent when the session sits in the repository's own checkout rather than
+    # in one of its worktrees.
+    worktree: str | None = None
+    branch: str | None = None
+    base_branch: str | None = None
+    message: str | None = None
+
+
+class WorkspaceGitCheckoutsResponse(ProtocolModel):
+    checkouts: list[WorkspaceGitCheckout] = Field(default_factory=list)
 
 
 class WorkspaceTrustDecisionParams(ProtocolModel):
@@ -1486,6 +1771,7 @@ class ProtocolErrorCode(StrEnum):
     CONFLICT = auto()
     STALE_TURN = auto()
     NOT_STEERABLE = auto()
+    CALLBACK_CLOSED = auto()
     COMPACTION_FAILED = auto()
     UNAUTHORIZED = auto()
     FORBIDDEN = auto()

@@ -3,19 +3,20 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
-from enum import StrEnum, auto
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from textual.widget import Widget
 
 from vibe.app_server.models import PreparedPrompt
+from vibe.cli.textual_ui.queue_kinds import QueuedItemKind
 from vibe.cli.textual_ui.shortcut_hints import shortcut, shortcut_hint
 from vibe.cli.textual_ui.widgets.messages import (
     BashOutputMessage,
     ErrorMessage,
     QueueHeaderMessage,
+    SlashCommandMessage,
     UserMessage,
 )
 from vibe.observability.logging import logger
@@ -23,11 +24,11 @@ from vibe.observability.logging import logger
 if TYPE_CHECKING:
     from vibe.app_server.config import ModelConfigView
     from vibe.app_server.models import ImageAttachment
+    from vibe.cli.commands import Command
 
 
-class QueuedItemKind(StrEnum):
-    PROMPT = auto()
-    BASH = auto()
+async def _noop_async() -> None:
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,21 @@ class QueuedItem:
     content: str
     skill_name: str | None = None
     prepared_prompt: PreparedPrompt | None = None
+    # When set, content is cosmetic (display only) and the callback is what
+    # actually executes at drain time. When None, content is replayed via
+    # _dispatch_idle_input.
+    command_payload: Callable[[], Awaitable[None]] | None = None
+    # Invoked if this item is discarded before it drains (e.g. via Ctrl+C
+    # pop_last) so the caller can revert any speculative state it applied at
+    # enqueue time and clear its pending flag. Without this the payload's
+    # finally never runs, so the speculative change would stay applied but
+    # unpersisted. Defaults to a noop so callers that have nothing to revert
+    # need not pass anything.
+    on_discard: Callable[[], Awaitable[None]] = _noop_async
+    # Set on lifecycle commands that reset the conversation (e.g. /clear). At
+    # drain time the queue drops any prompts queued before such a command
+    # instead of running an LLM turn on the widgets the command tears down.
+    flushes_pending: bool = False
 
 
 @dataclass(slots=True)
@@ -76,6 +92,24 @@ class MessageQueue:
     def append_bash(self, content: str) -> None:
         self._items.append(QueuedItem(QueuedItemKind.BASH, content))
 
+    def append_command(
+        self,
+        content: str,
+        *,
+        command_payload: Callable[[], Awaitable[None]] | None = None,
+        on_discard: Callable[[], Awaitable[None]] | None = None,
+        flushes_pending: bool = False,
+    ) -> None:
+        self._items.append(
+            QueuedItem(
+                QueuedItemKind.COMMAND,
+                content,
+                command_payload=command_payload,
+                on_discard=on_discard or _noop_async,
+                flushes_pending=flushes_pending,
+            )
+        )
+
     def prepend_prompts(self, items: list[QueuedItem]) -> None:
         if not items:
             return
@@ -93,6 +127,22 @@ class MessageQueue:
         if not self._items:
             return None
         return self._items.pop(0)
+
+    def pop_at(self, index: int) -> QueuedItem | None:
+        if index < 0 or index >= len(self._items):
+            return None
+        item = self._items.pop(index)
+        if not self._items:
+            self._paused = False
+        return item
+
+    def update_prompt_item(
+        self, index: int, content: str, *, prepared_prompt: PreparedPrompt | None = None
+    ) -> None:
+        old = self._items[index]
+        self._items[index] = replace(
+            old, content=content, prepared_prompt=prepared_prompt
+        )
 
     def pause(self) -> None:
         self._paused = True
@@ -127,8 +177,14 @@ class QueuePorts:
     start_agent_turn: Callable[..., asyncio.Task]
     await_agent_turn: Callable[[], Awaitable[None]]
     run_bash: Callable[..., asyncio.Task]
+    run_command: Callable[[str, Callable[[], Awaitable[None]] | None], Awaitable[None]]
     maybe_show_feedback_bar: Callable[[], Awaitable[None]]
     send_skill_telemetry: Callable[[str | None], None]
+    # Awaited after a queued command runs, in case it opened a picker (e.g.
+    # /mcp, /resume) that must block the drain until the user dismisses it.
+    # No-op when no picker is open, so commands that don't open a picker
+    # return immediately.
+    await_input_app: Callable[[], Awaitable[None]] = _noop_async
 
 
 @dataclass(slots=True)
@@ -216,6 +272,7 @@ class QueueController:
         self._widgets.append(widget)
         await self._ports.mount_live_queue(widget, after=anchor)
         self._push_loading_queue_count()
+        self.start_drain_if_needed()
 
     async def enqueue_bash(self, content: str, workdir: str) -> None:
         self._queue.append_bash(content)
@@ -226,17 +283,115 @@ class QueueController:
         self._widgets.append(widget)
         await self._ports.mount_live_queue(widget, after=anchor)
         self._push_loading_queue_count()
+        self.start_drain_if_needed()
+
+    async def enqueue_command(
+        self,
+        content: str,
+        *,
+        command_payload: Callable[[], Awaitable[None]] | None = None,
+        on_discard: Callable[[], Awaitable[None]] | None = None,
+        flushes_pending: bool = False,
+    ) -> None:
+        self._queue.append_command(
+            content,
+            command_payload=command_payload,
+            on_discard=on_discard,
+            flushes_pending=flushes_pending,
+        )
+        await self._ensure_header()
+        widget = SlashCommandMessage(content, pending=True)
+        anchor = self._last_queue_anchor()
+        self._widgets.append(widget)
+        await self._ports.mount_and_scroll(widget, after=anchor)
+        self._push_loading_queue_count()
+        self.start_drain_if_needed()
 
     async def pop_last(self) -> bool:
         item = self._queue.pop_last()
         if item is None:
             return False
+        await item.on_discard()
         widget = self._widgets.pop() if self._widgets else None
         if widget is not None:
             await widget.remove()
         await self._remove_header_if_empty()
         self._push_loading_queue_count()
         return True
+
+    def prompt_item_texts(self) -> list[tuple[int, str]]:
+        """Return (queue_index, content) for PROMPT items, in queue order."""
+        return [
+            (i, item.content)
+            for i, item in enumerate(self._queue._items)
+            if item.kind == QueuedItemKind.PROMPT
+        ]
+
+    def queue_item_texts(self) -> list[tuple[int, str]]:
+        """Return (queue_index, content) for all items, in queue order."""
+        return [(i, item.content) for i, item in enumerate(self._queue._items)]
+
+    def queue_items(self) -> list[tuple[int, QueuedItemKind, str]]:
+        """Return (queue_index, kind, content) for all items, in queue order."""
+        return [
+            (i, item.kind, item.content) for i, item in enumerate(self._queue._items)
+        ]
+
+    @property
+    def widgets(self) -> list[Widget]:
+        return list(self._widgets)
+
+    async def pop_at(self, index: int) -> bool:
+        item = self._queue.pop_at(index)
+        if item is None:
+            return False
+        await item.on_discard()
+        if index < len(self._widgets):
+            widget = self._widgets.pop(index)
+            await widget.remove()
+        await self._remove_header_if_empty()
+        self._push_loading_queue_count()
+        return True
+
+    async def update_prompt_item(
+        self,
+        queue_index: int,
+        content: str,
+        *,
+        prepared_prompt: PreparedPrompt | None = None,
+    ) -> None:
+        self._queue.update_prompt_item(
+            queue_index, content, prepared_prompt=prepared_prompt
+        )
+        widget = self._widgets[queue_index]
+        if isinstance(widget, UserMessage):
+            widget.update_content(content)
+
+    async def update_item(
+        self,
+        queue_index: int,
+        content: str,
+        *,
+        prepared_prompt: PreparedPrompt | None = None,
+    ) -> None:
+        """In-place edit of a queued item, refreshing its on-screen widget.
+
+        Prompts re-prepare mentions/images; bash commands refresh the rendered
+        command line. The widget list and queue positions are unchanged.
+        """
+        item = self._queue._items[queue_index]
+        if item.kind == QueuedItemKind.BASH:
+            self._queue.update_prompt_item(queue_index, content)
+            widget = self._widgets[queue_index]
+            if isinstance(widget, BashOutputMessage):
+                widget.update_command(content)
+            return
+        self._queue.update_prompt_item(
+            queue_index, content, prepared_prompt=prepared_prompt
+        )
+        widget = self._widgets[queue_index]
+        if isinstance(widget, UserMessage):
+            widget.update_content(content)
 
     # -- header lifecycle -------------------------------------------------
 
@@ -299,6 +454,10 @@ class QueueController:
     async def _drain(self) -> None:
         try:
             while self._drain_enabled and self._queue and not self._queue.paused:
+                # Block while a side-channel picker (e.g. /theme opened while
+                # busy) is on screen, so the drain doesn't run a queued turn
+                # behind it. Returns immediately when the input app is active.
+                await self._ports.await_input_app()
                 await self._remove_header()
                 pending = await self._consume_until_bash_or_empty()
                 if not pending:
@@ -322,12 +481,40 @@ class QueueController:
                 break
             widget = self._widgets.pop(0) if self._widgets else None
             if item.kind == QueuedItemKind.BASH:
-                await self._flush_pending_prompts(pending)
-                pending = []
+                # A bash item is a turn boundary: run any preceding prompts as
+                # a real LLM turn before executing the command. Injecting them
+                # without a turn (the old flush) silently dropped prompts that
+                # immediately preceded a bash item — the model never answered.
+                if pending:
+                    await self._run_pending_as_llm_turn(pending)
+                    pending = []
                 if widget is not None:
                     await widget.remove()
                 if not await self._run_bash(item.content):
                     return []
+            elif item.kind == QueuedItemKind.COMMAND:
+                # Commands are side effects, not turn boundaries. Keep
+                # preceding prompts so they still get an LLM turn, and wait
+                # if the command started an agent (e.g. /compact, /retry) or
+                # opened a picker (e.g. /mcp, /resume) that must block the drain
+                # until the user dismisses it. A flushes_pending command
+                # (e.g. /clear) resets the conversation, so drop any prompts
+                # queued before it instead of running a turn on the widgets it
+                # is about to tear down.
+                if item.flushes_pending:
+                    pending = []
+                elif pending:
+                    # Run preceding prompts as a real LLM turn before the
+                    # command's side effect. Without this, a queued [/mcp]
+                    # following a prompt opens its picker first and the prompt
+                    # only runs after the user dismisses it — out of FIFO order.
+                    await self._run_pending_as_llm_turn(pending)
+                    pending = []
+                if widget is not None:
+                    await widget.remove()
+                await self._ports.run_command(item.content, item.command_payload)
+                await self._await_tail_turn()
+                await self._ports.await_input_app()
             elif isinstance(widget, UserMessage):
                 pending.append(_Pending(item, widget))
         return pending
@@ -369,13 +556,6 @@ class QueueController:
                 raise
             self._push_loading_queue_count()
 
-    async def _flush_pending_prompts(self, pending: list[_Pending]) -> None:
-        if not await self._gate_queued_images_for_vision(pending):
-            return
-        for p in pending:
-            await self._inject_head_item(p.item, p.widget)
-            await self._activate_prompt(p.item, p.widget)
-
     async def _gate_queued_images_for_vision(self, pending: list[_Pending]) -> bool:
         if not any(
             p.item.prepared_prompt and p.item.prepared_prompt.images for p in pending
@@ -390,7 +570,7 @@ class QueueController:
         await self._ports.mount_and_scroll(
             ErrorMessage(
                 shortcut_hint(
-                    f"Model `{active_model.alias}` does not support images. "
+                    f"Model `{active_model.display_name}` does not support images. "
                     f"Switch with /model, then press {shortcut('Enter')} "
                     "to resume the queue."
                 ),
@@ -437,3 +617,87 @@ class QueueController:
                 raise
             return False
         return True
+
+    @staticmethod
+    def _link_consecutive_user_messages(widgets: list[UserMessage]) -> None:
+        for prev, curr in zip(widgets, widgets[1:], strict=False):
+            prev.set_show_separator(False)
+            curr.set_follows_previous(True)
+
+
+@dataclass(frozen=True)
+class SideChannelPorts:
+    """Callbacks for side-channel slash command execution.
+
+    The side channel runs allowlisted slash commands while the agent or bash
+    is busy. It does not wait for the agent to become idle — that's the point.
+    Commands that need idle (lifecycle ops, config reloads) go to the main
+    queue instead. Commands that persist config defer to the main queue via
+    a COMMAND item with payload.
+    """
+
+    invoke_command: Callable[[str, Command, str, str], Awaitable[bool]]
+
+
+@dataclass(slots=True)
+class SideChannelItem:
+    cmd_name: str
+    command: Command
+    cmd_args: str
+    display_text: str
+
+
+class SideChannelController:
+    """Single-slot runner for side-channel slash commands.
+
+    Only one side-channel command runs at a time; new submissions are rejected
+    while one is in flight. Does not check ``agent_running`` or ``bash_task`` —
+    the whole purpose is concurrency with the agent loop.
+
+    Commands that need to persist config changes enqueue a COMMAND item on
+    the main queue with a payload. The main queue drains when idle, so
+    persistence never hits CONFLICT.
+    """
+
+    def __init__(self, ports: SideChannelPorts) -> None:
+        self._ports = ports
+        self._task: asyncio.Task | None = None
+        self._enabled = True
+
+    def __bool__(self) -> bool:
+        return self.draining
+
+    def __len__(self) -> int:
+        return 1 if self.draining else 0
+
+    @property
+    def draining(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def enqueue(
+        self, cmd_name: str, command: Command, cmd_args: str, display_text: str
+    ) -> bool:
+        if not self._enabled or self.draining:
+            return False
+        item = SideChannelItem(cmd_name, command, cmd_args, display_text)
+        self._task = asyncio.create_task(self._run(item))
+        return True
+
+    async def _run(self, item: SideChannelItem) -> None:
+        try:
+            await self._ports.invoke_command(
+                item.cmd_name, item.command, item.cmd_args, item.display_text
+            )
+        except Exception:
+            logger.exception("Side-channel command failed")
+        finally:
+            self._task = None
+
+    async def shutdown(self) -> None:
+        self._enabled = False
+        task = self._task
+        if task is None or task.done():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task

@@ -197,7 +197,7 @@ Session creation and user execution are separate:
 - `session/continue` resolves and attaches the latest eligible session;
 - `session/read`, `session/list`, and `session/history/list` are passive reads;
 - `session/fork` creates a session from an existing public boundary;
-- `session/close` flushes and closes the attached runtime;
+- `session/stop` flushes and shuts down the attached runtime;
 - `turn/start` begins structured user input and may mark harness instructions as
   injected so they remain hidden from public history;
 - `turn/steer` adds input to the active turn; and
@@ -236,10 +236,19 @@ assignment from the first rendered prompt.
 - public session metadata;
 - a page of public history;
 - currently open callback entries; and
-- the active or most recently terminal turn.
+- the active or most recently terminal turn; and
+- the current model-provider retry, including its turn, category, and technical
+  detail.
 
 It is not the private persistence format and is not sufficient to reconstruct
 the engine. Only the server reads session files.
+
+The optional `retrying` value is present only while the current live turn is
+waiting to retry a model request. The server sets it before announcing the
+retry and clears it before resumed model output, terminal turn state,
+interruption, shutdown, or session replacement. Other projection changes,
+including session metadata and statistics updates, preserve it. The public retry
+state currently includes only the turn ID, retry category, and technical detail.
 
 Within a session, public history is an append-only timeline of these closed
 variants:
@@ -268,7 +277,10 @@ their async stream and projects only client-relevant semantics. It does not
 mirror every core event into a second private hierarchy.
 
 Projection-changing notifications carry a positive, monotonic event ID scoped
-to the session. The snapshot's `eventId` is its watermark. The client reducer:
+to one loaded session runtime. A restored runtime may begin a new sequence and
+its subscription snapshot replaces the earlier projection and watermark. A
+subscription never promises replay of events from an earlier connection or
+process. The snapshot's `eventId` is its watermark. The client reducer:
 
 1. ignores IDs at or below the watermark;
 2. accepts only the next ID;
@@ -279,6 +291,16 @@ The core notification families are `session/snapshot`, session handoffs,
 `session/updated`, `history/entryAdded`, `history/entryUpdated`,
 `turn/started`, `turn/completed`, and `session/statsUpdated`. Warnings, errors,
 and resource notifications remain typed rather than using a generic envelope.
+
+Retry-state changes use numbered `session/snapshot` notifications and therefore
+share the session event watermark. A live same-session snapshot contains a
+bounded latest history and turn page. Reducers retain an already-loaded
+contiguous prefix when that page overlaps it, while explicit resyncs and session
+handoffs still replace state. The unnumbered `turn/retrying` notification remains
+temporarily because the ACP/VS Code path and previously released clients may
+still depend on it. New reducers derive retry presentation from
+`PublicSessionState.retrying` and do not keep a second local retry value from that
+compatibility notification.
 
 ## Callbacks and client participation
 
@@ -308,7 +330,11 @@ instead of silently switching ownership or implementation.
 
 ## Server-owned resources
 
-State outside the main timeline uses typed resource families. Current families
+State outside the main timeline uses typed resource families. Live-session
+configuration mutations such as agent switching, settings updates, config
+writes, and config reloads are applied through the selected session backend;
+the app server remains responsible for their typed Host API and public result.
+Current resource families
 include runtime/config, agents, skills, tools, MCP, connectors, diagnostics,
 statistics, session logs, scheduled loops, workspace trust and prompt
 preparation, account, feedback, narration, review, telemetry, shell, and Vibe
@@ -356,15 +382,18 @@ session loader, tool execution path, or extension lifecycle.
 
 The in-process harness can replace a failed memory connection. The client
 initializes the new connection, resumes the attached session, replaces its
-projection from the returned snapshot, and receives still-open callbacks. Stdio
-EOF closes its server process; process restart uses normal persisted-session
-resume semantics and does not imply restoration of in-flight execution.
+projection from the returned snapshot, receives still-open callbacks, and sees
+the current retry state when the live turn is waiting to retry. Stdio EOF closes
+its server process; process restart uses normal persisted-session resume
+semantics and does not restore an in-flight turn or its retry state.
 
-A successful `session/close` is the delivery surface's durability and cleanup
-boundary. The server records eligible last-session state, flushes session-owned
-data, closes child runtimes, interrupts or rejects pending work, and releases
-owned runtime resources such as MCP clients, model backends, experiments,
-managed terminals, Vibe Code operations, and telemetry before shutdown finishes.
+Transport detachment only removes that connection's subscriptions and callback
+claims. A successful `session/stop` is the delivery surface's durability and
+runtime-cleanup boundary. The server records eligible last-session state,
+flushes session-owned data, closes child runtimes, interrupts or rejects pending
+work, and releases owned runtime resources such as MCP clients, model backends,
+experiments, managed terminals, Vibe Code operations, and telemetry before
+shutdown finishes.
 
 Security rules:
 
@@ -411,6 +440,8 @@ Security rules:
   validated response lifecycles.
 - Return or notify canonical resource state after mutations rather than
   maintaining client/server shadow state.
+- Derive retry presentation from `PublicSessionState.retrying`; do not maintain
+  a client-local retry lifecycle.
 - Keep blocking serialization, file I/O, subprocess work, and discovery off the
   shared UI event loop.
 

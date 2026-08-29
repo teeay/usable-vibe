@@ -4,7 +4,7 @@ Where the full-screen UI renders tool result bodies as Textual widgets
 (``get_result_widget`` in ``tool_widgets.py``), native scroll commits the same
 semantic inputs as Rich renderables straight into the host terminal's
 scrollback. These renderers build from the typed result models
-(:class:`BashResult`, :class:`EditResult`, :class:`AskUserQuestionResult`),
+(:class:`CapturedShellResult`, :class:`EditResult`, :class:`AskUserQuestionResult`),
 never by scraping a completed widget, so they are the durable rendering
 architecture for tool output. Disposable agent tool output
 (``bash``/``read_file``/``grep``) is shortened by default for terminal readability;
@@ -36,7 +36,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from vibe.core.tools.builtins.ask_user_question import AskUserQuestionResult
-from vibe.core.tools.builtins.bash import BashResult
+from vibe.core.tools.builtins.bash import CapturedShellResult
 from vibe.core.tools.builtins.edit import EditResult
 from vibe.core.tools.builtins.experimental_bash import (
     BashLogFileResult,
@@ -80,7 +80,7 @@ def render_result_body(
     """
     body: RenderableType | None
     match (tool_name, result):
-        case ("bash", BashResult()):
+        case ("bash", CapturedShellResult()):
             body = _render_bash_result(
                 result, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
             )
@@ -146,7 +146,7 @@ def render_manual_bash_body(
 
 
 def _render_bash_result(
-    result: BashResult, *, shorten: bool, head_lines: int, tail_lines: int
+    result: CapturedShellResult, *, shorten: bool, head_lines: int, tail_lines: int
 ) -> RenderableType:
     output = _combined_output(result.stdout, result.stderr)
     return _render_terminal_output(
@@ -157,9 +157,11 @@ def _render_bash_result(
 def _render_experimental_bash_result(
     result: ExperimentalBashResult, *, shorten: bool, head_lines: int, tail_lines: int
 ) -> RenderableType:
-    output = _combined_output(result.stdout, result.stderr) or result.output.strip("\n")
     return _render_terminal_output(
-        output, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
+        result.output.strip("\n"),
+        shorten=shorten,
+        head_lines=head_lines,
+        tail_lines=tail_lines,
     )
 
 

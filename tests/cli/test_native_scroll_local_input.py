@@ -54,6 +54,7 @@ async def test_queued_prompt_is_live_not_hidden() -> None:
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()  # drop the startup-header baseline
+        app._queue.set_paused(True)
         await app._queue.enqueue_prompt("queued one")
         await pilot.pause()
 
@@ -71,6 +72,7 @@ async def test_queue_header_tracks_pause_resume() -> None:
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
+        app._queue.set_paused(True)
         await app._queue.enqueue_prompt("one")
         await pilot.pause()
 
@@ -94,6 +96,7 @@ async def test_queue_pop_removes_live_widget_without_committing() -> None:
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()  # drop the startup-header baseline
+        app._queue.set_paused(True)
         await app._queue.enqueue_prompt("first")
         await app._queue.enqueue_prompt("second")
         await pilot.pause()
@@ -118,6 +121,7 @@ async def test_queued_bash_widget_is_live_in_live_queue() -> None:
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()  # drop the startup-header baseline
+        app._queue.set_paused(True)
         await app._queue.enqueue_bash("echo hi", app.app_server.cwd)
         await pilot.pause()
 

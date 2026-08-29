@@ -79,7 +79,7 @@ from vibe.core.hooks.models import (
     HookRunStartEvent,
     HookType,
 )
-from vibe.core.tools.builtins.bash import BashResult
+from vibe.core.tools.builtins.bash import CapturedShellResult
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIDataAdapter
 from vibe.core.types import (
     AgentProfileChangedEvent,
@@ -660,11 +660,8 @@ class ScrollbackCommitter:
         output = ShellEffectOutput.model_validate(state.output)
         return render_result_body(
             "bash",
-            BashResult(
-                command=command,
-                stdout=output.stdout,
-                stderr=output.stderr,
-                returncode=0,
+            CapturedShellResult(
+                command=command, stdout=output.stdout, stderr=output.stderr, exit_code=0
             ),
             dark=self._dark(),
             ansi=self._ansi(),

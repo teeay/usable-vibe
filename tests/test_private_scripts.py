@@ -41,18 +41,18 @@ def _fork_env() -> dict[str, str]:
 def test_release_version_uses_integer_fourth_segment() -> None:
     script = (
         "source private/scripts/_lib.sh\n"
-        "release_version_for_counter v2.24.1 13\n"
-        "next_release_counter 13\n"
+        "release_version_for_counter v2.24.4 14\n"
+        "next_release_counter 14\n"
     )
 
     result = _run_private_script(script)
 
     assert result.returncode == 0
-    assert result.stdout.splitlines() == ["2.24.1.13", "14"]
+    assert result.stdout.splitlines() == ["2.24.4.14", "15"]
 
 
 def test_release_version_rejects_zero_padded_counter() -> None:
-    script = "source private/scripts/_lib.sh\nrelease_version_for_counter v2.24.1 005\n"
+    script = "source private/scripts/_lib.sh\nrelease_version_for_counter v2.24.4 005\n"
 
     result = _run_private_script(script)
 
@@ -139,7 +139,7 @@ def test_patch_pyproject_adds_release_project_icon_url(tmp_path: Path) -> None:
             "DOCS_URL": "https://teeay.dev/oss/uvibe",
             "ICON_URL": "https://teeay.dev/images/oss/usable-vibe-icon.png",
             "UPSTREAM_DISPLAY": "Mistral Vibe",
-            "FORK_VERSION": "2.24.1.13",
+            "FORK_VERSION": "2.24.4.14",
         },
         text=True,
     )
@@ -161,13 +161,13 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
             """\
             [project]
             name = "uvibe"
-            version = "2.24.1"
+            version = "2.24.4"
             """
         ),
         encoding="utf-8",
     )
     (tmp_path / "vibe" / "__init__.py").write_text(
-        '__version__ = "2.24.1"\n', encoding="utf-8"
+        '__version__ = "2.24.4"\n', encoding="utf-8"
     )
     (tmp_path / "tests" / "acp" / "test_initialize.py").write_text(
         "from vibe import __version__\n"
@@ -177,8 +177,8 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
     (tmp_path / "distribution" / "zed" / "extension.toml").write_text(
         dedent(
             """\
-            version = "2.24.1"
-            archive = "https://example.test/releases/download/v2.24.1/vibe-acp-darwin-aarch64-2.24.1.zip"
+            version = "2.24.4"
+            archive = "https://example.test/releases/download/v2.24.4/vibe-acp-darwin-aarch64-2.24.4.zip"
             """
         ),
         encoding="utf-8",
@@ -192,7 +192,7 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
             str(REPO_ROOT),
             "python",
             str(REPO_ROOT / "private/scripts/set_release_version.py"),
-            "2.24.1.13",
+            "2.24.4.14",
             "--root",
             str(tmp_path),
         ],
@@ -203,11 +203,11 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
     )
 
     assert result.returncode == 0, result.stderr
-    assert 'version = "2.24.1.13"' in (tmp_path / "pyproject.toml").read_text(
+    assert 'version = "2.24.4.14"' in (tmp_path / "pyproject.toml").read_text(
         encoding="utf-8"
     )
     assert (tmp_path / "vibe" / "__init__.py").read_text(encoding="utf-8") == (
-        '__version__ = "2.24.1.13"\n'
+        '__version__ = "2.24.4.14"\n'
     )
     assert "version=__version__" in (
         tmp_path / "tests" / "acp" / "test_initialize.py"
@@ -215,9 +215,9 @@ def test_set_release_version_accepts_acp_initialize_version_binding(
     zed_extension = (tmp_path / "distribution" / "zed" / "extension.toml").read_text(
         encoding="utf-8"
     )
-    assert 'version = "2.24.1.13"' in zed_extension
-    assert "releases/download/v2.24.1.13" in zed_extension
-    assert "-2.24.1.13.zip" in zed_extension
+    assert 'version = "2.24.4.14"' in zed_extension
+    assert "releases/download/v2.24.4.14" in zed_extension
+    assert "-2.24.4.14.zip" in zed_extension
 
 
 def test_set_release_version_allows_removed_acp_initialize_test(tmp_path: Path) -> None:
@@ -228,19 +228,19 @@ def test_set_release_version_allows_removed_acp_initialize_test(tmp_path: Path) 
             """\
             [project]
             name = "uvibe"
-            version = "2.24.1"
+            version = "2.24.4"
             """
         ),
         encoding="utf-8",
     )
     (tmp_path / "vibe" / "__init__.py").write_text(
-        '__version__ = "2.24.1"\n', encoding="utf-8"
+        '__version__ = "2.24.4"\n', encoding="utf-8"
     )
     (tmp_path / "distribution" / "zed" / "extension.toml").write_text(
         dedent(
             """\
-            version = "2.24.1"
-            archive = "https://example.test/releases/download/v2.24.1/vibe-acp-darwin-aarch64-2.24.1.zip"
+            version = "2.24.4"
+            archive = "https://example.test/releases/download/v2.24.4/vibe-acp-darwin-aarch64-2.24.4.zip"
             """
         ),
         encoding="utf-8",
@@ -254,7 +254,7 @@ def test_set_release_version_allows_removed_acp_initialize_test(tmp_path: Path) 
             str(REPO_ROOT),
             "python",
             str(REPO_ROOT / "private/scripts/set_release_version.py"),
-            "2.24.1.13",
+            "2.24.4.14",
             "--root",
             str(tmp_path),
         ],
@@ -265,11 +265,11 @@ def test_set_release_version_allows_removed_acp_initialize_test(tmp_path: Path) 
     )
 
     assert result.returncode == 0, result.stderr
-    assert 'version = "2.24.1.13"' in (tmp_path / "pyproject.toml").read_text(
+    assert 'version = "2.24.4.14"' in (tmp_path / "pyproject.toml").read_text(
         encoding="utf-8"
     )
     assert (tmp_path / "vibe" / "__init__.py").read_text(encoding="utf-8") == (
-        '__version__ = "2.24.1.13"\n'
+        '__version__ = "2.24.4.14"\n'
     )
 
 
@@ -545,6 +545,12 @@ def test_rebrand_rewrites_existing_prompt_markdown_dynamically() -> None:
     )
 
     assert "find vibe/core/prompts -maxdepth 1 -type f -name '*.md'" in rebrand_script
+    assert 'grep -vF ":You are ${PROMPT_DISPLAY_NAME},"' in rebrand_script
+    assert "tests/test_system_prompt.py" in rebrand_script
+    assert "You are ${UPSTREAM_DISPLAY}, an interactive coding agent." in rebrand_script
+    assert (
+        "You are ${PROMPT_DISPLAY_NAME}, an interactive coding agent." in rebrand_script
+    )
     assert "cli_2026-06_emoji.md" not in rebrand_script
 
 
@@ -592,10 +598,12 @@ def test_rebrand_display_test_targets_match_current_tree() -> None:
         encoding="utf-8"
     )
 
+    assert "vibe/app_server/stdio.py" in rebrand_script
     assert "tests/core/auth/test_mcp_oauth.py" in rebrand_script
     assert "tests/acp/test_initialize.py" not in rebrand_script
     assert "tests/core/experiments/test_system_prompt_variant.py" not in rebrand_script
     assert "tests/core/test_mcp_oauth.py" not in rebrand_script
+    assert (REPO_ROOT / "vibe" / "app_server" / "stdio.py").is_file()
     assert (REPO_ROOT / "tests" / "core" / "auth" / "test_mcp_oauth.py").is_file()
 
 

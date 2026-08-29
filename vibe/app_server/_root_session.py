@@ -15,11 +15,13 @@ from vibe.app_server.models import (
     PublicCheckpointEntry,
     PublicEntryGenerationStatus,
     PublicHistoryEntry,
+    PublicRetryState,
     PublicSessionState,
     PublicTurn,
     SessionLogSummary,
 )
 from vibe.core.agent_loop import AgentLoop
+from vibe.observability.logging import logger
 
 
 class SessionResources(Protocol):
@@ -101,7 +103,18 @@ class RootSessionCoordinator:
         )
 
     def replace_from_core(self) -> None:
-        self._history.replace(project_history(self._agent_loop))
+        # Runs after an in-place resume has committed, so it must not raise:
+        # malformed stored messages can make project_history throw beyond the
+        # ValidationError it already tolerates. Degrade to an empty history.
+        try:
+            history = project_history(self._agent_loop)
+        except Exception:
+            logger.exception(
+                "Failed to project history while refreshing resumed session_id=%s",
+                self._agent_loop.session_id,
+            )
+            history = []
+        self._history.replace(history)
         self._handoffs.clear()
         self._resources.restore_loops()
 
@@ -115,8 +128,8 @@ class RootSessionCoordinator:
         *,
         current_history: list[PublicHistoryEntry],
         callbacks: list[PublicCallbackEntry],
-        active_turn: PublicTurn | None,
-        completed_turns: list[PublicTurn],
+        turns: list[PublicTurn],
+        retrying: PublicRetryState | None,
         history_limit: int,
         turns_limit: int | None = None,
         include_history: bool = True,
@@ -127,8 +140,8 @@ class RootSessionCoordinator:
             history=self._history.base,
             current_history=current_history,
             callbacks=callbacks,
-            active_turn=active_turn,
-            completed_turns=completed_turns,
+            turns=turns,
+            retrying=retrying,
             history_limit=history_limit,
             turns_limit=turns_limit,
             include_history=include_history,
@@ -153,8 +166,8 @@ class RootSessionCoordinator:
         state = self.public_state(
             current_history=current_history,
             callbacks=callbacks,
-            active_turn=active_turn,
-            completed_turns=completed_turns,
+            turns=[*completed_turns, active_turn],
+            retrying=None,
             history_limit=history_limit,
         )
         return SessionHandoff(
@@ -279,8 +292,8 @@ class RootSessionCoordinator:
         return self.public_state(
             current_history=[],
             callbacks=[],
-            active_turn=None,
-            completed_turns=[],
+            turns=[],
+            retrying=None,
             history_limit=history_limit,
         )
 

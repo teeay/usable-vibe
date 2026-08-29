@@ -16,7 +16,6 @@ from tests.skills.conftest import create_skill
 from vibe.app_server.models import CompletedEffectState, PublicEffectEntry
 from vibe.cli.textual_ui.app import VibeApp
 from vibe.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
-from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 
 SKILL_BODY = "## Instructions\n\nDo the thing."
 
@@ -242,19 +241,16 @@ async def test_queued_head_skill_injects_skill_tool_message(
             lambda: (
                 len(vibe_app_with_skills._input_queue) == 0
                 and vibe_app_with_skills._agent_task is None
-                and any(
-                    widget._tool_name == "skill"
-                    for widget in vibe_app_with_skills.query(ToolCallMessage)
-                )
-                and any(
-                    widget.tool_name == "skill"
-                    for widget in vibe_app_with_skills.query(ToolResultMessage)
-                )
+                and _skill_effect_loaded(vibe_app_with_skills, "my-skill")
+                and "Loaded skill: my-skill"
+                in committed_scrollback(vibe_app_with_skills)
             ),
             timeout=5.0,
         )
 
-        assert _skill_effect_loaded(vibe_app_with_skills, "my-skill")
+        scrollback = committed_scrollback(vibe_app_with_skills)
+        assert "/my-skill" in scrollback
+        assert "follow-up prompt" in scrollback
 
 
 @pytest.mark.asyncio
@@ -280,16 +276,15 @@ async def test_skill_prompt_flushed_before_bash_injects_skill_tool_message(
                 len(vibe_app_with_skills._input_queue) == 0
                 and vibe_app_with_skills._agent_task is None
                 and vibe_app_with_skills._bash_task is None
-                and any(
-                    widget._tool_name == "skill"
-                    for widget in vibe_app_with_skills.query(ToolCallMessage)
-                )
-                and any(
-                    widget.tool_name == "skill"
-                    for widget in vibe_app_with_skills.query(ToolResultMessage)
-                )
+                and _skill_effect_loaded(vibe_app_with_skills, "my-skill")
+                and "Loaded skill: my-skill"
+                in committed_scrollback(vibe_app_with_skills)
+                and "echo queued" in committed_scrollback(vibe_app_with_skills)
             ),
             timeout=5.0,
         )
 
-        assert _skill_effect_loaded(vibe_app_with_skills, "my-skill")
+        scrollback = committed_scrollback(vibe_app_with_skills)
+        assert scrollback.index("Loaded skill: my-skill") < scrollback.index(
+            "echo queued"
+        )

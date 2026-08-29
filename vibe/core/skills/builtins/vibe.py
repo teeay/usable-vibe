@@ -69,6 +69,10 @@ When in a trusted folder, Vibe also looks for project-local configuration:
 - `.vibe/prompts/` - Project-specific prompts
 - `.agents/skills/` - Standard agent skills directory
 
+Custom Python tools will be deprecated in a future release. Recommend skills
+for new extensions. When a user asks for migration help, inspect the custom
+tool's behavior and replace it with an equivalent skill.
+
 ### AGENTS.md Discovery
 
 `AGENTS.md` files provide directory-scoped instructions to the model. At startup,
@@ -109,6 +113,29 @@ version if one exists, and exit. Initial install: `uv tool install uvibe`.
 - `uvibe --resume [SESSION_ID]`: specific session; without an id, opens a picker.
 - In-session: `/resume` (alias `/continue`).
 
+#### Session titles
+
+Each session has a `title` stored in `meta.json` (with `title_source`: `auto` or
+`manual`). A session stays untitled until a background LLM call generates a
+concise descriptive title (the `--resume` list shows a message preview until
+then). Automatic generation runs only for the interactive CLI; other clients
+(ACP, app server, programmatic) keep their own session management and fall back
+to the message preview. Title generation runs on the session's active
+model/provider — it substitutes a small fast Mistral model only when the active
+provider is already Mistral and the allowlist permits it, so titles never reach a
+new destination. The first title waits for the opening turn to finish (or a few
+model steps) so it isn't generated off a thin tool-call preamble. On that cheap
+fast model it also refreshes periodically and
+after each compaction; when it falls back to the (possibly expensive) active
+model it stays bounded — one title at the start plus one after a compaction, a
+couple at most — so a large model isn't re-invoked every few turns. The refresh
+keeps the opening intent and the latest exchange in view and feeds the previous
+title back so it refines rather than restarts. `/rename <title>` sets a `manual`
+title that auto-generation never overwrites. Set `session_logging.generate_titles
+= false` to turn automatic titles off (the `--resume` list and tab then use the
+message preview). The current title also drives the terminal tab/window title
+(OSC), updated on rename, auto-title changes, and resume; it never blocks a turn.
+
 #### Session storage & folder scoping
 
 Local sessions are written under `~/.vibe/logs/session/` (override with
@@ -143,6 +170,7 @@ autocopy_to_clipboard = true  # Enable automatic copying of selected text to cli
 file_watcher_for_autocomplete = false
 ask_confirmation_on_exit = true  # Require a second Ctrl+D to quit (Ctrl+C always confirms)
 show_greeting = true  # Show "Hello {name}" greeting below the banner at startup (Mistral providers, once per 24h)
+log_level = "WARNING"  # Optional. DEBUG | INFO | WARNING | ERROR | CRITICAL — log level for ~/.uvibe/logs/vibe.log
 native_scroll_shorten_tool_output = true       # Shorten long agent bash/read/grep output
 native_scroll_tool_output_head_lines = 3       # Leading output lines to keep
 native_scroll_tool_output_tail_lines = 3       # Trailing output lines to keep
@@ -186,8 +214,8 @@ active_tts_model = "voxtral-tts"
 
 Set `enable_otel = true` to export traces for agent, model, and tool operations
 over OTLP/HTTP. `enable_telemetry` must also be enabled. With no explicit
-endpoint, Vibe uses the configured Mistral provider's telemetry endpoint and API
-key.
+endpoint, Vibe derives the telemetry endpoint and API key from the configured
+Mistral provider, except public regional API hosts that do not serve telemetry.
 
 To use another collector, set `otel_endpoint` to its base URL; Vibe appends
 `/v1/traces`. Configure custom-collector authentication through the standard
@@ -445,6 +473,12 @@ Mistral connectors are auto-discovered when the active provider is Mistral
 and the API key env var is set. Toggle the master switch or hide individual
 connectors / tools:
 
+The legacy backend keeps a discovered connector disabled until it has an
+explicit `[[connectors]]` entry. The Unified backend selected with
+`--experimental-harness` enables ready connectors by default in memory. It
+does not write that default to TOML, and the master switch plus explicit
+connector, tool, allowlist, and denylist settings always take precedence.
+
 ```toml
 enable_connectors = true          # Master switch (default: true)
 
@@ -464,6 +498,7 @@ disabled_tools = ["delete_issue"] # Hide selected tools only
 enabled = true
 save_dir = ""                     # Defaults to ~/.vibe/logs/session
 session_prefix = "session"
+generate_titles = true            # Background LLM session titles; false uses the message preview
 ```
 
 ### Browser Sign-In
@@ -579,7 +614,7 @@ discriminated by `hook_event_name`:
  "tool_name": "bash", "tool_call_id": "call_42",
  "tool_input": {"command": "ls"},
  "tool_status": "success",         // success | failure | cancelled
- "tool_output": {"stdout": "..."},  // structured result (success/cancelled); null otherwise
+ "tool_output": {"output": "..."},  // the tool's serialized result (success/cancelled); null otherwise
  "tool_output_text": "...",         // current text the LLM will see; mutable by prior hooks
  "tool_error": null,                // populated on failure/skipped
  "duration_ms": 42.5}
@@ -733,9 +768,18 @@ Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
 - `/reload` - Reload configuration, agent instructions, and skills from disk
 - `/clear`, `/new` - Start a new conversation. Optionally pass a prompt to seed it
 - `/log` - Show path to current interaction log file
+- `/log-level` - Show or set the log level. `/log-level` prints the full chain
+  (session, env, config, effective); `/log-level set <LEVEL>` sets a
+  process-lifetime override; `/log-level set-global <LEVEL>` also persists to
+  config.toml; `/log-level unset` clears the session override. LEVEL is one of
+  DEBUG, INFO, WARNING, ERROR, CRITICAL.
 - `/debug` - Toggle debug console
 - `/compact` - Compact model context by summarizing. The session ID and visible
-  conversation stay intact.
+  conversation stay intact; the auto title is refreshed to reflect the
+  compacted conversation (unless renamed manually).
+- `/rename <title>` - Set a manual session title. Persists to `meta.json`
+  (`title_source=manual`), updates the terminal tab title, and is never
+  overwritten by automatic title generation.
 - `/retry [additional instructions]` - Continue a model response interrupted by
   a backend error without repeating text already shown. Optional instructions
   are passed to the model for the continuation. Relevant error messages also
@@ -833,11 +877,33 @@ Image attachments:
 
 Messages submitted while the agent or a `!`-bash command is running are
 queued instead of cancelling the in-flight work, and drain in FIFO order
-once the job finishes. Prompts (plain, `/skill ...`, `@`-mentions) and
-`!bash` commands can be queued; slash commands and `&teleport` are
-rejected with a toast. **Ctrl+C** pops the last queued item (LIFO);
-**Esc** interrupts the running job and pauses the queue; pressing Enter
-(empty or not) on a paused queue resumes draining.
+once the job finishes. Prompts (plain, `/skill ...`, `@`-mentions),
+`!bash` commands, and non-side-channel slash commands can be queued;
+`&teleport` is rejected with a toast. **Ctrl+C** pops the last queued
+item (LIFO); **Esc** interrupts the running job and pauses the queue;
+pressing Enter (empty or not) on a paused queue resumes draining.
+
+Allowlisted slash commands (`side_channel=True`) run immediately via a
+side channel while the agent or bash is busy — they open pickers,
+display info, or apply visual changes without waiting. Only one
+side-channel command runs at a time. Commands that persist config
+changes (theme, model, thinking, voice, proxy) enqueue the persist
+step on the main queue as a `COMMAND` item with a callable payload;
+the queue drains when idle, so config writes never conflict.
+
+Commands not on the side-channel allowlist (e.g. `/clear`, `/compact`,
+`/rewind`, `/resume`, `/reload`, `/leanstall`, `/unleanstall`, `/teleport`,
+`/remote-project`, `/retry`) are enqueued on the main queue and execute
+when the session is idle.
+
+While the queue is non-empty and the agent is busy, pressing **Up**
+enters queue selection mode: the last queued item is highlighted and
+the input is locked (no cursor, no typing). **Up/Down** navigate
+between queued items, **Enter** loads the selected item into the input
+for editing (press Enter again to update it in-place), **Backspace**
+or **Delete** removes the selected item and moves selection to the
+next, and **Esc** exits selection mode and restores the original
+input text.
 
 ## Skills System
 
@@ -893,9 +959,9 @@ offered inline, and no popup is shown.
 - `MISTRAL_API_KEY` - API key for Mistral provider
 - `VIBE_ACTIVE_MODEL` - Override active model
 - `VIBE_*` - Any config field can be overridden with the `VIBE_` prefix
-- `LOG_LEVEL` - Logging level for `$UVIBE_HOME/logs/vibe.log`. One of `DEBUG`,
-  `INFO`, `WARNING` (default), `ERROR`, `CRITICAL`. Invalid values fall back
-  to `WARNING`.
+- `LOG_LEVEL` - Overrides `log_level` config for `$UVIBE_HOME/logs/vibe.log`.
+  One of `DEBUG`, `INFO`, `WARNING` (default), `ERROR`, `CRITICAL`. Invalid values
+  fall back to `WARNING`. Use `/log-level` to change at runtime.
 - `LOG_MAX_BYTES` - Max size in bytes of `vibe.log` before rotation
   (default: `10485760`, i.e. 10 MiB).
 - `DEBUG_MODE` - When `true`, forces `DEBUG`-level logging. Under `uvibe-acp`
