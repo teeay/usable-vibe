@@ -47,6 +47,7 @@ class LegacyCommittedHistory:
     reference: LegacySessionReference
     store_revision: str
     history: list[dict[str, JsonValue]]
+    active_model: str | None = None
 
     @property
     def session_id(self) -> str:
@@ -131,8 +132,19 @@ def export_legacy_committed_history(
             f"Legacy session history is invalid: {session_id}: {exc}"
         ) from exc
     return LegacyCommittedHistory(
-        reference=reference, store_revision=revision, history=history
+        reference=reference,
+        store_revision=revision,
+        history=history,
+        active_model=_active_model_from_metadata(metadata),
     )
+
+
+def _active_model_from_metadata(metadata: dict[str, Any]) -> str | None:
+    config = metadata.get("config")
+    if not isinstance(config, dict):
+        return None
+    active_model = config.get("active_model")
+    return active_model if isinstance(active_model, str) and active_model else None
 
 
 def import_unified_committed_history(
@@ -298,6 +310,7 @@ def _export_image_content(
     image: ImageAttachment, session_dir: Path
 ) -> dict[str, JsonValue]:
     source = image.source
+    file_fallback: dict[str, JsonValue] | None = None
     if isinstance(source, InlineImageSource):
         data = source.data
     elif isinstance(source, FileImageSource):
@@ -310,9 +323,15 @@ def _export_image_content(
             raise InvalidLegacyInteropSourceError(
                 f"Cannot read persisted image {image.alias!r}: {exc}"
             ) from exc
+        file_fallback = {"type": "file", "name": image.alias}
     else:
         raise InvalidLegacyInteropSourceError("Unknown persisted image source")
-    return {"type": "image", "data": data, "mimeType": image.mime_type}
+    return {
+        "type": "image",
+        "data": data,
+        "mimeType": image.mime_type,
+        **({"file_fallback": file_fallback} if file_fallback is not None else {}),
+    }
 
 
 def _export_resource_content(resource: Any) -> dict[str, JsonValue]:

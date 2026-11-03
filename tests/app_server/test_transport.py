@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 from contextlib import suppress
 from io import BytesIO
 import json
+import os
+from pathlib import Path
 import socket
+import sys
 from threading import Event
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -58,6 +63,43 @@ class CountingWriter(BytesIO):
         super().flush()
 
 
+def test_stdio_main_neutralizes_stdout_after_serving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    neutralized = False
+
+    def run(coroutine: Any) -> None:
+        coroutine.close()
+
+    def neutralize_stdout() -> None:
+        nonlocal neutralized
+        neutralized = True
+
+    monkeypatch.setattr(
+        stdio,
+        "parse_arguments",
+        lambda: argparse.Namespace(
+            experimental_harness=False,
+            legacy_harness=False,
+            multiplex=False,
+            additional_builtin_plugin_roots=[],
+        ),
+    )
+    monkeypatch.setattr(stdio, "init_harness_files_manager", lambda *_: None)
+    monkeypatch.setattr(stdio, "init_file_logging", lambda _: None)
+    monkeypatch.setattr(stdio.asyncio, "run", run)
+    monkeypatch.setattr(stdio, "_neutralize_stdout", neutralize_stdout)
+    monkeypatch.setattr("vibe.core.config.load_dotenv_values", lambda: None)
+    monkeypatch.setattr(
+        "vibe.core.utils.windows_asyncio.silence_proactor_transport_teardown_warnings",
+        lambda: None,
+    )
+
+    stdio.main()
+
+    assert neutralized
+
+
 @pytest.mark.asyncio
 async def test_stdio_server_creates_the_harness_behind_its_transport(
     monkeypatch: pytest.MonkeyPatch,
@@ -73,7 +115,12 @@ async def test_stdio_server_creates_the_harness_behind_its_transport(
     assert call is not None
     args, kwargs = call
     assert isinstance(args[0], StdioJsonRpcTransport)
-    assert kwargs == {"transport_kind": "stdio", "experimental_harness": False}
+    assert kwargs == {
+        "transport_kind": "stdio",
+        "experimental_harness": False,
+        "legacy_harness": False,
+        "additional_builtin_plugin_roots": (),
+    }
     harness.serve.assert_awaited_once_with()
 
 
@@ -92,7 +139,35 @@ async def test_stdio_server_forwards_experimental_harness_selection(
     call = factory.await_args
     assert call is not None
     _, kwargs = call
-    assert kwargs == {"transport_kind": "stdio", "experimental_harness": True}
+    assert kwargs == {
+        "transport_kind": "stdio",
+        "experimental_harness": True,
+        "legacy_harness": False,
+        "additional_builtin_plugin_roots": (),
+    }
+
+
+def test_stdio_arguments_collect_every_builtin_plugin_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "vibe-app-server",
+            "--additional-builtin-plugin-root",
+            "/bundle/plugins",
+            "--additional-builtin-plugin-root",
+            "/bundle/more-plugins",
+        ],
+    )
+
+    arguments = stdio.parse_arguments()
+
+    assert arguments.additional_builtin_plugin_roots == [
+        Path("/bundle/plugins"),
+        Path("/bundle/more-plugins"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -183,6 +258,30 @@ async def test_stdio_transport_bounds_pending_output() -> None:
     assert messages == [{"id": 1}, {"id": 2}, {"id": 3}]
 
 
+@pytest.mark.asyncio
+async def test_stdio_transport_batches_messages_queued_behind_a_write() -> None:
+    writer = BlockingWriter()
+    transport = StdioJsonRpcTransport(BytesIO(), writer, outbox_size=8)
+    writes: list[bytes] = []
+    write = writer.write
+
+    def record(data: bytes) -> int:
+        writes.append(data)
+        return write(data)
+
+    writer.write = record  # type: ignore[method-assign]
+    await transport.send({"id": 1})
+    assert await asyncio.to_thread(writer.started.wait, 1)
+    for index in range(2, 6):
+        await transport.send({"id": index})
+    writer.release.set()
+    await asyncio.wait_for(transport.close(), timeout=1)
+
+    assert [len(data.splitlines()) for data in writes] == [1, 4]
+    messages = [json.loads(line) for line in writer.output.getvalue().splitlines()]
+    assert messages == [{"id": index} for index in range(1, 6)]
+
+
 def test_stdio_transport_rejects_unbounded_outbox() -> None:
     with pytest.raises(ValueError, match="outbox_size must be positive"):
         StdioJsonRpcTransport(BytesIO(), BytesIO(), outbox_size=0)
@@ -242,6 +341,11 @@ async def test_stdio_transport_close_is_idempotent() -> None:
 @pytest.mark.asyncio
 async def test_stdio_server_uses_the_same_json_rpc_lifecycle() -> None:
     agent_loop = build_test_agent_loop()
+    client_socket, server_socket = socket.socketpair()
+    client_reader = client_socket.makefile("rb")
+    client_writer = client_socket.makefile("wb")
+    server_reader = server_socket.makefile("rb")
+    server_writer = server_socket.makefile("wb")
 
     async def open_root(_request: RootOpenRequest):
         return agent_loop
@@ -270,23 +374,54 @@ async def test_stdio_server_uses_the_same_json_rpc_lifecycle() -> None:
             "params": {"sessionId": agent_loop.session_id},
         },
     ]
-    reader = BytesIO(
-        b"".join(json.dumps(message).encode() + b"\n" for message in input_messages)
-    )
-    output = BytesIO()
-
-    await create_legacy_app_server(
-        StdioJsonRpcTransport(reader, output),
+    server = create_legacy_app_server(
+        StdioJsonRpcTransport(server_reader, server_writer),
         open_root=open_root,
         transport_kind="stdio",
-    ).serve()
+    )
+    serve_task = asyncio.create_task(server.serve())
 
-    responses = [json.loads(line) for line in output.getvalue().splitlines()]
+    async def send(message: dict[str, object]) -> None:
+        await asyncio.to_thread(
+            client_writer.write, json.dumps(message).encode() + b"\n"
+        )
+        await asyncio.to_thread(client_writer.flush)
+
+    async def receive() -> dict[str, Any]:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(client_reader.readline), timeout=2
+        )
+        return json.loads(raw)
+
+    try:
+        await send(input_messages[0])
+        responses = [await receive()]
+        await send(input_messages[1])
+        await send(input_messages[2])
+        responses.append(await receive())
+        await send(input_messages[3])
+        responses.append(await receive())
+        client_socket.shutdown(socket.SHUT_WR)
+        await asyncio.wait_for(serve_task, timeout=2)
+    finally:
+        if not serve_task.done():
+            serve_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await serve_task
+        for sock in (client_socket, server_socket):
+            with suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        for stream in (client_reader, client_writer, server_reader, server_writer):
+            stream.close()
+        client_socket.close()
+        server_socket.close()
+
     assert responses[0]["result"] == {
         "serverInfo": {
             "name": "vibe-app-server",
             "version": responses[0]["result"]["serverInfo"]["version"],
-        }
+        },
+        "processId": os.getpid(),
     }
     assert responses[1]["result"]["state"]["session"]["id"] == (agent_loop.session_id)
     assert responses[2]["result"]["state"]["session"]["id"] == (agent_loop.session_id)

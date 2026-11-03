@@ -38,9 +38,16 @@ from mistralai.client.models import (
 from mistralai.client.utils.retries import BackoffStrategy, RetryConfig
 from mistralai.extra.observability.telemetry import configure_telemetry
 
+from vibe.core.config._defaults import (
+    DEFAULT_API_CONNECT_TIMEOUT,
+    DEFAULT_API_POOL_TIMEOUT,
+    DEFAULT_API_RETRY_MAX_ELAPSED_TIME,
+    DEFAULT_API_TIMEOUT,
+    DEFAULT_API_WRITE_TIMEOUT,
+)
 from vibe.core.llm.backend._image import to_data_uri as _to_data_uri
 from vibe.core.llm.backend.base import MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS
-from vibe.core.llm.exceptions import BackendErrorBuilder
+from vibe.core.llm.exceptions import BackendErrorBuilder, ModelCall
 from vibe.core.types import (
     AvailableTool,
     Content,
@@ -54,7 +61,7 @@ from vibe.core.types import (
     ToolCall,
 )
 from vibe.core.utils import RetryObserver, RetryReason
-from vibe.utils.api_keys import resolve_api_key
+from vibe.utils.api_keys import resolve_api_key_with_origin
 from vibe.utils.http import (
     VibeAsyncHTTPClient,
     build_ssl_context,
@@ -68,6 +75,7 @@ logger = logging.getLogger("vibe")
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _RETRYABLE_ERRORS = (httpx.NetworkError, httpx.TimeoutException)
+_MAX_CONNECTIONS = 20
 
 
 def _log_delivery_failure(future: Future[None]) -> None:
@@ -254,23 +262,54 @@ _THINKING_TO_REASONING_EFFORT: dict[str, ReasoningEffortValue] = {
 }
 
 
+def _reasoning_effort(model: ModelConfig) -> ReasoningEffortValue | None:
+    """The wire value for the model's thinking level, if any.
+
+    "off" sends "none" only when a curated level set offers it: some hosted
+    models (the zai-glm family) reject the explicit value, and the uncurated
+    default set makes no claim about the model, so "off" leaves the field
+    unset for the server default there. Every other level keeps the
+    historical mapping.
+    """
+    if (
+        model.thinking == "off"
+        and "off" in model.thinking_levels
+        and model.thinking_levels_curated
+    ):
+        return "none"
+    return _THINKING_TO_REASONING_EFFORT.get(model.thinking)
+
+
 class MistralBackend:
     def __init__(
         self,
         provider: ProviderConfig,
-        timeout: float = 720.0,
-        retry_max_elapsed_time: float = 300.0,
+        timeout: float = DEFAULT_API_TIMEOUT,
+        retry_max_elapsed_time: float = DEFAULT_API_RETRY_MAX_ELAPSED_TIME,
+        connect_timeout: float = DEFAULT_API_CONNECT_TIMEOUT,
+        write_timeout: float = DEFAULT_API_WRITE_TIMEOUT,
+        pool_timeout: float = DEFAULT_API_POOL_TIMEOUT,
         enable_otel: bool = False,
         on_retry: RetryObserver | None = None,
     ) -> None:
         self._client: Mistral | None = None
         self._http_client: VibeAsyncHTTPClient | None = None
         self._provider = provider
+        self._transport_timeouts = {
+            "connect": connect_timeout,
+            "write": write_timeout,
+            "pool": pool_timeout,
+        }
         self._enable_otel = enable_otel
         self._on_retry = on_retry
         self._loop: asyncio.AbstractEventLoop | None = None
         self._mapper = MistralMapper()
-        self._api_key = resolve_api_key(self._provider.api_key_env_var)
+        # Key and origin from the same lookup: the client is built once from
+        # this key, so an origin re-read per call could name a source the
+        # refused credential never came from.
+        resolved = resolve_api_key_with_origin(self._provider.api_key_env_var)
+        self._api_key = resolved[0] if resolved else None
+        self._api_key_origin = resolved[1] if resolved else None
 
         reasoning_field = getattr(provider, "reasoning_field_name", "reasoning_content")
         if reasoning_field != "reasoning_content":
@@ -304,9 +343,45 @@ class MistralBackend:
             retry_connection_errors=True,
         )
 
+    async def _bound_transport_timeouts(self, request: httpx.Request) -> None:
+        """Cap connect, write and pool waits without shortening the read budget.
+
+        The SDK sends a single scalar timeout per request, which httpx expands
+        onto all four axes. A budget sized for a long model turn then also
+        governs opening a socket and acquiring a pooled connection, so an
+        unreachable host stalls for that whole budget before erroring. Each cap
+        is a ceiling rather than a value, so a caller asking for a shorter
+        overall timeout still wins on every axis.
+        """
+        timeout = dict(request.extensions.get("timeout", {}))
+        for axis, limit in self._transport_timeouts.items():
+            current = timeout.get(axis)
+            timeout[axis] = limit if current is None else min(current, limit)
+        request.extensions = {**request.extensions, "timeout": timeout}
+
     async def _on_response(self, response: httpx.Response) -> None:
-        if response.status_code in _RETRYABLE_STATUS_CODES:
-            await self._notice_retry(RetryReason.from_http_status(response.status_code))
+        """Release the connection behind a retryable response, then report it.
+
+        Streaming requests are issued with the body unread, and the SDK holds a
+        failed response alive across the retry backoff without closing it, so its
+        pooled connection stays checked out for the lifetime of the client.
+        Reading the body here returns the connection to the pool and keeps the
+        error payload available to the terminal error path.
+
+        A truncated or badly encoded body is not retryable to the SDK, so letting
+        that surface would turn a rate limit into a dead turn. Close the response
+        instead and let the retry proceed on the status code alone.
+        """
+        if response.status_code not in _RETRYABLE_STATUS_CODES:
+            return
+        try:
+            await response.aread()
+        except Exception:
+            logger.debug(
+                "Could not read the body of a %s response", response.status_code
+            )
+            await response.aclose()
+        await self._notice_retry(RetryReason.from_http_status(response.status_code))
 
     def _report_error(self, error: Exception) -> None:
         # On a worker thread inside basesdk's except block: raising would
@@ -360,8 +435,14 @@ class MistralBackend:
         self._http_client = VibeAsyncHTTPClient(
             verify=build_ssl_context(),
             follow_redirects=True,
-            event_hooks={"response": [self._on_response]},
-            limits=httpx.Limits(keepalive_expiry=MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS),
+            event_hooks={
+                "request": [self._bound_transport_timeouts],
+                "response": [self._on_response],
+            },
+            limits=httpx.Limits(
+                max_connections=_MAX_CONNECTIONS,
+                keepalive_expiry=MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+            ),
         )
         client = Mistral(
             api_key=self._api_key,
@@ -392,8 +473,18 @@ class MistralBackend:
         extra_headers: dict[str, str] | None,
         metadata: dict[str, str] | None = None,
     ) -> LLMChunk:
+        call = ModelCall(
+            provider=self._provider.name,
+            endpoint=self._server_url,
+            model=model.name,
+            messages=messages,
+            temperature=temperature,
+            has_tools=bool(tools),
+            tool_choice=tool_choice,
+            api_key_origin=self._api_key_origin,
+        )
         try:
-            reasoning_effort = _THINKING_TO_REASONING_EFFORT.get(model.thinking)
+            reasoning_effort = _reasoning_effort(model)
             response = await self._get_client().chat.complete_async(
                 model=model.name,
                 messages=[
@@ -446,27 +537,10 @@ class MistralBackend:
 
         except SDKError as e:
             raise BackendErrorBuilder.build_http_error(
-                provider=self._provider.name,
-                endpoint=self._server_url,
-                error=e,
-                response=e.raw_response,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
+                call, error=e, response=e.raw_response
             ) from e
-        except httpx.RequestError as e:
-            raise BackendErrorBuilder.build_request_error(
-                provider=self._provider.name,
-                endpoint=self._server_url,
-                error=e,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
-            ) from e
+        except (httpx.RequestError, httpx.StreamError) as e:
+            raise BackendErrorBuilder.build_request_error(call, error=e) from e
 
     async def complete_streaming(
         self,
@@ -480,8 +554,18 @@ class MistralBackend:
         extra_headers: dict[str, str] | None,
         metadata: dict[str, str] | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
+        call = ModelCall(
+            provider=self._provider.name,
+            endpoint=self._server_url,
+            model=model.name,
+            messages=messages,
+            temperature=temperature,
+            has_tools=bool(tools),
+            tool_choice=tool_choice,
+            api_key_origin=self._api_key_origin,
+        )
         try:
-            reasoning_effort = _THINKING_TO_REASONING_EFFORT.get(model.thinking)
+            reasoning_effort = _reasoning_effort(model)
 
             stream = await self._get_client().chat.stream_async(
                 model=model.name,
@@ -547,24 +631,7 @@ class MistralBackend:
 
         except SDKError as e:
             raise BackendErrorBuilder.build_http_error(
-                provider=self._provider.name,
-                endpoint=self._server_url,
-                error=e,
-                response=e.raw_response,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
+                call, error=e, response=e.raw_response
             ) from e
-        except httpx.RequestError as e:
-            raise BackendErrorBuilder.build_request_error(
-                provider=self._provider.name,
-                endpoint=self._server_url,
-                error=e,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
-            ) from e
+        except (httpx.RequestError, httpx.StreamError) as e:
+            raise BackendErrorBuilder.build_request_error(call, error=e) from e

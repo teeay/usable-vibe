@@ -21,9 +21,9 @@ from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from vibe.core.types import ToolResultEvent, ToolStreamEvent
 from vibe.utils.tool_presentation import ToolEffectKind
 
-_MAX_LISTED_FILES = 10
-_MAX_WALKED_ENTRIES = 200
-_SKIP_DIR_NAMES = frozenset({
+SAMPLED_SKILL_FILES = 10
+MAX_WALKED_SKILL_ENTRIES = 200
+SKIPPED_SKILL_DIR_NAMES = frozenset({
     ".git",
     "node_modules",
     "__pycache__",
@@ -53,26 +53,33 @@ class SkillResult(BaseModel):
     )
 
 
-def _sample_skill_files(skill_dir: Path | None) -> list[str]:
+def sample_skill_files(skill_dir: Path | None) -> list[str]:
     if skill_dir is None or not (skill_dir / "SKILL.md").is_file():
         return []
     files: list[str] = []
     try:
         for root, dirnames, filenames in os.walk(skill_dir, followlinks=False):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIR_NAMES]
+            dirnames[:] = [d for d in dirnames if d not in SKIPPED_SKILL_DIR_NAMES]
             for name in filenames:
                 if name == "SKILL.md":
                     continue
                 files.append(str(Path(root, name).relative_to(skill_dir)))
-            if len(files) >= _MAX_WALKED_ENTRIES:
+            if len(files) >= MAX_WALKED_SKILL_ENTRIES:
                 break
     except OSError:
         pass
-    return sorted(files)[:_MAX_LISTED_FILES]
+    return sorted(files)[:SAMPLED_SKILL_FILES]
 
 
-def render_skill_result(skill_info: SkillInfo, files: list[str]) -> SkillResult:
-    skill_dir = skill_info.skill_dir
+def render_skill_result(
+    skill_info: SkillInfo, files: list[str], *, base_dir: str | None = None
+) -> SkillResult:
+    """Render a skill's content block.
+
+    ``base_dir`` overrides the skill's own directory, for a skill whose files
+    the model reads somewhere else, such as a copy in a sandbox.
+    """
+    skill_dir = base_dir or skill_info.skill_dir
 
     file_lines = "\n".join(f"<file>{f}</file>" for f in files)
     base_dir_lines: list[str] = []
@@ -103,14 +110,18 @@ def render_skill_result(skill_info: SkillInfo, files: list[str]) -> SkillResult:
     )
 
 
+def already_loaded_message(name: str) -> str:
+    return (
+        f"Skill '{name}' is already loaded earlier in this "
+        "conversation. Reuse those instructions."
+    )
+
+
 def already_loaded_result(skill_info: SkillInfo) -> SkillResult:
     skill_dir = skill_info.skill_dir
     return SkillResult(
         name=skill_info.name,
-        content=(
-            f"Skill '{skill_info.name}' is already loaded earlier in this "
-            "conversation. Reuse those instructions."
-        ),
+        content=already_loaded_message(skill_info.name),
         skill_dir=None if skill_dir is None else str(skill_dir),
     )
 
@@ -120,7 +131,7 @@ async def build_skill_result(
 ) -> SkillResult:
     if already_loaded:
         return already_loaded_result(skill_info)
-    files = await asyncio.to_thread(_sample_skill_files, skill_info.skill_dir)
+    files = await asyncio.to_thread(sample_skill_files, skill_info.skill_dir)
     return render_skill_result(skill_info, files)
 
 
@@ -168,10 +179,16 @@ class Skill(
             raise ToolError("Skill manager not available")
 
         skill_manager = ctx.skill_manager
-        skill_info = skill_manager.get_skill(args.name)
+        skill_info = skill_manager.get_model_invocable_skill(args.name)
 
         if skill_info is None:
-            available = ", ".join(sorted(skill_manager.available_skills.keys()))
+            available = ", ".join(
+                sorted(
+                    name
+                    for name, skill in skill_manager.available_skills.items()
+                    if skill.model_invocable
+                )
+            )
             raise ToolError(
                 f'Skill "{args.name}" not found. Available skills: {available or "none"}'
             )

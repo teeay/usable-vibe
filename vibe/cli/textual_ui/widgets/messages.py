@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from enum import StrEnum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -36,6 +37,7 @@ from vibe.cli.textual_ui.widgets.collapsible import (
     OverflowCollapsibleSection,
     lines_label,
 )
+from vibe.cli.textual_ui.widgets.fired_loop import FiredLoop
 from vibe.cli.textual_ui.widgets.no_markup_static import (
     NoMarkupStatic,
     NonSelectableStatic,
@@ -132,6 +134,12 @@ class UserMessageAttachment(Horizontal):
                 )
 
 
+class UserMessageSeverity(StrEnum):
+    INFO = auto()
+    WARNING = auto()
+    ERROR = auto()
+
+
 class UserMessage(Static):
     PROMPT_CHAR: ClassVar[str] = ">"
     SHOW_SEPARATOR: ClassVar[bool] = True
@@ -142,13 +150,22 @@ class UserMessage(Static):
         pending: bool = False,
         history_entry_id: str | None = None,
         images: list[ImageAttachment] | None = None,
+        severity: UserMessageSeverity | None = None,
+        fired_loop: FiredLoop | None = None,
     ) -> None:
         super().__init__()
         self.add_class("user-message")
         self._content = content
         self._pending = pending
         self._images = images or []
+        self.severity = severity
         self.history_entry_id = history_entry_id
+        self.fired_loop = fired_loop
+        if severity is not None:
+            self.add_class("user-message-severity")
+            self.add_class(f"user-message-{severity.value}")
+        if fired_loop is not None:
+            self.add_class("user-message-fired-loop")
 
     def get_content(self) -> str:
         return self._content
@@ -168,15 +185,21 @@ class UserMessage(Static):
     def compose(self) -> ComposeResult:
         with Vertical(classes="user-message-wrapper"):
             with Horizontal(classes="user-message-container"):
-                yield NonSelectableStatic(
-                    f"{self.PROMPT_CHAR} ", classes="user-message-prompt"
-                )
+                if self.severity is None:
+                    yield NonSelectableStatic(
+                        f"{self.PROMPT_CHAR} ", classes="user-message-prompt"
+                    )
                 yield NoMarkupStatic(self._content, classes="user-message-content")
-            if self._images:
+            if self._images or self.fired_loop is not None:
                 with Vertical(classes="user-message-attachments"):
                     for image in self._images:
                         yield UserMessageAttachment(image)
-            if self.SHOW_SEPARATOR:
+                    if self.fired_loop is not None:
+                        yield NonSelectableStatic(
+                            self.fired_loop.label(),
+                            classes="user-message-fired-loop-line",
+                        )
+            if self.SHOW_SEPARATOR and self.severity is None:
                 yield ExpandingSeparator(classes="user-message-separator")
             if self._pending:
                 self.add_class("pending")
@@ -540,15 +563,12 @@ class BashOutputMessage(ClickWithoutDragMixin, SpinnerMixin, Static):
         self._output = output.rstrip("\n")
         self._exit_code = exit_code
         self._pending = pending
-        self._queued = False
         self._output_widget: NoMarkupStatic | None = None
         self._overflow_widget: NoMarkupStatic | None = None
         self._section: OverflowCollapsibleSection | None = None
         self._output_container: Horizontal | None = None
         self._prompt_widget: NonSelectableStatic | None = None
         self._indicator_widget: Static | None = None
-
-    QUEUED_PROMPT = "! "
 
     def _clean_lines(self) -> list[str]:
         # Sanitize captured output (ANSI escapes, \r redraws, control bytes)
@@ -575,43 +595,18 @@ class BashOutputMessage(ClickWithoutDragMixin, SpinnerMixin, Static):
             self._section.set_collapsed_label(lines_label(count, prefix="+"))
 
     def _update_spinner_frame(self) -> None:
-        if not self._is_spinning or not self._prompt_widget or self._queued:
+        if not self._is_spinning or not self._prompt_widget:
             return
         # Frames are all the same size, so skip the relayout.
         self._prompt_widget.update(f"{self._spinner.next_frame()} ", layout=False)
 
     def on_mount(self) -> None:
-        if self._pending and not self._queued:
-            self.start_spinner_timer()
-
-    def set_queued(self, queued: bool) -> None:
-        if queued == self._queued:
-            return
-        self._queued = queued
-        if queued:
-            self.add_class("queued")
-            self.stop_spinning()
-            if self._prompt_widget is not None:
-                self._prompt_widget.update(self.QUEUED_PROMPT)
-            return
-        self.remove_class("queued")
         if self._pending:
-            if self._prompt_widget is not None:
-                self._prompt_widget.update(f"{self._spinner.current_frame()} ")
-            self._is_spinning = True
             self.start_spinner_timer()
 
     @property
     def pending(self) -> bool:
         return self._pending
-
-    def update_command(self, command: str) -> None:
-        """Refresh the displayed command for an in-place queue edit."""
-        self._command = command
-        try:
-            self.query_one(".bash-command", NoMarkupStatic).update(command)
-        except Exception:
-            pass
 
     def compose(self) -> ComposeResult:
         if self._pending:
@@ -621,9 +616,7 @@ class BashOutputMessage(ClickWithoutDragMixin, SpinnerMixin, Static):
         else:
             status_class = "bash-success"
         self.add_class(status_class)
-        if self._queued:
-            prompt_text = self.QUEUED_PROMPT
-        elif self._pending:
+        if self._pending:
             prompt_text = f"{self._spinner.current_frame()} "
         else:
             prompt_text = "$ "

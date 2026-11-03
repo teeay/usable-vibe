@@ -23,6 +23,7 @@ from io import StringIO
 from pathlib import Path
 import re
 
+from pydantic import ValidationError
 from rich.console import Console, Group, RenderableType
 from rich.markdown import Markdown
 from rich.padding import Padding
@@ -35,6 +36,7 @@ from vibe.app_server.events import (
     HistoryEntryUpdated,
 )
 from vibe.app_server.models import (
+    MANUAL_SHELL_TOOL_NAME,
     CancelledEffectState,
     CompletedEffectState,
     FailedEffectState,
@@ -42,6 +44,7 @@ from vibe.app_server.models import (
     HookScope,
     HookSeverity,
     PlanReviewStartedNoticeDetail,
+    ProcessEffectDetail,
     PublicCheckpointEntry,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
@@ -49,9 +52,13 @@ from vibe.app_server.models import (
     PublicMessageEntry,
     PublicNoticeEntry,
     PublicReasoningEntry,
+    ScratchpadEffectDetail,
+    ScratchpadEffectOutput,
     ShellEffectDetail,
     ShellEffectOutput,
     SkippedEffectState,
+    TodoEffectDetail,
+    TodoEffectOutput,
 )
 from vibe.cli.textual_ui.native_scroll.app_surfaces import (
     render_approval_outcome,
@@ -63,7 +70,10 @@ from vibe.cli.textual_ui.native_scroll.app_surfaces import (
 from vibe.cli.textual_ui.native_scroll.history_render import render_history_blocks
 from vibe.cli.textual_ui.native_scroll.tool_result_render import (
     render_manual_bash_body,
+    render_process_effect_body,
     render_result_body,
+    render_scratchpad_effect_body,
+    render_todo_items,
 )
 from vibe.cli.textual_ui.native_scroll.widget_render import (
     render_hook_line,
@@ -71,6 +81,9 @@ from vibe.cli.textual_ui.native_scroll.widget_render import (
     render_user_prompt,
     render_widget_block,
 )
+from vibe.cli.textual_ui.widgets.fired_loop import FiredLoop
+from vibe.cli.textual_ui.widgets.model_change import model_change_model
+from vibe.cli.textual_ui.widgets.tool_widgets import ProcessToolOutput
 from vibe.core.hooks.models import (
     HookEndEvent,
     HookEvent,
@@ -499,8 +512,10 @@ class ScrollbackCommitter:
                     self._commit_public_effect(entry)
             case PublicCheckpointEntry(kind="compaction"):
                 self.flush()
-                if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
-                    self._enqueue(Text("✓ Conversation compacted", style="green"))
+                self._commit_compaction_checkpoint(entry)
+            case PublicCheckpointEntry(kind="model_change"):
+                self.flush()
+                self._commit_model_change_checkpoint(entry)
             case PublicNoticeEntry():
                 self._handle_public_notice(entry)
             case _:
@@ -543,6 +558,13 @@ class ScrollbackCommitter:
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     self.flush()
                     self._enqueue(Text("✓ Conversation compacted", style="green"))
+            case PublicCheckpointEntry(kind="model_change"):
+                if (
+                    entry.generation_status is PublicEntryGenerationStatus.COMPLETED
+                    and (model := model_change_model(entry)) is not None
+                ):
+                    self.flush()
+                    self._enqueue(Text(f"Model changed to {model}", style="green"))
             case _:
                 pass
 
@@ -636,23 +658,83 @@ class ScrollbackCommitter:
             )
         )
 
+    def _commit_compaction_checkpoint(self, entry: PublicCheckpointEntry) -> None:
+        if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+            self._enqueue(Text("✓ Conversation compacted", style="green"))
+
+    def _commit_model_change_checkpoint(self, entry: PublicCheckpointEntry) -> None:
+        if (
+            entry.generation_status is PublicEntryGenerationStatus.COMPLETED
+            and (model := model_change_model(entry)) is not None
+        ):
+            self._enqueue(Text(f"Model changed to {model}", style="green"))
+
     def _public_effect_body(
         self, entry: PublicEffectEntry, state: object
     ) -> RenderableType | None:
-        if not isinstance(entry.detail, ShellEffectDetail):
-            return None
-        if entry.detail.input is None:
-            return None
+        match entry.detail:
+            case TodoEffectDetail():
+                return self._todo_effect_body(state)
+            case ProcessEffectDetail():
+                return self._process_effect_body(state)
+            case ScratchpadEffectDetail():
+                return self._scratchpad_effect_body(state)
+            case ShellEffectDetail(input=None):
+                return None
+            case ShellEffectDetail() as detail:
+                return self._shell_effect_body(detail, state)
+            case _:
+                return None
 
-        command = entry.detail.input.command
+    def _shell_effect_body(
+        self, detail: ShellEffectDetail, state: object
+    ) -> RenderableType | None:
+        if detail.input is None:
+            return None
+        command = detail.input.command
+        # Agent shells carry the real tool route (``bash``, ``file_system.bash``,
+        # ``git_bash``, ...); only the manual ``!`` sentinel renders manual-style.
         if (
-            entry.detail.tool_name == "bash"
+            detail.tool_name != MANUAL_SHELL_TOOL_NAME
             and isinstance(state, CompletedEffectState)
             and state.output is not None
         ):
             return self._agent_shell_body(command, state)
-
         return self._manual_shell_body(command, state)
+
+    def _todo_effect_body(self, state: object) -> RenderableType | None:
+        if not isinstance(state, CompletedEffectState) or state.output is None:
+            return None
+        try:
+            todos = TodoEffectOutput.model_validate(state.output).todos
+        except ValidationError:
+            return None
+        return render_todo_items(todos)
+
+    def _process_effect_body(self, state: object) -> RenderableType | None:
+        if not isinstance(state, CompletedEffectState) or state.output is None:
+            return None
+        try:
+            output = ProcessToolOutput.model_validate(state.output)
+        except ValidationError:
+            return None
+        return render_process_effect_body(
+            output,
+            shorten=self._shorten_tool_output(),
+            head_lines=self._tool_output_head_lines(),
+            tail_lines=self._tool_output_tail_lines(),
+        )
+
+    def _scratchpad_effect_body(self, state: object) -> RenderableType | None:
+        if not isinstance(state, CompletedEffectState) or state.output is None:
+            return None
+        try:
+            output = ScratchpadEffectOutput.model_validate(state.output)
+        except ValidationError:
+            return None
+        return render_scratchpad_effect_body(
+            output, dark=self._dark(), ansi=self._ansi()
+        )
 
     def _agent_shell_body(
         self, command: str, state: CompletedEffectState
@@ -738,21 +820,6 @@ class ScrollbackCommitter:
             renderables.append(body)
         return Group(*renderables) if len(renderables) > 1 else header
 
-    def commit_manual_bash(
-        self, command: str, output: str, exit_code: int, *, interrupted: bool = False
-    ) -> None:
-        """Commit a durable block for a finished manual ``!`` / queued bash.
-
-        Used by both manual and queued bash so the live-to-durable finalization
-        has one path. The live ``BashOutputMessage`` streams in ``#live-queue``
-        while running; this commits the final result and the app removes the
-        live widget.
-        """
-        self.flush()
-        self._enqueue(
-            render_manual_bash_body(command, output, exit_code, interrupted=interrupted)
-        )
-
     def commit_history(
         self,
         messages: Sequence[LLMMessage],
@@ -792,7 +859,11 @@ class ScrollbackCommitter:
             if isinstance(entry, PublicMessageEntry) and entry.role == "user":
                 self._enqueue(
                     render_user_prompt(
-                        ">", entry.text, entry.images or None, dark=self._dark()
+                        ">",
+                        entry.text,
+                        entry.images or None,
+                        dark=self._dark(),
+                        fired_loop=FiredLoop.from_display(entry.user_display_content),
                     )
                 )
                 continue

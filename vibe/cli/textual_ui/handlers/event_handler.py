@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
 from textual.widget import Widget
 
 from vibe.app_server.events import (
@@ -12,6 +13,7 @@ from vibe.app_server.events import (
     HistoryEntryAdded,
     HistoryEntryUpdated,
     SessionSnapshot,
+    SessionUpdated,
 )
 from vibe.app_server.models import (
     AgentChangedNoticeDetail,
@@ -36,9 +38,12 @@ from vibe.app_server.models import (
     ScheduledLoopFiredNoticeDetail,
     SessionTitleUpdatedNoticeDetail,
     SkippedEffectState,
+    TodoEffectOutput,
     WaitingForInputNoticeDetail,
 )
+from vibe.cli.textual_ui.todo_tracker import TodoTracker
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
+from vibe.cli.textual_ui.widgets.fired_loop import FiredLoop
 from vibe.cli.textual_ui.widgets.loading import (
     DEFAULT_LOADING_STATUS,
     THINKING_LOADING_STATUS,
@@ -51,23 +56,26 @@ from vibe.cli.textual_ui.widgets.messages import (
     PlanFileMessage,
     ReasoningMessage,
     SlashCommandMessage,
-    UserCommandMessage,
+    UserMessage,
+)
+from vibe.cli.textual_ui.widgets.model_change import (
+    ModelChangeMessage,
+    model_change_model,
 )
 from vibe.cli.textual_ui.widgets.tools import (
     ToolCallMessage,
     ToolGroup,
     ToolResultMessage,
+    _effect_state_is_failure,
+    _effect_state_to_indicator,
+    entry_keeps_tool_group,
+    is_manual_shell_entry,
 )
+from vibe.cli.textual_ui.windowing.history import history_entry_renders_widget
 from vibe.utils.tool_presentation import ToolEffectKind
 
 if TYPE_CHECKING:
     from vibe.cli.textual_ui.widgets.loading import LoadingWidget
-
-
-_NON_GROUPED_EFFECT_KINDS = frozenset({
-    ToolEffectKind.FILE_EDIT,
-    ToolEffectKind.FILE_WRITE,
-})
 
 
 @dataclass(slots=True)
@@ -86,6 +94,8 @@ class EventHandler:
         get_show_thinking: Callable[[], bool] | None = None,
         on_context_cleared: Callable[[Path | None], Awaitable[None]] | None = None,
         on_session_title_changed: Callable[[str], None] | None = None,
+        todo_tracker: TodoTracker | None = None,
+        on_todos_changed: Callable[[], None] | None = None,
     ) -> None:
         self.mount_callback = mount_callback
         self.get_tools_collapsed = get_tools_collapsed
@@ -93,6 +103,8 @@ class EventHandler:
         self.get_show_thinking = get_show_thinking or (lambda: True)
         self.on_context_cleared = on_context_cleared
         self.on_session_title_changed = on_session_title_changed
+        self.todo_tracker = todo_tracker
+        self.on_todos_changed = on_todos_changed
         self.tool_calls: dict[str, ToolCallMessage] = {}
         self.current_compact: CompactMessage | None = None
         self.current_streaming_message: AssistantMessage | None = None
@@ -104,6 +116,8 @@ class EventHandler:
         self._tool_call_anchors: dict[str, Widget] = {}
         self._pending_error_results: list[ToolResultMessage] = []
         self._retry_presentation: _RetryPresentation | None = None
+        self._last_user_entry: PublicMessageEntry | None = None
+        self._fired_prompt_id: str | None = None
 
     def offer_retry(self, error: ErrorMessage | None = None) -> None:
         presentation = self._retry_presentation
@@ -136,16 +150,29 @@ class EventHandler:
                 return await self._handle_entry_added(entry, loading_widget)
             case HistoryEntryUpdated() as update:
                 await self._handle_entry_updated(update, loading_widget)
+            case SessionUpdated() as updated:
+                self._handle_session_updated(updated)
             case SessionSnapshot(state=state) if loading_widget is not None:
                 loading_widget.set_retrying(state.retrying is not None)
             case _:
                 pass
         return None
 
+    def _handle_session_updated(self, event: SessionUpdated) -> None:
+        title = event.session.title
+        if title is None or title == event.previous.title:
+            return
+        if self.on_session_title_changed is not None:
+            self.on_session_title_changed(title)
+
     async def _handle_entry_added(
         self, entry: PublicHistoryEntry, loading_widget: LoadingWidget | None
     ) -> ToolCallMessage | None:
-        if self.current_tool_group is not None and not _entry_keeps_tool_group(entry):
+        if isinstance(
+            entry, PublicCheckpointEntry
+        ) and not history_entry_renders_widget(entry):
+            return None
+        if self.current_tool_group is not None and not entry_keeps_tool_group(entry):
             self._finalize_tool_group()
 
         match entry:
@@ -154,8 +181,12 @@ class EventHandler:
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
             case PublicMessageEntry(role="user"):
+                self._last_user_entry = entry
                 self.cancel_retry_presentation()
                 await self.finalize_streaming()
+                fired_loop = FiredLoop.from_display(entry.user_display_content)
+                if fired_loop is not None:
+                    await self._mount_fired_loop_prompt(entry, fired_loop)
             case PublicMessageEntry(role="system"):
                 await self._resolve_retry_presentation(continue_assistant=False)
             case PublicReasoningEntry():
@@ -170,12 +201,10 @@ class EventHandler:
                 if _effect_is_terminal(entry):
                     await self._handle_effect_completed(entry, loading_widget)
                 return tool_call
-            case PublicCheckpointEntry(kind="compaction"):
+            case PublicCheckpointEntry():
                 await self._resolve_retry_presentation(continue_assistant=False)
                 await self.finalize_streaming()
-                await self._handle_compact_start()
-                if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
-                    await self._handle_compact_end()
+                await self._handle_checkpoint_added(entry)
             case PublicNoticeEntry():
                 await self._resolve_retry_presentation(continue_assistant=False)
                 await self._handle_notice(entry, loading_widget)
@@ -188,6 +217,22 @@ class EventHandler:
                 )
         return None
 
+    async def _handle_checkpoint_added(self, entry: PublicCheckpointEntry) -> None:
+        """Render a transcript annotation the Harness wrote.
+
+        An unknown kind is skipped rather than raised on: checkpoint kinds are
+        added by the Harness, and a Runtime newer than this CLI must not take
+        the event stream down with it.
+        """
+        match entry.kind:
+            case "compaction":
+                await self._handle_compact_start()
+                if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+                    await self._handle_compact_end()
+            case "model_change":
+                if (model := model_change_model(entry)) is not None:
+                    await self.mount_callback(ModelChangeMessage(model))
+
     async def _handle_entry_updated(
         self, update: HistoryEntryUpdated, loading_widget: LoadingWidget | None
     ) -> None:
@@ -195,6 +240,8 @@ class EventHandler:
         match entry:
             case PublicMessageEntry(role="assistant"):
                 if delta := _appended_text(update.patch, "/content/0/text"):
+                    if self.current_tool_group is not None:
+                        self._finalize_tool_group()
                     await self._handle_assistant_delta(delta, loading_widget)
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
@@ -229,29 +276,57 @@ class EventHandler:
             existing.update_entry(entry)
             tool_call = existing
         else:
-            self._resolve_pending_errors(escalate=False)
             tool_call = ToolCallMessage(entry)
             self.tool_calls[entry.id] = tool_call
             self._tool_call_anchors[entry.id] = tool_call
-            if entry.detail.kind in _NON_GROUPED_EFFECT_KINDS:
-                self._finalize_tool_group()
+            if is_manual_shell_entry(entry):
+                # Mounted at top level, not in a group: `_handle_entry_added`
+                # already closed the open one, and folding the user's own `!`
+                # command into a summary line would hide what they ran it for.
                 await self.mount_callback(tool_call)
             else:
                 group = await self._ensure_tool_group()
+                group.add_call_kind(entry.detail.kind)
                 await self._mount_in_group(group, tool_call)
         if loading_widget is not None:
             loading_widget.set_status(entry.detail.display.status_text)
         return tool_call
+
+    def _record_todos(self, entry: PublicEffectEntry) -> str | None:
+        # ``None`` means "render this the old way".
+        if self.todo_tracker is None or entry.detail.kind is not ToolEffectKind.TODO:
+            return None
+        if not isinstance(entry.state, CompletedEffectState):
+            return None
+        try:
+            output = TodoEffectOutput.model_validate(entry.state.output)
+        except ValidationError:
+            return None
+        delta = self.todo_tracker.record(output.todos)
+        if self.on_todos_changed is not None:
+            self.on_todos_changed()
+        return delta
 
     async def _handle_effect_completed(
         self, entry: PublicEffectEntry, loading_widget: LoadingWidget | None
     ) -> None:
         call_widget = self.tool_calls.get(entry.id)
         anchor = self._tool_call_anchors.get(entry.id) or call_widget
-        result = ToolResultMessage(entry, call_widget)
+        result = ToolResultMessage(
+            entry, call_widget, todo_delta=self._record_todos(entry)
+        )
         await self.mount_callback(result, after=anchor)
-        if isinstance(entry.state, FailedEffectState):
+        if _effect_state_is_failure(entry.state):
             self._pending_error_results.append(result)
+        elif isinstance(entry.state, CompletedEffectState):
+            # A successful call means earlier errors in the group were
+            # recoverable: keep their indicators muted (grey) instead of
+            # escalating them to red at turn end.
+            self._resolve_pending_errors(escalate=False)
+        if self.current_tool_group is not None and not is_manual_shell_entry(entry):
+            self.current_tool_group.settle_indicator(
+                _effect_state_to_indicator(entry.state)
+            )
         self._tool_call_anchors[entry.id] = result
         self.tool_calls.pop(entry.id, None)
         if loading_widget is not None and not self.tool_calls:
@@ -309,6 +384,8 @@ class EventHandler:
             message = ReasoningMessage(content, collapsed=self.get_tools_collapsed())
             self.current_streaming_reasoning = message
             group = await self._ensure_tool_group()
+            if self.get_show_thinking():
+                group.mark_reasoning()
             await self._mount_in_group(group, message)
             if not self.get_show_thinking():
                 message.display = False
@@ -338,10 +415,40 @@ class EventHandler:
                 await self.finalize_streaming()
             case ScheduledLoopFiredNoticeDetail():
                 await self.finalize_streaming()
-                await self.mount_callback(UserCommandMessage(entry.message))
+                await self._handle_fired_loop_notice(entry)
             case SessionTitleUpdatedNoticeDetail(title=title):
                 if self.on_session_title_changed is not None:
                     self.on_session_title_changed(title)
+
+    async def _handle_fired_loop_notice(self, notice: PublicNoticeEntry) -> None:
+        # A prompt without the display marker (an older server) is only known
+        # to be fired once the notice that follows it in the same turn arrives.
+        prompt = self._last_user_entry
+        fired_loop = FiredLoop.from_notice(notice)
+        if (
+            prompt is None
+            or notice.turn_id is None
+            or prompt.turn_id != notice.turn_id
+            or prompt.id == self._fired_prompt_id
+            or fired_loop is None
+        ):
+            return
+        await self._mount_fired_loop_prompt(prompt, fired_loop)
+
+    async def _mount_fired_loop_prompt(
+        self, prompt: PublicMessageEntry, fired_loop: FiredLoop
+    ) -> None:
+        # A fired loop starts its turn server-side, so no local widget echoes
+        # the prompt.
+        self._fired_prompt_id = prompt.id
+        await self.mount_callback(
+            UserMessage(
+                prompt.text,
+                history_entry_id=prompt.id,
+                images=prompt.images or None,
+                fired_loop=fired_loop,
+            )
+        )
 
     async def _handle_hook_notice(
         self, detail: HookNoticeDetail, loading_widget: LoadingWidget | None
@@ -412,7 +519,10 @@ class EventHandler:
             if tool_call is not None:
                 tool_call.add_class("no-gap")
 
-    def _finalize_tool_group(self) -> None:
+    def _finalize_tool_group(self, *, escalate: bool = True) -> None:
+        if self.current_tool_group is not None:
+            self._resolve_pending_errors(escalate=escalate)
+            self.current_tool_group.finalize()
         self.current_tool_group = None
 
     async def _ensure_tool_group(self) -> ToolGroup:
@@ -470,8 +580,7 @@ class EventHandler:
         self.tool_calls.clear()
         self._tool_call_anchors.clear()
         self._hook_containers.clear()
-        self._finalize_tool_group()
-        self._resolve_pending_errors(escalate=not cancelled)
+        self._finalize_tool_group(escalate=not cancelled)
 
     def stop_current_compact(self) -> None:
         if self.current_compact:
@@ -489,13 +598,6 @@ class EventHandler:
             return
         self.plan_file_message.stop_watching()
         self.plan_file_message = None
-
-
-def _entry_keeps_tool_group(entry: PublicHistoryEntry) -> bool:
-    return isinstance(entry, PublicEffectEntry | PublicReasoningEntry) or (
-        isinstance(entry, PublicNoticeEntry)
-        and isinstance(entry.detail, HookNoticeDetail)
-    )
 
 
 def _appended_text(patch: list[JsonPatchOperation], path: str) -> str:

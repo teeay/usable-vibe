@@ -5,7 +5,11 @@ from typing import Any
 
 import pytest
 
-from vibe.core.experiments.active import DEFAULT_VARIANTS, ExperimentName
+from vibe.core.experiments.active import (
+    DEFAULT_VARIANTS,
+    ExperimentName,
+    ExperimentSurface,
+)
 from vibe.core.experiments.client import RemoteEvalClient
 from vibe.core.experiments.manager import (
     ExperimentManager,
@@ -30,7 +34,11 @@ class _StubClient(RemoteEvalClient):
 
 def _attrs() -> ExperimentAttributes:
     return ExperimentAttributes(
-        userId="x", entrypoint="cli", agent_version="0", os="darwin"
+        userId="x",
+        entrypoint="cli",
+        harness=ExperimentSurface.LEGACY,
+        agent_version="0",
+        os="darwin",
     )
 
 
@@ -61,50 +69,6 @@ async def test_get_variant_returns_default_when_uninitialized() -> None:
 async def test_get_variant_or_none_returns_none_when_unassigned() -> None:
     manager = ExperimentManager(client=_StubClient(None))
     assert manager.get_variant_or_none(ExperimentName.SYSTEM_PROMPT) is None
-
-
-@pytest.mark.asyncio
-async def test_managed_shell_tools_remote_variant_enables_rollout() -> None:
-    response = _response({
-        ExperimentName.MANAGED_SHELL_TOOLS.value: {
-            "defaultValue": "legacy",
-            "rules": [{"force": "managed", "tracks": []}],
-        }
-    })
-    manager = ExperimentManager(client=_StubClient(response))
-
-    await manager.initialize(_attrs())
-
-    assert manager.get_variant(ExperimentName.MANAGED_SHELL_TOOLS) == "managed"
-
-
-@pytest.mark.asyncio
-async def test_get_variant_or_none_returns_resolved_value() -> None:
-    response = _response({
-        ExperimentName.SYSTEM_PROMPT.value: {
-            "defaultValue": "cli",
-            "rules": [{"force": "explore", "tracks": []}],
-        }
-    })
-    manager = ExperimentManager(client=_StubClient(response))
-    await manager.initialize(_attrs())
-    assert manager.get_variant_or_none(ExperimentName.SYSTEM_PROMPT) == "explore"
-
-
-@pytest.mark.asyncio
-async def test_get_variant_serializes_json_object_value() -> None:
-    payload = {
-        "active_model": "target-testing-model-alias",
-        "fallbacks": {"multimodal": "mistral-medium-3.5"},
-    }
-    response = _response({
-        ExperimentName.CLI_MODEL_ROUTING.value: {"defaultValue": payload, "rules": []}
-    })
-    manager = ExperimentManager(client=_StubClient(response))
-    await manager.initialize(_attrs())
-
-    variant = manager.get_variant(ExperimentName.CLI_MODEL_ROUTING)
-    assert json.loads(variant) == payload
 
 
 @pytest.mark.asyncio
@@ -211,9 +175,22 @@ async def test_config_variants_include_forced_rule_without_assignment() -> None:
 
 
 @pytest.mark.asyncio
-async def test_config_variants_exclude_default_value_without_forced_rule() -> None:
+async def test_config_variants_include_default_value_without_forced_rule() -> None:
     response = _response({
         ExperimentName.SYSTEM_PROMPT.value: {"defaultValue": "explore", "rules": []}
+    })
+    manager = ExperimentManager(client=_StubClient(response))
+    await manager.initialize(_attrs())
+    assert manager.config_variants() == {ExperimentName.SYSTEM_PROMPT.value: "explore"}
+
+
+@pytest.mark.asyncio
+async def test_config_variants_exclude_default_value_equal_to_baseline() -> None:
+    response = _response({
+        ExperimentName.SYSTEM_PROMPT.value: {
+            "defaultValue": DEFAULT_VARIANTS[ExperimentName.SYSTEM_PROMPT],
+            "rules": [],
+        }
     })
     manager = ExperimentManager(client=_StubClient(response))
     await manager.initialize(_attrs())
@@ -258,19 +235,6 @@ async def test_assignments_returns_confirmed_assignment() -> None:
     assert assignments[0].hash_attribute == "userId"
     assert assignments[0].hash_value == "user-abc"
     assert assignments[0].feature_id == ExperimentName.SYSTEM_PROMPT.value
-
-
-@pytest.mark.asyncio
-async def test_get_variant_returns_resolved_value() -> None:
-    response = _response({
-        ExperimentName.SYSTEM_PROMPT.value: {
-            "defaultValue": "cli",
-            "rules": [{"force": "cli_v2", "tracks": []}],
-        }
-    })
-    manager = ExperimentManager(client=_StubClient(response))
-    await manager.initialize(_attrs())
-    assert manager.get_variant(ExperimentName.SYSTEM_PROMPT) == "cli_v2"
 
 
 @pytest.mark.asyncio
@@ -408,7 +372,11 @@ async def test_attributes_retains_snapshot_even_on_failed_eval() -> None:
 
 def test_experiment_attributes_default_custom_system_prompt_to_false() -> None:
     attrs = ExperimentAttributes(
-        userId="x", entrypoint="cli", agent_version="0", os="darwin"
+        userId="x",
+        entrypoint="cli",
+        harness=ExperimentSurface.LEGACY,
+        agent_version="0",
+        os="darwin",
     )
     assert attrs.custom_system_prompt is False
     assert attrs.model_dump(exclude_none=True)["custom_system_prompt"] is False
@@ -418,6 +386,7 @@ def test_experiment_attributes_serializes_custom_system_prompt() -> None:
     attrs = ExperimentAttributes(
         userId="x",
         entrypoint="cli",
+        harness=ExperimentSurface.LEGACY,
         agent_version="0",
         os="darwin",
         custom_system_prompt=True,
@@ -609,23 +578,37 @@ async def test_initialize_drops_unknown_features() -> None:
 def test_config_variants_from_response_returns_forced_routing_variant() -> None:
     response = _response({
         ExperimentName.CLI_MODEL_ROUTING.value: {
-            "rules": [{"force": '{"active_model": "magistral"}', "tracks": []}]
+            "rules": [{"force": {"active_model": "magistral"}, "tracks": []}]
         }
     })
 
     variants = config_variants_from_response(response)
 
-    assert variants[ExperimentName.CLI_MODEL_ROUTING.value] == (
-        '{"active_model": "magistral"}'
-    )
+    assert variants[ExperimentName.CLI_MODEL_ROUTING.value] == {
+        "active_model": "magistral"
+    }
 
 
 def test_config_variants_from_response_empty_without_forced_or_assigned() -> None:
     response = _response({
-        ExperimentName.CLI_MODEL_ROUTING.value: {"defaultValue": "x", "rules": []}
+        ExperimentName.CLI_MODEL_ROUTING.value: {
+            "defaultValue": DEFAULT_VARIANTS[ExperimentName.CLI_MODEL_ROUTING],
+            "rules": [],
+        }
     })
 
     assert config_variants_from_response(response) == {}
+
+
+def test_config_variants_from_response_includes_differing_default_value() -> None:
+    payload = {"active_model": "magistral"}
+    response = _response({
+        ExperimentName.CLI_MODEL_ROUTING.value: {"defaultValue": payload, "rules": []}
+    })
+
+    variants = config_variants_from_response(response)
+
+    assert variants[ExperimentName.CLI_MODEL_ROUTING.value] == payload
 
 
 def test_hydrate_drops_unknown_features() -> None:
@@ -642,3 +625,36 @@ def test_hydrate_drops_unknown_features() -> None:
     snapshot = manager.export_state()
     assert snapshot is not None
     assert set(snapshot.features.keys()) == {ExperimentName.SYSTEM_PROMPT.value}
+
+
+def test_config_variants_from_response_honors_conditioned_force() -> None:
+    response = _response({
+        ExperimentName.SYSTEM_PROMPT.value: {
+            "defaultValue": "cli",
+            "rules": [
+                {"force": "explore", "condition": {"planType": "x"}, "tracks": []}
+            ],
+        }
+    })
+    assert config_variants_from_response(response) == {
+        ExperimentName.SYSTEM_PROMPT.value: "explore"
+    }
+
+
+def test_hydrate_without_attributes_honors_coverage_limited_force() -> None:
+    response = _response({
+        ExperimentName.SYSTEM_PROMPT.value: {
+            "defaultValue": "cli",
+            "rules": [
+                {
+                    "force": "explore",
+                    "coverage": 1,
+                    "hashAttribute": "userId",
+                    "tracks": [],
+                }
+            ],
+        }
+    })
+    manager = ExperimentManager(client=_StubClient(None))
+    manager.hydrate(response)
+    assert manager.config_variants() == {ExperimentName.SYSTEM_PROMPT.value: "explore"}

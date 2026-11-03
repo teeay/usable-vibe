@@ -19,6 +19,7 @@ from vibe.app_server.models import (
     PublicMessageEntry,
     TextContentBlock,
 )
+from vibe.app_server.protocol import RuntimeMutationStatus
 from vibe.cli.textual_ui.native_scroll.app_surfaces import (
     render_approval_outcome,
     render_rewind_outcome,
@@ -212,6 +213,11 @@ async def test_model_selection_commits_single_outcome(
         assert app._committer is not None
         app._committer.drain_lines()
         _neutralize_reload(app, monkeypatch)
+        monkeypatch.setattr(
+            app.app_server.resources.config,
+            "write_model",
+            AsyncMock(return_value=RuntimeMutationStatus.APPLIED),
+        )
 
         await app.on_model_picker_app_model_selected(
             ModelPickerApp.ModelSelected(alias="big[high]")

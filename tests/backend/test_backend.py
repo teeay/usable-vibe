@@ -38,15 +38,21 @@ from tests.backend.data.mistral import (
     TOOL_CONVERSATION_PARAMS as MISTRAL_TOOL_CONVERSATION_PARAMS,
 )
 from tests.constants import CHAT_COMPLETIONS_PATH
+from vibe.config_values import THINKING_LEVELS, ThinkingLevel
 from vibe.core.config import ModelConfig, ProviderConfig
 from vibe.core.llm.backend.base import build_chat_payload
 from vibe.core.llm.backend.factory import BACKEND_FACTORY, create_backend
 from vibe.core.llm.backend.generic import GenericBackend, OpenAIAdapter
-from vibe.core.llm.backend.mistral import MistralBackend, MistralMapper, _cached_tokens
-from vibe.core.llm.exceptions import BackendError, BackendErrorBuilder
+from vibe.core.llm.backend.mistral import (
+    MistralBackend,
+    MistralMapper,
+    _cached_tokens,
+    _reasoning_effort,
+)
+from vibe.core.llm.exceptions import BackendError, BackendErrorBuilder, ModelCall
 from vibe.core.llm.types import BackendLike
 from vibe.core.types import Backend, FunctionCall, LLMChunk, LLMMessage, Role, ToolCall
-from vibe.utils.http import get_user_agent
+from vibe.utils.http import VibeAsyncHTTPClient, get_user_agent
 from vibe.utils.tool_presentation import (
     EffectCallDisplay,
     ToolCallPresentation,
@@ -84,6 +90,25 @@ async def test_mistral_backend_keeps_idle_connections_for_tool_turns() -> None:
 
     limits = create_http_client.call_args.kwargs["limits"]
     assert limits.keepalive_expiry == 60.0
+
+
+@pytest.mark.asyncio
+async def test_mistral_backend_bounds_the_connection_pool() -> None:
+    provider = ProviderConfig(
+        name="mistral", api_base="https://api.mistral.ai/v1", api_key_env_var="API_KEY"
+    )
+    backend = MistralBackend(provider=provider)
+    with (
+        patch(
+            "vibe.core.llm.backend.mistral.VibeAsyncHTTPClient"
+        ) as create_http_client,
+        patch("vibe.core.llm.backend.mistral.Mistral"),
+        patch("vibe.core.llm.backend.mistral._register_retry_hook"),
+    ):
+        backend._create_mistral_client()
+
+    limits = create_http_client.call_args.kwargs["limits"]
+    assert limits.max_connections == 20
 
 
 def test_internal_tool_presentation_is_not_sent_to_provider() -> None:
@@ -754,6 +779,238 @@ class TestMistralRetry:
             assert result.message.content == "Some content"
             assert route.call_count == 2
 
+    @staticmethod
+    def _rate_limited_stream() -> httpx.Response:
+        """A 429 whose body is still on the wire, as a real transport returns it.
+
+        respx pre-reads every mocked response, which is exactly the state this
+        test needs to avoid, so these cases drive a plain httpx MockTransport.
+        """
+        return httpx.Response(
+            status_code=429,
+            stream=httpx.ByteStream(b'{"message": "service tier capacity exceeded"}'),
+            headers={"content-type": "application/json", "retry-after": "0"},
+        )
+
+    @staticmethod
+    def _serving(handler):
+        return patch(
+            "vibe.core.llm.backend.mistral.VibeAsyncHTTPClient",
+            lambda **kwargs: VibeAsyncHTTPClient(
+                **kwargs, transport=httpx.MockTransport(handler)
+            ),
+        )
+
+    async def _drain_stream(self, backend: MistralBackend) -> None:
+        model = ModelConfig(
+            name="model_name", provider="test_provider", alias="model_alias"
+        )
+        messages = [LLMMessage(role=Role.user, content="Just say hi")]
+        async for _ in backend.complete_streaming(
+            model=model,
+            messages=messages,
+            temperature=0.2,
+            tools=None,
+            max_tokens=None,
+            tool_choice=None,
+            extra_headers=None,
+        ):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_retried_streaming_response_releases_its_connection(self):
+        """A retried streaming response must not stay checked out of the pool.
+
+        The SDK issues the request with the body unread and holds the failed
+        response alive across the backoff without closing it, so nothing else
+        ever returns its connection.
+        """
+        _, chunks, _ = MISTRAL_STREAMED_SIMPLE_CONVERSATION_PARAMS[0]
+        served: list[httpx.Response] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            response = (
+                httpx.Response(
+                    status_code=200,
+                    stream=httpx.ByteStream(b"\n\n".join(chunks)),
+                    headers={"content-type": "text/event-stream"},
+                )
+                if served
+                else self._rate_limited_stream()
+            )
+            served.append(response)
+            return response
+
+        backend = self._create_test_backend()
+        backend._retry_config = self._build_fast_http_retry_config()
+        with self._serving(handler):
+            await self._drain_stream(backend)
+
+        assert len(served) == 2
+        retried = served[0]
+        assert retried.is_closed
+        assert "service tier capacity exceeded" in retried.text
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_retryable_body_still_retries(self):
+        """A body that cannot be read must not cost the turn its retry.
+
+        Decoding and protocol errors are permanent to the SDK, so letting one
+        escape the drain would turn a rate limit into a dead turn on the first
+        attempt.
+        """
+        _, chunks, _ = MISTRAL_STREAMED_SIMPLE_CONVERSATION_PARAMS[0]
+        served: list[httpx.Response] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            response = (
+                httpx.Response(
+                    status_code=200,
+                    stream=httpx.ByteStream(b"\n\n".join(chunks)),
+                    headers={"content-type": "text/event-stream"},
+                )
+                if served
+                else httpx.Response(
+                    status_code=429,
+                    stream=httpx.ByteStream(b"this is not gzip"),
+                    headers={
+                        "content-type": "application/json",
+                        "content-encoding": "gzip",
+                        "retry-after": "0",
+                    },
+                )
+            )
+            served.append(response)
+            return response
+
+        backend = self._create_test_backend()
+        backend._retry_config = self._build_fast_http_retry_config()
+        with self._serving(handler):
+            await self._drain_stream(backend)
+
+        assert len(served) == 2
+        assert served[0].is_closed
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retries_still_carry_the_streamed_error_body(self):
+        served: list[httpx.Response] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            response = self._rate_limited_stream()
+            served.append(response)
+            return response
+
+        backend = self._create_test_backend()
+        backend._retry_config = TestBackend._build_fast_retry_config()
+        with self._serving(handler), pytest.raises(BackendError) as raised:
+            await self._drain_stream(backend)
+
+        assert raised.value.status == 429
+        assert "service tier capacity exceeded" in (raised.value.body_text or "")
+        assert all(response.is_closed for response in served)
+
+    @pytest.mark.asyncio
+    async def test_transport_timeouts_bound_everything_but_the_read(self):
+        with respx.mock(base_url="https://api.mistral.ai") as mock_api:
+            route = mock_api.post(CHAT_COMPLETIONS_PATH).mock(
+                return_value=httpx.Response(
+                    status_code=200, json=MISTRAL_SIMPLE_CONVERSATION_PARAMS[0][1]
+                )
+            )
+            backend = self._create_test_backend(timeout=720.0)
+            model = ModelConfig(
+                name="model_name", provider="test_provider", alias="model_alias"
+            )
+            messages = [LLMMessage(role=Role.user, content="Just say hi")]
+
+            await backend.complete(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                tools=None,
+                max_tokens=None,
+                tool_choice=None,
+                extra_headers=None,
+            )
+
+            assert route.calls.last.request.extensions["timeout"] == {
+                "connect": 10.0,
+                "read": 720.0,
+                "write": 30.0,
+                "pool": 10.0,
+            }
+
+    @pytest.mark.asyncio
+    async def test_transport_timeout_caps_come_from_config(self):
+        with respx.mock(base_url="https://api.mistral.ai") as mock_api:
+            route = mock_api.post(CHAT_COMPLETIONS_PATH).mock(
+                return_value=httpx.Response(
+                    status_code=200, json=MISTRAL_SIMPLE_CONVERSATION_PARAMS[0][1]
+                )
+            )
+            provider = ProviderConfig(
+                name="test_provider",
+                api_base="https://api.mistral.ai/v1",
+                api_key_env_var="API_KEY",
+            )
+            backend = MistralBackend(
+                provider=provider,
+                timeout=720.0,
+                connect_timeout=45.0,
+                write_timeout=90.0,
+                pool_timeout=60.0,
+            )
+            model = ModelConfig(
+                name="model_name", provider="test_provider", alias="model_alias"
+            )
+
+            await backend.complete(
+                model=model,
+                messages=[LLMMessage(role=Role.user, content="Just say hi")],
+                temperature=0.2,
+                tools=None,
+                max_tokens=None,
+                tool_choice=None,
+                extra_headers=None,
+            )
+
+            assert route.calls.last.request.extensions["timeout"] == {
+                "connect": 45.0,
+                "read": 720.0,
+                "write": 90.0,
+                "pool": 60.0,
+            }
+
+    @pytest.mark.asyncio
+    async def test_a_shorter_overall_timeout_still_wins_on_every_axis(self):
+        with respx.mock(base_url="https://api.mistral.ai") as mock_api:
+            route = mock_api.post(CHAT_COMPLETIONS_PATH).mock(
+                return_value=httpx.Response(
+                    status_code=200, json=MISTRAL_SIMPLE_CONVERSATION_PARAMS[0][1]
+                )
+            )
+            backend = self._create_test_backend(timeout=5.0)
+            model = ModelConfig(
+                name="model_name", provider="test_provider", alias="model_alias"
+            )
+
+            await backend.complete(
+                model=model,
+                messages=[LLMMessage(role=Role.user, content="Just say hi")],
+                temperature=0.2,
+                tools=None,
+                max_tokens=None,
+                tool_choice=None,
+                extra_headers=None,
+            )
+
+            assert route.calls.last.request.extensions["timeout"] == {
+                "connect": 5.0,
+                "read": 5.0,
+                "write": 5.0,
+                "pool": 5.0,
+            }
+
 
 class TestMistralMapperPrepareMessage:
     """Tests for MistralMapper.prepare_message thinking-block handling.
@@ -882,13 +1139,27 @@ class TestMistralBackendReasoningEffort:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("thinking", "expected_effort"),
-        [("off", None), ("low", "none"), ("medium", "high"), ("high", "high")],
+        ("thinking", "thinking_levels", "expected_effort"),
+        [
+            # The uncurated default set makes no claim about the model, so
+            # "off" leaves the field unset for the server default: some
+            # hosted models reject the explicit "none".
+            ("off", list(THINKING_LEVELS), None),
+            ("low", list(THINKING_LEVELS), "none"),
+            ("medium", list(THINKING_LEVELS), "high"),
+            ("high", list(THINKING_LEVELS), "high"),
+            ("max", list(THINKING_LEVELS), "high"),
+            # A curated set offering "off" claims the model supports it.
+            ("off", ["off", "high"], "none"),
+            ("high", ["off", "high"], "high"),
+            ("off", ["off", "medium", "high"], "none"),
+        ],
     )
     async def test_complete_passes_reasoning_effort(
         self,
         backend: MistralBackend,
         thinking: Literal["off", "low", "medium", "high"],
+        thinking_levels: list[ThinkingLevel],
         expected_effort: str | None,
     ) -> None:
         model = ModelConfig(
@@ -896,6 +1167,7 @@ class TestMistralBackendReasoningEffort:
             provider="mistral",
             alias="mistral-small",
             thinking=thinking,
+            thinking_levels=thinking_levels,
         )
         messages = [LLMMessage(role=Role.user, content="hi")]
 
@@ -923,6 +1195,55 @@ class TestMistralBackendReasoningEffort:
             call_kwargs = mock_client.chat.complete_async.call_args.kwargs
             assert call_kwargs["reasoning_effort"] == expected_effort
             assert call_kwargs["temperature"] == 0.2
+
+    def test_off_on_a_curated_set_that_lacks_it_leaves_the_field_unset(self) -> None:
+        # Compaction forces "off" through model_copy, which bypasses the
+        # validator that would re-derive an out-of-set level. The set's claim
+        # wins there: a curated set not offering "off" leaves the field unset
+        # rather than sending "none" the model may reject.
+        model = ModelConfig(
+            name="m", provider="mistral", alias="m", thinking_levels=["high"]
+        ).model_copy(update={"thinking": "off"})
+
+        assert _reasoning_effort(model) is None
+
+    @pytest.mark.asyncio
+    async def test_stream_passes_reasoning_effort_for_curated_off(
+        self, backend: MistralBackend
+    ) -> None:
+        # The stream call site shares _reasoning_effort with complete; this
+        # pins the wiring on the streaming path.
+        model = ModelConfig(
+            name="mistral-small-latest",
+            provider="mistral",
+            alias="mistral-small",
+            thinking="off",
+            thinking_levels=["off", "high"],
+        )
+        captured: dict[str, object] = {}
+
+        async def _capture(**kwargs: object) -> None:
+            captured.update(kwargs)
+            raise RuntimeError("stop")
+
+        with patch.object(backend, "_get_client") as mock_get_client:
+            mock_client = MagicMock()
+            mock_client.chat.stream_async = _capture
+            mock_get_client.return_value = mock_client
+            with pytest.raises(RuntimeError, match="stop"):
+                await anext(
+                    backend.complete_streaming(
+                        model=model,
+                        messages=[LLMMessage(role=Role.user, content="hi")],
+                        temperature=1.0,
+                        tools=None,
+                        max_tokens=None,
+                        tool_choice=None,
+                        extra_headers=None,
+                    )
+                )
+
+        assert captured["reasoning_effort"] == "none"
 
     @pytest.mark.asyncio
     async def test_complete_omits_reasoning_content_when_thinking_off(
@@ -973,7 +1294,7 @@ class TestMistralBackendReasoningEffort:
 
 class TestBuildHttpErrorBodyReading:
     _MESSAGES: ClassVar[list[LLMMessage]] = [LLMMessage(role=Role.user, content="hi")]
-    _COMMON_KWARGS: ClassVar[dict] = dict(
+    _CALL: ClassVar[ModelCall] = ModelCall(
         provider="test",
         endpoint="https://api.test.com",
         model="test-model",
@@ -1000,9 +1321,7 @@ class TestBuildHttpErrorBodyReading:
             request=httpx.Request("POST", "https://api.test.com"),
         )
         err = BackendErrorBuilder.build_http_error(
-            error=self._make_sdk_error(response),
-            response=response,
-            **self._COMMON_KWARGS,
+            self._CALL, error=self._make_sdk_error(response), response=response
         )
         assert err.status == 400
         assert err.parsed_error == "invalid temperature"
@@ -1015,9 +1334,7 @@ class TestBuildHttpErrorBodyReading:
             request=httpx.Request("POST", "https://api.test.com"),
         )
         err = BackendErrorBuilder.build_http_error(
-            error=self._make_http_status_error(response),
-            response=response,
-            **self._COMMON_KWARGS,
+            self._CALL, error=self._make_http_status_error(response), response=response
         )
         assert err.status == 400
         assert err.parsed_error == "invalid temperature"
@@ -1033,7 +1350,7 @@ class TestBuildHttpErrorBodyReading:
             "sdk error", response, body='{"message": "context too long"}'
         )
         err = BackendErrorBuilder.build_http_error(
-            error=sdk_err, response=response, **self._COMMON_KWARGS
+            self._CALL, error=sdk_err, response=response
         )
         assert err.parsed_error == "context too long"
         assert "context too long" in err.body_text
@@ -1045,9 +1362,7 @@ class TestBuildHttpErrorBodyReading:
             request=httpx.Request("POST", "https://api.test.com"),
         )
         err = BackendErrorBuilder.build_http_error(
-            error=self._make_http_status_error(response),
-            response=response,
-            **self._COMMON_KWARGS,
+            self._CALL, error=self._make_http_status_error(response), response=response
         )
         assert err.parsed_error == "context too long"
         assert "context too long" in err.body_text
@@ -1062,7 +1377,7 @@ class TestBuildHttpErrorBodyReading:
 
         sdk_err = SDKError("sdk msg", response, body='{"message": "context too long"}')
         err = BackendErrorBuilder.build_http_error(
-            error=sdk_err, response=response, **self._COMMON_KWARGS
+            self._CALL, error=sdk_err, response=response
         )
         assert err.body_text == '{"message": "context too long"}'
         assert err.parsed_error == "context too long"
@@ -1080,7 +1395,7 @@ class TestBuildHttpErrorBodyReading:
             "http error with details", request=response.request, response=response
         )
         err = BackendErrorBuilder.build_http_error(
-            error=http_err, response=response, **self._COMMON_KWARGS
+            self._CALL, error=http_err, response=response
         )
         assert "http error with details" in err.body_text
 

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 import errno
+import functools
 import time
-from typing import Final
+from typing import Final, Literal
 import urllib.parse
 
 import anyio.to_thread
@@ -19,10 +20,15 @@ from mcp.client.auth import (
     OAuthTokenError,
     TokenStorage,
 )
+from mcp.client.auth.oauth2 import OAuthContext
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
-from pydantic import AnyUrl, BaseModel, ConfigDict
+from mcp.types import LATEST_PROTOCOL_VERSION
+from pydantic import AnyUrl, BaseModel, ConfigDict, ValidationError
 
+from vibe import __version__
 from vibe.core.config import MCPHttp, MCPOAuth, MCPStreamableHttp
+from vibe.core.utils.exceptions import first_of_type
+from vibe.observability.logging import logger
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
 from vibe.utils.keyring import (
     delete_api_key_from_keyring,
@@ -33,6 +39,12 @@ from vibe.utils.keyring import (
 _USERNAME_PREFIX: Final = "mcp-oauth"
 _CLIENT_NAME: Final = "Usable Vibe"
 _LOGIN_TIMEOUT_SECONDS: Final = 300.0
+# A login whose browser callback never arrives must not pin the loopback port
+# until the process exits, so the callback wait is bounded: an abandoned login
+# fails loudly after this long and releases the port for later attempts.
+_CALLBACK_TIMEOUT_SECONDS: Final = 600.0
+# What a streamable HTTP endpoint accepts: a POST that says both, per the spec.
+_MCP_ACCEPT: Final = "application/json, text/event-stream"
 _MIN_REQUEST_LINE_PARTS: Final = 2
 _HEADER_TERMINATORS: Final = frozenset({b"\r\n", b"\n", b""})
 # OAuth 2.0 token-endpoint error signalling a permanently dead refresh token.
@@ -56,6 +68,23 @@ class MCPOAuthPortInUse(MCPOAuthError):
             f"Loopback callback port {self.port} is already in use; cannot complete "
             f"OAuth login for MCP server {self.server_alias!r}. "
             "Set `auth.redirect_port` to a free port in this server's config and retry."
+        )
+
+
+class MCPOAuthCallbackTimeout(MCPOAuthError):
+    def __init__(self, *, port: int, server_alias: str, timeout_seconds: float) -> None:
+        self.port = port
+        self.server_alias = server_alias
+        self.timeout_seconds = timeout_seconds
+        super().__init__(self._fmt())
+
+    def _fmt(self) -> str:
+        minutes = self.timeout_seconds / 60
+        return (
+            f"Timed out after {minutes:g} minutes waiting for the OAuth browser "
+            f"callback for MCP server {self.server_alias!r}. The loopback port "
+            f"{self.port} has been released; retry the login and complete the "
+            "browser authorization this time."
         )
 
 
@@ -144,7 +173,13 @@ def _kr_username(alias: str, kind: str) -> str:
 
 
 async def _kr_get(username: str) -> str | None:
-    return await anyio.to_thread.run_sync(get_api_key_from_keyring, username)
+    # OAuth material has only ever been filed under the current service name, so
+    # the legacy fallback can only ever miss -- and on macOS each service tried
+    # is its own `security` subprocess, ~17ms, on the session startup path.
+    return await anyio.to_thread.run_sync(
+        functools.partial(get_api_key_from_keyring, search_legacy_services=False),
+        username,
+    )
 
 
 async def _kr_set(username: str, value: str) -> None:
@@ -156,6 +191,18 @@ async def _kr_delete(username: str) -> None:
         await anyio.to_thread.run_sync(delete_api_key_from_keyring, username)
     except keyring.errors.PasswordDeleteError:
         pass
+
+
+async def _kr_load[M: BaseModel](username: str, model: type[M]) -> M | None:
+    raw = await _kr_get(username)
+    if raw is None:
+        return None
+    try:
+        return model.model_validate_json(raw)
+    except ValidationError:
+        # Never log the exception: its message embeds the stored secret.
+        logger.warning("Ignoring unreadable keyring entry %s", username)
+        return None
 
 
 class Fingerprint(BaseModel):
@@ -192,10 +239,7 @@ class Fingerprint(BaseModel):
 
     @classmethod
     async def load(cls, alias: str) -> Fingerprint | None:
-        raw = await _kr_get(_kr_username(alias, "fingerprint"))
-        if raw is None:
-            return None
-        return cls.model_validate_json(raw)
+        return await _kr_load(_kr_username(alias, "fingerprint"), cls)
 
     async def save(self, alias: str) -> None:
         await _kr_set(_kr_username(alias, "fingerprint"), self.model_dump_json())
@@ -244,11 +288,10 @@ class KeyringTokenStorage(TokenStorage):
         self.token_expiry_time: float | None = None
 
     async def get_tokens(self) -> OAuthToken | None:
-        raw = await _kr_get(_kr_username(self._alias, "tokens"))
-        if raw is None:
+        stored = await _kr_load(_kr_username(self._alias, "tokens"), StoredOAuthTokens)
+        if stored is None:
             self.token_expiry_time = None
             return None
-        stored = StoredOAuthTokens.model_validate_json(raw)
         self.token_expiry_time = stored.expires_at
         if stored.expires_at is None and stored.expires_in is not None:
             self.token_expiry_time = _EXPIRED_TOKEN_TIME
@@ -264,10 +307,10 @@ class KeyringTokenStorage(TokenStorage):
         self.token_expiry_time = None
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
-        raw = await _kr_get(_kr_username(self._alias, "client_info"))
-        if raw is None:
-            return self._fallback_client_info
-        return OAuthClientInformationFull.model_validate_json(raw)
+        info = await _kr_load(
+            _kr_username(self._alias, "client_info"), OAuthClientInformationFull
+        )
+        return self._fallback_client_info if info is None else info
 
     async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
         await _kr_set(
@@ -519,7 +562,15 @@ class LoopbackCallbackHandler:
             raise
 
         try:
-            return await future
+            # Bounded so an abandoned login releases the port instead of
+            # blocking every later login on this machine.
+            return await asyncio.wait_for(future, timeout=_CALLBACK_TIMEOUT_SECONDS)
+        except TimeoutError:
+            raise MCPOAuthCallbackTimeout(
+                port=self._port,
+                server_alias=self._server_alias,
+                timeout_seconds=_CALLBACK_TIMEOUT_SECONDS,
+            ) from None
         finally:
             server.close()
             with _suppress_close_errors():
@@ -559,25 +610,58 @@ async def _classify_refresh_error(response: httpx.Response) -> tuple[str, bool]:
     return reason, error == _OAUTH_INVALID_GRANT
 
 
-def _first_of_type[E: BaseException](exc: BaseException, target: type[E]) -> E | None:
-    if isinstance(exc, target):
-        return exc
-    if isinstance(exc, BaseExceptionGroup):
-        for sub in exc.exceptions:
-            if (found := _first_of_type(sub, target)) is not None:
-                return found
-    return None
-
-
 def unwrap_oauth_refresh_error(
     exc: BaseException,
 ) -> MCPOAuthInvalidGrant | MCPOAuthTransientRefreshError | OAuthFlowError | None:
     """Find a known OAuth error inside a possibly-grouped exception (streamable_http wraps auth-flow errors in an ExceptionGroup)."""
-    if (invalid_grant := _first_of_type(exc, MCPOAuthInvalidGrant)) is not None:
+    if (invalid_grant := first_of_type(exc, MCPOAuthInvalidGrant)) is not None:
         return invalid_grant
-    if (transient := _first_of_type(exc, MCPOAuthTransientRefreshError)) is not None:
+    if (transient := first_of_type(exc, MCPOAuthTransientRefreshError)) is not None:
         return transient
-    return _first_of_type(exc, OAuthFlowError)
+    return first_of_type(exc, OAuthFlowError)
+
+
+class _ServerIssuedSecretContext(OAuthContext):
+    """``OAuthContext`` that authenticates a server-issued client secret.
+
+    Some authorization servers (e.g. Supabase) accept a registration with
+    ``token_endpoint_auth_method="none"`` but register a confidential client
+    anyway: the response carries a ``client_secret`` while omitting the auth
+    method, and their token endpoint then rejects requests without client
+    authentication. RFC 7591 §2 defaults an omitted method to
+    ``client_secret_basic``, and RFC 6749 §2.3.1 requires servers that issue
+    a client password to support HTTP Basic, so pick the method from what the
+    server advertises in ``token_endpoint_auth_methods_supported`` and only
+    fall back to ``client_secret_post`` when Basic is not an option. The
+    derived value is per request, never persisted, so keyring entries saved
+    before this class existed (method absent or ``"none"``) self-heal.
+    """
+
+    def prepare_token_auth(
+        self, data: dict[str, str], headers: dict[str, str] | None = None
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        client_info = self.client_info
+        if (
+            client_info is not None
+            and client_info.client_secret
+            and client_info.token_endpoint_auth_method in {None, "none"}
+        ):
+            client_info.token_endpoint_auth_method = self._secret_auth_method()
+        return super().prepare_token_auth(data, headers)
+
+    def _secret_auth_method(
+        self,
+    ) -> Literal["client_secret_basic", "client_secret_post"]:
+        supported = (
+            self.oauth_metadata.token_endpoint_auth_methods_supported
+            if self.oauth_metadata is not None
+            else None
+        )
+        if not supported or "client_secret_basic" in supported:
+            return "client_secret_basic"
+        if "client_secret_post" in supported:
+            return "client_secret_post"
+        return "client_secret_basic"
 
 
 class RefreshAwareOAuthClientProvider(OAuthClientProvider):
@@ -595,6 +679,16 @@ class RefreshAwareOAuthClientProvider(OAuthClientProvider):
         client_metadata_url: str | None = None,
     ) -> None:
         super().__init__(
+            server_url=server_url,
+            client_metadata=client_metadata,
+            storage=storage,
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
+            client_metadata_url=client_metadata_url,
+        )
+        # The base class builds a plain OAuthContext; swap it for the one that
+        # authenticates a server-issued client secret on every token request.
+        self.context = _ServerIssuedSecretContext(
             server_url=server_url,
             client_metadata=client_metadata,
             storage=storage,
@@ -694,7 +788,10 @@ def build_oauth_provider(
 
 
 async def perform_oauth_login(
-    server: MCPHttp | MCPStreamableHttp, *, on_url: Callable[[str], Awaitable[None]]
+    server: MCPHttp | MCPStreamableHttp,
+    *,
+    on_url: Callable[[str], Awaitable[None]],
+    headers: Mapping[str, str] | None = None,
 ) -> None:
     auth = server.auth
     if not isinstance(auth, MCPOAuth):
@@ -702,28 +799,84 @@ async def perform_oauth_login(
             "perform_oauth_login requires an OAuth-configured MCP server; "
             f"server {server.name!r} uses auth.type={type(auth).__name__}"
         )
-    handler = LoopbackCallbackHandler(port=auth.redirect_port, server_alias=server.name)
-    provider = build_oauth_provider(
-        server, redirect_handler=on_url, callback_handler=handler.serve_once
-    )
+    declared = dict(headers or {})
     try:
         try:
-            await _request_oauth_login(server, provider)
+            await _attempt_oauth_login(server, auth, on_url, declared)
         except MCPOAuthInvalidGrant:
-            await _request_oauth_login(server, provider)
+            # invalid_grant already cleared the stored creds; retry runs fresh.
+            await _attempt_oauth_login(server, auth, on_url, declared)
+        except MCPOAuthTransientRefreshError:
+            # A non-invalid_grant refresh failure (e.g. pruned DCR client -> 5xx)
+            # keeps the creds, so a plain retry just re-refreshes and fails the
+            # same way. Drop them and retry once as a fresh authorization.
+            await delete_oauth_credentials(server.name)
+            await _attempt_oauth_login(server, auth, on_url, declared)
     except MCPOAuthTransientRefreshError as exc:
         raise MCPOAuthLoginFailed(
             server_alias=server.name, reason=f"Transient error: {exc.reason}"
         ) from exc
     except (OAuthTokenError, OAuthFlowError, httpx.HTTPError, OSError) as exc:
         raise MCPOAuthLoginFailed(server_alias=server.name, reason=str(exc)) from exc
+    # A probe the server never challenges leaves no token, so fail loudly rather than save a false-success fingerprint.
+    if await KeyringTokenStorage(alias=server.name).get_tokens() is None:
+        raise MCPOAuthLoginFailed(
+            server_alias=server.name,
+            reason="the server never issued an OAuth challenge, so no token was obtained",
+        )
     await Fingerprint.compute(server).save(server.name)
 
 
+async def _attempt_oauth_login(
+    server: MCPHttp | MCPStreamableHttp,
+    auth: MCPOAuth,
+    on_url: Callable[[str], Awaitable[None]],
+    declared_headers: Mapping[str, str],
+) -> None:
+    # Fresh provider per attempt so a retry reads the current keyring state, not
+    # the previous attempt's in-memory tokens.
+    handler = LoopbackCallbackHandler(port=auth.redirect_port, server_alias=server.name)
+    provider = build_oauth_provider(
+        server, redirect_handler=on_url, callback_handler=handler.serve_once
+    )
+    await _request_oauth_login(server, provider, declared_headers)
+
+
+def _initialize_message() -> dict[str, object]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": LATEST_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": _CLIENT_NAME, "version": __version__},
+        },
+    }
+
+
 async def _request_oauth_login(
-    server: MCPHttp | MCPStreamableHttp, provider: OAuthClientProvider
+    server: MCPHttp | MCPStreamableHttp,
+    provider: OAuthClientProvider,
+    declared_headers: Mapping[str, str],
 ) -> None:
     async with VibeAsyncHTTPClient(
         auth=provider, timeout=_LOGIN_TIMEOUT_SECONDS, verify=build_ssl_context()
     ) as client:
-        await client.get(server.url)
+        # A login has nothing to ask; it needs the 401 that starts the flow.
+        # Streamable HTTP endpoints route on POST and answer a bare GET with
+        # 405 before looking at credentials, so only a real ``initialize``
+        # draws the challenge. Streamed because an authorized server answers
+        # with an event stream, and the login is done at the headers either way.
+        #
+        # Declared headers ride along for the same reason: this has to be the
+        # request every other one to this url is, or a server that routes on
+        # them need not answer with the challenge at all. ``Accept`` stays
+        # ours -- the transport depends on it.
+        async with client.stream(
+            "POST",
+            server.url,
+            json=_initialize_message(),
+            headers={**declared_headers, "Accept": _MCP_ACCEPT},
+        ):
+            pass

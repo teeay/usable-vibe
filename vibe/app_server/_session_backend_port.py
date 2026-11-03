@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,45 +11,81 @@ from pydantic import JsonValue
 from vibe.app_server._dispatch import DispatchResult
 from vibe.app_server._model import ProtocolModel
 from vibe.app_server.events import AppServerEvent
-from vibe.app_server.models import PublicCallbackEntry
+from vibe.app_server.models import (
+    PublicCallbackEntry,
+    PublicSessionState,
+    SessionLogSummary,
+)
 from vibe.app_server.protocol import (
+    AgentInstallParams,
+    AgentsListResponse,
     AgentSwitchParams,
     CallbackResultError,
     CallbackResultParams,
     CallbackResultResponse,
     ConfigMutationResponse,
+    ConfigReadParams,
+    ConfigReadResponse,
     ConfigReloadParams,
     ConfigWriteParams,
     ConfigWriteResponse,
     ContextInjectParams,
     ContextInjectResponse,
     EmptyResponse,
+    ModelConfigWriteParams,
     ProtocolErrorCode,
     RuntimeMutationResponse,
     RuntimeUpdatedParams,
+    SessionArchiveParams,
+    SessionArchiveResponse,
     SessionCompactParams,
     SessionCompactResponse,
     SessionContinueParams,
+    SessionDeleteParams,
     SessionForkParams,
     SessionForkResponse,
+    SessionHistoryClearParams,
+    SessionHistoryListParams,
+    SessionHistoryListResponse,
+    SessionLeaseHolder,
     SessionListParams,
     SessionListResponse,
+    SessionMarkAsSeenParams,
+    SessionPinParams,
+    SessionPinResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionResumeParams,
+    SessionRewindParams,
+    SessionRewindResponse,
     SessionSettingsUpdateParams,
     SessionStartParams,
+    SessionTitleUpdateParams,
+    SessionTitleUpdateResponse,
+    TurnEnqueueParams,
+    TurnEnqueueResponse,
     TurnInterruptParams,
     TurnInterruptResponse,
+    TurnQueueReadParams,
+    TurnQueueReadResponse,
+    TurnQueueRemoveParams,
+    TurnQueueRemoveResponse,
+    TurnQueueReplaceParams,
+    TurnQueueReplaceResponse,
+    TurnQueueResumeParams,
+    TurnQueueResumeResponse,
+    TurnQueueSteerParams,
+    TurnQueueSteerResponse,
     TurnStartParams,
     TurnStartResponse,
     TurnSteerParams,
     TurnSteerResponse,
 )
 
-type SessionBackendKind = Literal["python", "rust"]
+type SessionBackendKind = Literal["legacy", "unified"]
 type MCPAuthorizationReason = Literal["missing", "expired", "rejected", "invalid"]
 type ConnectorAuthAction = Literal["none", "oauth", "credentials_setup", "unknown"]
+type MCPCatalogOwner = Literal["config", "plugin"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +94,10 @@ class MCPAuthorizationRef:
     server_fingerprint: str
     kind: Literal["none", "static", "oauth"]
     descriptor_revision: str
+    # Two catalogs share one name namespace, so the name alone is ambiguous.
+    # Carried rather than inferred: resolving a plugin's reference against a
+    # configured server would hand the plugin that server's credentials.
+    owner: MCPCatalogOwner = "config"
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,10 +307,18 @@ class SessionMCPControl(Protocol):
 
 class SessionBackendError(Exception):
     def __init__(
-        self, code: ProtocolErrorCode, message: str, data: JsonValue = None
+        self,
+        code: ProtocolErrorCode,
+        message: str,
+        data: JsonValue = None,
+        *,
+        after_response: Callable[[], None] | None = None,
+        on_response_abandoned: Callable[[], None] | None = None,
     ) -> None:
         self.code = code
         self.data = data
+        self.after_response = after_response
+        self.on_response_abandoned = on_response_abandoned
         super().__init__(message)
 
 
@@ -293,6 +341,7 @@ class SessionEventSubscription:
 class SessionForkResult:
     response: SessionForkResponse
     backend: SessionBackend | None
+    after_response: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,9 +359,28 @@ class SessionLifecycleResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionHistoryClearResult:
+    backend: SessionBackend
+    state: PublicSessionState
+    session_log: SessionLogSummary
+    after_response: Callable[[], None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRewindForkResult:
+    """A rewind that lands on a new session, leaving the source untouched."""
+
+    backend: SessionBackend
+    response: SessionRewindResponse
+    after_response: Callable[[], None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SessionBackendResult[ResponseT: ProtocolModel]:
     response: ResponseT
     after_response: Callable[[], None] | None = None
+    on_response_abandoned: Callable[[], None] | None = None
+    runtime_updated: bool = False
 
 
 class SessionBackend(Protocol):
@@ -331,12 +399,24 @@ class SessionBackend(Protocol):
         self, params: AgentSwitchParams
     ) -> SessionBackendResult[RuntimeMutationResponse]: ...
 
+    async def install_agent(
+        self, params: AgentInstallParams
+    ) -> SessionBackendResult[AgentsListResponse]: ...
+
+    async def uninstall_agent(
+        self, params: AgentInstallParams
+    ) -> SessionBackendResult[AgentsListResponse]: ...
+
     async def update_settings(
         self, params: SessionSettingsUpdateParams
     ) -> SessionBackendResult[EmptyResponse]: ...
 
     async def write_config(
         self, params: ConfigWriteParams
+    ) -> SessionBackendResult[ConfigWriteResponse]: ...
+
+    async def write_model_config(
+        self, params: ModelConfigWriteParams
     ) -> SessionBackendResult[ConfigWriteResponse]: ...
 
     async def reload_config(
@@ -346,6 +426,26 @@ class SessionBackend(Protocol):
     async def start_turn(
         self, params: TurnStartParams
     ) -> SessionBackendResult[TurnStartResponse]: ...
+
+    async def enqueue_turn(
+        self, params: TurnEnqueueParams
+    ) -> SessionBackendResult[TurnEnqueueResponse]: ...
+
+    async def read_turn_queue(
+        self, params: TurnQueueReadParams
+    ) -> SessionBackendResult[TurnQueueReadResponse]: ...
+
+    async def remove_queued_turn(
+        self, params: TurnQueueRemoveParams
+    ) -> SessionBackendResult[TurnQueueRemoveResponse]: ...
+
+    async def replace_queued_turn(
+        self, params: TurnQueueReplaceParams
+    ) -> SessionBackendResult[TurnQueueReplaceResponse]: ...
+
+    async def resume_turn_queue(
+        self, params: TurnQueueResumeParams
+    ) -> SessionBackendResult[TurnQueueResumeResponse]: ...
 
     async def steer_turn(
         self, params: TurnSteerParams
@@ -368,6 +468,15 @@ class SessionBackend(Protocol):
     ) -> SessionBackendResult[SessionCompactResponse]: ...
 
     async def shutdown(self) -> None: ...
+
+
+@runtime_checkable
+class SessionBackendQueuedTurnSteering(Protocol):
+    """Optional atomic transfer of an accepted queued Turn into the active Turn."""
+
+    async def steer_queued_turn(
+        self, params: TurnQueueSteerParams
+    ) -> SessionBackendResult[TurnQueueSteerResponse]: ...
 
 
 @runtime_checkable
@@ -445,7 +554,84 @@ class SessionBackendHost(Protocol):
 
     async def read(self, params: SessionReadParams) -> SessionReadResponse: ...
 
+    async def rename(
+        self, params: SessionTitleUpdateParams
+    ) -> SessionTitleUpdateResponse: ...
+
     async def shutdown(self) -> None: ...
+
+
+@runtime_checkable
+class SessionBackendHostPin(Protocol):
+    """Optional selected-backend ownership of durable session pinning."""
+
+    async def pin(self, params: SessionPinParams) -> SessionPinResponse: ...
+
+
+@runtime_checkable
+class SessionBackendHostLeaseWatch(Protocol):
+    def watch_leases(
+        self,
+    ) -> AsyncGenerator[dict[str, SessionLeaseHolder | None], None]: ...
+
+
+@runtime_checkable
+class SessionBackendHostSeenState(Protocol):
+    """Optional selected-backend ownership of durable session seen state."""
+
+    async def mark_as_seen(self, params: SessionMarkAsSeenParams) -> EmptyResponse: ...
+
+
+@runtime_checkable
+class SessionBackendHostConfigRead(Protocol):
+    """Optional selected-backend ownership of a stored session's configuration."""
+
+    async def read_config(self, params: ConfigReadParams) -> ConfigReadResponse: ...
+
+
+@runtime_checkable
+class SessionBackendHostHistoryList(Protocol):
+    """Optional selected-backend paging of a stored session's history."""
+
+    async def list_history(
+        self, params: SessionHistoryListParams
+    ) -> SessionHistoryListResponse: ...
+
+
+@runtime_checkable
+class SessionBackendHostArchive(Protocol):
+    """Optional selected-backend ownership of durable session archiving."""
+
+    async def archive(self, params: SessionArchiveParams) -> SessionArchiveResponse: ...
+
+
+@runtime_checkable
+class SessionBackendHostDelete(Protocol):
+    """Optional selected-backend ownership of durable session deletion."""
+
+    async def delete(self, params: SessionDeleteParams) -> EmptyResponse: ...
+
+
+@runtime_checkable
+class SessionBackendHistoryClearHost(Protocol):
+    async def clear_history(
+        self, source: SessionBackend, params: SessionHistoryClearParams
+    ) -> SessionHistoryClearResult: ...
+
+
+@runtime_checkable
+class SessionBackendRewindForkHost(Protocol):
+    """Optional Host ownership of the fork half of ``session/rewind``.
+
+    A backend whose sessions are immutable stores cannot rewind into a new
+    session from inside the session it is rewinding: the replacement has to be
+    opened by whoever owns session identity. Backends that rewind in place
+    answer ``session/rewind`` themselves and do not implement this.
+    """
+
+    async def rewind_fork(
+        self, source: SessionBackend, params: SessionRewindParams
+    ) -> SessionRewindForkResult: ...
 
 
 @runtime_checkable

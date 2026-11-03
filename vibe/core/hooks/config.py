@@ -86,6 +86,7 @@ def load_hooks_file(path: Path, *, strict: bool = False) -> HookConfigResult:
                     message=f"{label} - {_format_validation_error(e, root_label='hook')}",
                 )
             )
+            continue
 
     return HookConfigResult(hooks=hooks, issues=issues)
 

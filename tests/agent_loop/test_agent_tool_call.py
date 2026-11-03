@@ -399,11 +399,14 @@ async def test_tool_call_with_invalid_action() -> None:
 
     events = await act_and_collect_events(agent_loop, "What's my todo list?")
 
+    # `action` is a Literal, so an unknown one is rejected while parsing the
+    # arguments -- the call never reaches the tool and no ToolCallEvent is emitted.
     assert isinstance(events[0], UserMessageEvent)
-    assert isinstance(events[3], ToolResultEvent)
-    assert events[3].error is not None
-    assert events[3].result is None
-    assert "tool_error" in events[3].error.lower()
+    assert isinstance(events[2], ToolResultEvent)
+    assert events[2].error is not None
+    assert events[2].result is None
+    assert "tool_error" in events[2].error.lower()
+    assert "'read' or 'write'" in events[2].error
     assert agent_loop.stats.tool_calls_failed == 1
 
 
@@ -1031,6 +1034,28 @@ async def test_parallel_conversation_history_has_all_tool_messages() -> None:
         "call_h3",
     }
     assert agent_loop.stats.tool_calls_succeeded == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enable_streaming", [False, True])
+async def test_tool_call_id_reused_across_completions_is_made_unique(
+    enable_streaming: bool,
+) -> None:
+    reused_call = [
+        mock_llm_chunk(content="", tool_calls=[make_todo_tool_call("call_0")])
+    ]
+    agent_loop = build_test_agent_loop(
+        config=make_config(),
+        agent_name=BuiltinAgentName.AUTO_APPROVE,
+        backend=FakeBackend([reused_call, reused_call, [mock_llm_chunk("Done.")]]),
+        enable_streaming=enable_streaming,
+    )
+
+    events = await act_and_collect_events(agent_loop, "Check twice")
+
+    result_ids = [e.tool_call_id for e in events if isinstance(e, ToolResultEvent)]
+    assert result_ids[0] == "call_0"
+    assert len(set(result_ids)) == 2
 
 
 @pytest.mark.asyncio

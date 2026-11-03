@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+from pydantic import Field
+
 from vibe.app_server._model import ProtocolModel
 from vibe.config_values import (
     THINKING_LEVELS as THINKING_LEVELS,
@@ -20,6 +22,17 @@ class ModelConfigView(ProtocolModel):
     thinking: ThinkingLevel
     supports_images: bool
     display_name: str
+    # None when the model's window is unknown; defaulted so older clients
+    # tolerate the field's absence (ADR 0014).
+    max_context_length: int | None = None
+    # The levels the active model offers; defaulted so a client against an
+    # older server still renders the five (ADR 0014).
+    thinking_levels: list[ThinkingLevel] = Field(
+        default_factory=lambda: list(THINKING_LEVELS)
+    )
+    # Expected delivery of file-backed images; None means the runtime has not
+    # advertised a delivery mode. Native model support alone is not a fallback policy.
+    image_delivery: Literal["native", "resource_link"] | None = None
 
 
 class TranscribeModelConfigView(ProtocolModel):
@@ -61,12 +74,19 @@ class ConfigView(ProtocolModel):
     active_model: ModelConfigView
     # Whether the user has pinned a specific model, vs. the "default" (unpinned)
     active_model_pinned: bool
+    # Wider than `active_model.supports_images`, which stays a per-model fact:
+    # the backend may be able to show a model without vision something other
+    # than the pixels.
+    images_supported: bool = False
     # Cold-cache first launch
     awaiting_experiment_model: bool = False
     default_model_alias: str
+    default_agent: str = "accept-edits"
     theme: str
     log_level: str | None
     disable_welcome_banner_animation: bool
+    # Preserve blinking when reading an older app-server response (ADR 0014).
+    cursor_blink: bool = True
     show_greeting: bool
     autocopy_to_clipboard: bool
     file_watcher_for_autocomplete: bool
@@ -74,9 +94,18 @@ class ConfigView(ProtocolModel):
     voice_mode_enabled: bool
     narrator_enabled: bool
     show_thinking_nodes: bool
+    show_subagent_status_list: bool
+    worktree_limit: int
     enable_update_checks: bool
     enable_notifications: bool
-    vibe_code_enabled: bool
+    # ADR 0015: the outbound TLS trust policy the Rust client's update
+    # gateway applies; the server keeps its own copy for MCP/connector TLS.
+    enable_system_trust_store: bool = False
+    experimental_enable_tab_status: bool
+    # Consent gate for client-local sinks (the Rust client's crash reporter).
+    # Datalake events stay server-gated; clients never decide that.
+    enable_telemetry: bool = True
+    experimental_enable_registry_skills: bool = False
     native_scroll_shorten_tool_output: bool
     native_scroll_tool_output_head_lines: int
     native_scroll_tool_output_tail_lines: int

@@ -27,9 +27,9 @@ from vibe.config_values import (
     TranscriptionEncoding,
 )
 from vibe.core.config._defaults import (
-    DEFAULT_AUTO_COMPACT_THRESHOLD,
     DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL,
     DEFAULT_MISTRAL_BROWSER_AUTH_BASE_URL,
+    UNSET_AUTO_COMPACT_THRESHOLD,
 )
 from vibe.core.paths import SESSION_LOG_DIR
 from vibe.core.types import Backend
@@ -61,12 +61,54 @@ class ExperimentsConfig(BaseSettings):
     client_key: str = "sdk-OE8yJgTXZY6tj"
 
 
+class UtilityFeature(StrEnum):
+    """A background feature with its own model; values are ``[utility_models]`` keys."""
+
+    TITLE = "title"
+    SMART_APPROVE = "smart_approve"
+
+
+# The ``[utility_models]`` value that selects the session's active model.
+ACTIVE_MODEL_SELECTOR = "active"
+
+
+class UtilityModelsConfig(BaseSettings):
+    """Per-feature model aliases; empty means automatic selection."""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    title: str = ""
+    smart_approve: str = ""
+
+    def alias_for(self, feature: UtilityFeature) -> str:
+        match feature:
+            case UtilityFeature.TITLE:
+                return self.title.strip()
+            case UtilityFeature.SMART_APPROVE:
+                return self.smart_approve.strip()
+
+    def configured(self) -> list[tuple[UtilityFeature, str]]:
+        """Features with a non-empty override."""
+        return [
+            (feature, alias)
+            for feature in UtilityFeature
+            if (alias := self.alias_for(feature))
+        ]
+
+
 class SessionLoggingConfig(BaseSettings):
+    # Matches its sibling groups. Under per-field merging the union of keys
+    # from every layer reaches the validator, so forbidding extras would turn
+    # one unrecognised key in any layer -- a project file naming a setting from
+    # a newer Vibe, say -- into a hard config-load failure.
+    model_config = SettingsConfigDict(extra="ignore")
+
     save_dir: str = ""
     session_prefix: str = "session"
     enabled: bool = True
     # Background LLM-generated session titles (shown in --resume and the
-    # terminal tab). Off falls back to the first-message preview.
+    # terminal tab) for CLI and Desktop clients. False falls back to the
+    # first-message preview.
     generate_titles: bool = True
 
     @field_validator("save_dir", mode="before")
@@ -88,6 +130,12 @@ class ProviderConfig(BaseModel):
     api_key_env_var: str = ""
     browser_auth_base_url: str | None = None
     browser_auth_api_base_url: str | None = None
+    # Split-horizon deployments (e.g. behind an SAP Cloud Connector) expose the
+    # console under a virtual host the CLI reaches but the server does not know
+    # about, so it returns sign-in/poll URLs on its own public host. When True,
+    # returned URLs are re-homed onto the configured browser auth base URLs
+    # instead of being rejected for an origin mismatch.
+    browser_auth_allow_origin_rewrite: bool = False
     api_style: str = "openai"
     backend: Backend = Backend.GENERIC
     reasoning_field_name: str = "reasoning_content"
@@ -429,15 +477,76 @@ class ModelConfig(BaseModel):
     alias: str
     display_name: str | None = None
     temperature: float = 0.2
+    # Request settings read by the Unified Harness runtime only; the legacy
+    # agent loop does not send them.
+    # Nucleus sampling; None leaves it to the provider's default.
+    top_p: float | None = Field(default=None, gt=0, le=1)
+    # Cap on output tokens per model request; None leaves it to the provider.
+    # A session's own ``max_tokens`` limit, when set, takes precedence.
+    max_output_tokens: int | None = Field(default=None, ge=1)
     input_price: float = 0.0  # Price per million input tokens
     output_price: float = 0.0  # Price per million output tokens
     cached_input_price: float | None = (
         None  # Price per million cached input tokens; None bills them at input_price
     )
     thinking: ThinkingLevel = "off"
+    # The levels this model offers, in display order. Defaults to the CLI's
+    # five; a narrowed set resets a stored level that falls outside it.
+    thinking_levels: list[ThinkingLevel] = Field(
+        default_factory=lambda: list(THINKING_LEVELS)
+    )
     supports_images: bool = False
-    auto_compact_threshold: int = DEFAULT_AUTO_COMPACT_THRESHOLD
+    # None when the window is unknown; 0 or a negative would silently disable
+    # compaction by deriving an unreachable threshold, so it must be rejected.
+    max_context_length: int | None = Field(default=None, ge=1)
+    auto_compact_threshold: int = UNSET_AUTO_COMPACT_THRESHOLD
     _default_alias_to_name = model_validator(mode="before")(_default_alias_to_name)
+
+    @field_validator("thinking_levels", mode="after")
+    @classmethod
+    def _empty_set_offers_off(cls, value: list[ThinkingLevel]) -> list[ThinkingLevel]:
+        # An empty set means "no thinking control", not "nothing offered":
+        # distinct from unset, which keeps the five. The catalog mapping relies
+        # on the distinction (unspecified vs explicitly none). Duplicates are
+        # dropped in first-seen order: the picker renders one row per level.
+        return list(dict.fromkeys(value)) or ["off"]
+
+    @property
+    def default_thinking(self) -> ThinkingLevel:
+        """The level a model lands on when its stored one is not offered.
+
+        ``high`` when the set offers it, else the set's last entry: rank comes
+        from list order, the same order the pickers render, so a level the CLI
+        does not know yet still ranks.
+        """
+        if "high" in self.thinking_levels:
+            return "high"
+        return self.thinking_levels[-1]
+
+    @property
+    def thinking_levels_curated(self) -> bool:
+        """Whether the offered set was narrowed from the CLI's default five.
+
+        The uncurated default makes no claim about the model, so consumers
+        (e.g. the Mistral backend's reasoning-effort mapping) treat it
+        differently from a set someone deliberately wrote.
+        """
+        return set(self.thinking_levels) != set(THINKING_LEVELS)
+
+    @model_validator(mode="after")
+    def _reset_thinking_outside_levels(self) -> ModelConfig:
+        # Curation can narrow a set under a level the user already stored.
+        # Re-derived on every load, like the active-model fallback: the stored
+        # value stays in the user's file and applies again if the set widens.
+        if self.thinking not in self.thinking_levels:
+            # "low" was the historical no-reasoning pick; a curated set that
+            # dropped it carries that intent in "off" instead of re-enabling
+            # reasoning through default_thinking.
+            if self.thinking == "low" and "off" in self.thinking_levels:
+                self.thinking = "off"
+            else:
+                self.thinking = self.default_thinking
+        return self
 
 
 def normalize_model_configs(value: Any) -> Any:
@@ -471,10 +580,15 @@ def serialize_model_configs(value: Any) -> Any:
 
 def _serialize_model_entry(model: Any) -> Any:
     if isinstance(model, ModelConfig):
-        return model.model_dump(exclude_none=True)
-    if isinstance(model, Mapping):
-        return {key: value for key, value in model.items() if value is not None}
-    return model
+        entry = model.model_dump(exclude_none=True)
+    elif isinstance(model, Mapping):
+        entry = {key: value for key, value in model.items() if value is not None}
+    else:
+        return model
+    # The unset sentinel is merge-internal; it must never reach a TOML file.
+    if entry.get("auto_compact_threshold") == UNSET_AUTO_COMPACT_THRESHOLD:
+        del entry["auto_compact_threshold"]
+    return entry
 
 
 def normalize_model_configs_with_defaults(value: Any, defaults: Any) -> Any:

@@ -117,7 +117,7 @@ def _shell_effect_entry(
 
 
 def _agent_bash_effect_entry(
-    *, command: str, stdout: str, stderr: str = ""
+    *, command: str, stdout: str, stderr: str = "", tool_name: str = "bash"
 ) -> PublicEffectEntry:
     return PublicEffectEntry(
         id="effect-1",
@@ -128,7 +128,7 @@ def _agent_bash_effect_entry(
         updated_at=1,
         title="bash",
         detail=ShellEffectDetail(
-            tool_name="bash",
+            tool_name=tool_name,
             input=ShellEffectInput(command=command),
             display=EffectCallDisplay(
                 summary=f"bash: {command}", status_text="Running command"
@@ -650,15 +650,17 @@ def test_stray_hook_end_without_run_commits_single_line() -> None:
     assert "[legacy] boom" in text
 
 
-def test_commit_manual_bash_renders_durable_block() -> None:
+def test_manual_bash_effect_renders_durable_block() -> None:
     committer = _committer()
-    committer.commit_manual_bash("echo hi", "hi", 0)
+    committer.handle_app_server_event(
+        HistoryEntryAdded(_shell_effect_entry(command="echo hi", output_text="hi"))
+    )
     text = _drain_text(committer)
     assert "$ echo hi" in text
     assert "hi" in text
 
 
-def test_commit_manual_bash_keeps_full_output_with_preview_config() -> None:
+def test_manual_bash_effect_keeps_full_output_with_preview_config() -> None:
     committer = ScrollbackCommitter(
         width_getter=lambda: 80,
         color_system=None,
@@ -666,31 +668,52 @@ def test_commit_manual_bash_keeps_full_output_with_preview_config() -> None:
         tool_output_head_lines=lambda: 1,
         tool_output_tail_lines=lambda: 2,
     )
-    committer.commit_manual_bash(
-        "seq 6", "\n".join(f"line {i}" for i in range(1, 7)), 0
+    committer.handle_app_server_event(
+        HistoryEntryAdded(
+            _shell_effect_entry(
+                command="seq 6", output_text="\n".join(f"line {i}" for i in range(1, 7))
+            )
+        )
     )
     text = _drain_text(committer)
     assert "$ seq 6" in text
-    assert "line 1" in text
-    assert "line 2" in text
-    assert "line 4" in text
-    assert "line 5" in text
-    assert "line 6" in text
+    for i in range(1, 7):
+        assert f"line {i}" in text
     assert "omitted" not in text
 
 
-def test_commit_manual_bash_flushes_streaming_buffer_first() -> None:
+def test_agent_bash_effect_with_canonical_route_renders_without_prompt_echo() -> None:
+    committer = _committer()
+    committer.handle_app_server_event(
+        HistoryEntryAdded(
+            _agent_bash_effect_entry(
+                command="echo hi", stdout="hi", tool_name="file_system.bash"
+            )
+        )
+    )
+    text = _drain_text(committer)
+    assert "$ echo hi" not in text
+    assert "hi" in text
+
+
+def test_manual_bash_effect_flushes_streaming_buffer_first() -> None:
     committer = _committer()
     committer.handle_event(AssistantEvent(content="pending text"))
-    committer.commit_manual_bash("ls", "out", 0)
+    committer.handle_app_server_event(
+        HistoryEntryAdded(_shell_effect_entry(command="ls", output_text="out"))
+    )
     text = _drain_text(committer)
     # The streaming buffer is flushed before the bash block, preserving order.
     assert text.index("pending text") < text.index("$ ls")
 
 
-def test_commit_manual_bash_no_output_and_interrupted() -> None:
+def test_manual_bash_cancelled_effect_marks_interrupted() -> None:
+    from vibe.app_server.models import CancelledEffectState
+
     committer = _committer()
-    committer.commit_manual_bash("sleep 5", "", 1, interrupted=True)
+    entry = _shell_effect_entry(command="sleep 5", output_text="")
+    entry.state = CancelledEffectState(reason="interrupted")
+    committer.handle_app_server_event(HistoryEntryAdded(entry))
     text = _drain_text(committer)
     assert "(no output)" in text
     assert "interrupted" in text

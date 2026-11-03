@@ -4,20 +4,34 @@ Resolution runs once per session context: the roots are discovered, every
 plugin is parsed and materialized, and the result is projected into the
 portable snapshot the Session Runtime reads. Only the Unified backend reaches
 this module — the legacy backend never resolves plugins.
+
+This is also the single file in Vibe that implements the Session Runtime's
+plugin port. `UnifiedPluginProvider` is the whole of the seam: everything
+plugin-shaped stays on this side of it, and the Runtime below knows only names,
+paths, and digests.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import shutil
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
 from vibe.agents import AgentType
+from vibe.app_server._agent_types import (
+    AgentToolCatalogue,
+    AgentTypeSource,
+    resolve_agent_types,
+)
+from vibe.app_server._skills import project_model_invocable_plugin_contexts
 from vibe.app_server.models import (
     ConfigIssue,
     PluginComponent,
@@ -26,35 +40,71 @@ from vibe.app_server.models import (
 )
 from vibe.core.config import VibeConfigSchema
 from vibe.core.config.harness_files import HarnessFilesManager
+from vibe.core.config.models import MCPHttp, MCPStdio, MCPStreamableHttp
 from vibe.core.config.orchestrator import ConfigOrchestrator
+from vibe.core.paths import VIBE_HOME
 from vibe.core.plugins import (
+    DetectedPluginFormat,
     MaterializedPluginSet,
     PluginAgentDefinition,
     PluginConfigIssue,
     PluginKnowledgeDefinition,
     PluginMaterializer,
+    PluginMCPServerDefinition,
     PluginPathRef,
     PluginResolver,
+    PluginRouteKey,
+    PluginRouteStatus,
+    ResolvedPluginSet,
     ResolvedPluginSnapshot,
     build_snapshot,
+    plugin_runtime_state_names,
     plugin_skill_runtime_path,
+    reconcile_plugin_routes,
+    redact_argv,
+    redact_names,
+    redact_url,
     resolve_plugin_path,
-    snapshot_digest,
+    retain_pinned_tools,
+    snapshot_bytes,
+    validate_resolved_plugin_snapshot,
 )
-from vibe.core.skills.models import SkillInfo
+from vibe.core.skills.models import SkillInfo, SkillScope
 
 if TYPE_CHECKING:
-    from mistralai_rust_harness.protocol import (  # pyright: ignore[reportMissingImports]
+    from pydantic import JsonValue
+
+    from mistralai_vibe_local_harness.protocol import (
         RustAgentTypeDefinition,
         RustKnowledgeFolderDefinition,
         RustPluginContextDefinition,
         RustSkillDefinition,
     )
-    from mistralai_rust_harness.vibe._storage import (  # pyright: ignore[reportMissingImports]
-        PluginLockV1,
+    from mistralai_vibe_local_harness.session_protocol import (
+        PluginInfo as HarnessPluginInfo,
+        ResolvedPluginDefinition,
     )
+    from mistralai_vibe_local_harness.vibe.plugins import (
+        DeclaredAgentTypeProfile,
+        PinnedPlugins,
+        RestoredPlugins,
+        SessionPluginProjection,
+    )
+    from vibe.app_server._plugin_mcp import PluginMCPCatalog
+    from vibe.app_server._sandbox_skills import SandboxSkills
+    from vibe.core.config.models import MCPServer
+    from vibe.core.tools.connectors.connector_registry import ConnectorRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def packaged_builtin_plugin_roots() -> list[Path]:
+    """Discover built-in plugin directories shipped inside the package."""
+    try:
+        import vibe.plugins.builtins as _pkg
+    except ImportError:
+        return []
+    return [Path(_pkg.__file__).parent]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,101 +112,512 @@ class SessionPlugins:
     """Everything one session needs to know about its plugins."""
 
     materialized: MaterializedPluginSet
+
     snapshot: ResolvedPluginSnapshot
-    # The workdir discovery was rooted at, captured here rather than re-derived
-    # from the process working directory when the catalogue is read: a client
-    # asking what the session is running must not be answered from wherever the
-    # reader happens to stand.
+    """The catalogue the session runs: at restore the pinned one, not this resolve's.
+
+    A pinned tool the reconnected source dropped stays in it, marked; one the
+    source now advertises that the pin does not carry is not added.
+    """
+
     workdir: Path
+    """Where discovery was rooted, so a reader is never answered from its own cwd."""
+
+    routes: Mapping[PluginRouteKey, PluginRouteStatus] = MappingProxyType({})
+    """Per-route status at restore. Empty at create, where every route is live."""
 
     @property
     def issues(self) -> tuple[PluginConfigIssue, ...]:
         return self.materialized.issues
+
+    def route_status(self, group: str, function: str) -> PluginRouteStatus:
+        """What a call into one route would do. ``live`` unless proven otherwise."""
+        return self.routes.get((group, function), "live")
 
 
 async def resolve_session_plugins(
     harness_files: HarnessFilesManager,
     *,
     config_orchestrator: ConfigOrchestrator[VibeConfigSchema] | None = None,
+    plugin_mcp: PluginMCPCatalog | None = None,
+    connector_registry: ConnectorRegistry | None = None,
+    builtin_plugin_roots: list[Path] | None = None,
 ) -> SessionPlugins:
     """Resolve, materialize, and project the plugins visible to a session.
 
-    Resolution never raises on a bad plugin: a plugin that fails to parse is
-    dropped and reported through ``issues``, so one broken plugin cannot stop a
-    session from starting.
+    Never raises on a bad plugin: it is dropped and reported through ``issues``,
+    so one broken plugin cannot stop a session from starting.
+
+    Without the MCP catalog and the connector registry no tools materialize,
+    which is supported. The exception is a plugin declaring a managed connector
+    while ``connector_registry`` is ``None``, which reports itself: an
+    account-scoped source vanishing silently is a session the operator
+    diagnoses by hand.
+
+    ``builtin_plugin_roots`` overrides the default built-in plugin discovery.
+    Pass an empty list to suppress built-in plugins (used in tests that assert
+    exact plugin sets).
     """
-    resolution = PluginResolver.from_harness_files(
-        harness_files, config_orchestrator=config_orchestrator
-    ).resolve()
-    materialized = await PluginMaterializer().materialize(resolution)
+    if builtin_plugin_roots is None:
+        builtin_plugin_roots = packaged_builtin_plugin_roots()
+    resolution = await asyncio.to_thread(
+        _resolve_installed, harness_files, config_orchestrator, builtin_plugin_roots
+    )
+    materialized = await _materialize(resolution, plugin_mcp, connector_registry)
     return SessionPlugins(
         materialized=materialized,
         snapshot=build_snapshot(materialized),
-        # The same fallback the manager applies when it walks for project roots,
-        # so this is the directory discovery actually started from.
         workdir=harness_files.cwd or Path.cwd(),
     )
 
 
-def plugin_lock(plugins: SessionPlugins) -> PluginLockV1:
-    """Pin the plugin environment this session is created against.
+def _resolve_installed(
+    harness_files: HarnessFilesManager,
+    config_orchestrator: ConfigOrchestrator[VibeConfigSchema] | None,
+    builtin_roots: list[Path],
+) -> ResolvedPluginSet:
+    """Discover and resolve the installed plugin tree, off the event loop.
 
-    Each entry pins bytes: ``content_sha256`` is the tree digest of the plugin
-    root. ``environment_sha256`` pins the environment as a whole — the entries
-    plus the snapshot digest, which is what the Session Runtime is actually
-    handed. Bytes alone are not enough: the snapshot folds in hook and MCP
-    wiring that comes from config rather than from the plugin tree, so a plugin
-    disabled in config moves the environment without moving a single byte.
-
-    This detects; it does not restore. Nothing archives the plugin tree, so a
-    resumed session reads whatever is on disk now — which is exactly why the
-    comparison has to happen. ``validate_plugin_lock`` refuses the resume on a
-    mismatch rather than continuing a history that references components the
-    environment no longer has.
+    Both halves belong in the thread. Discovery walks the project roots looking
+    for plugin directories, and the resolve behind it reads and digests every
+    file under each one it found — a plugin that vendors its dependencies is
+    tens of thousands of syscalls, and the session opening behind this is what
+    waits. ``bind`` offloads the same work for the same reason.
     """
-    from mistralai_rust_harness.vibe._storage import (  # pyright: ignore[reportMissingImports]
-        PluginLockEntryV1,
-        PluginLockV1,
-        sha256_json,
-    )
+    return PluginResolver.from_harness_files(
+        harness_files,
+        builtin_roots=builtin_roots,
+        data_root_base=VIBE_HOME.path / "plugin-data",
+        config_orchestrator=config_orchestrator,
+    ).resolve()
 
-    # The lock requires names sorted and unique. The resolver already drops name
-    # collisions and sorts by name, but the lock's own ordering is the contract
-    # being satisfied here, so sort against it rather than relying on that.
-    entries = [
-        PluginLockEntryV1(
+
+def installed_plugin_scopes(plugins: SessionPlugins) -> dict[str, SkillScope]:
+    # Read off the resolve, never re-derived from paths: scope decides which
+    # checks a plugin is held to, so a second derivation that disagrees drops
+    # plugins the Host just loaded.
+    return {
+        plugin.name: plugin.scope for plugin in plugins.materialized.resolution.plugins
+    }
+
+
+async def _materialize(
+    resolution: ResolvedPluginSet,
+    plugin_mcp: PluginMCPCatalog | None,
+    connector_registry: ConnectorRegistry | None,
+) -> MaterializedPluginSet:
+    from vibe.core.plugins import RegistryConnectorCatalog
+
+    # Before materialization, which is where the declared servers are connected.
+    if plugin_mcp is not None:
+        await plugin_mcp.bind(resolution.mcp_servers)
+    materializer = PluginMaterializer(
+        mcp_discovery=None if plugin_mcp is None else plugin_mcp.discovery(),
+        connector_catalog=(
+            None
+            if connector_registry is None
+            else RegistryConnectorCatalog(connector_registry)
+        ),
+    )
+    return await materializer.materialize(resolution)
+
+
+def requested_plugin_definitions(
+    plugins: SessionPlugins,
+) -> list[ResolvedPluginDefinition]:
+    """Project a resolve onto the plugin set a session asks to be pinned.
+
+    The request half of the seam, travelling as ``AgentConfig.plugins``. It
+    names packages and the bytes they must have, and nothing about what is
+    inside them: anything more would be a plugin concept the Session Runtime is
+    not allowed to hold.
+
+    Only plugins that survived resolution are named. Pinning a dropped one would
+    record a package the session never had.
+    """
+    from mistralai_vibe_local_harness.session_protocol import ResolvedPluginDefinition
+
+    return [
+        ResolvedPluginDefinition(
             name=plugin.name,
-            version=plugin.version or "",
-            content_sha256=plugin.content_digest,
+            namespace=plugin.namespace,
+            version=plugin.version,
+            source_format=plugin.source_format.value,
+            manifest_digest=plugin.manifest_digest,
+            content_digest=plugin.content_digest,
         )
         for plugin in sorted(
-            plugins.materialized.resolution.plugins, key=lambda p: p.name
+            plugins.materialized.resolution.plugins, key=lambda item: item.name
         )
     ]
-    return PluginLockV1(
-        environment_sha256=sha256_json({
-            "plugins": [entry.model_dump(mode="json") for entry in entries],
-            "snapshot": snapshot_digest(plugins.snapshot),
-        }),
-        plugins=entries,
+
+
+class PluginReloadUnavailableError(Exception):
+    """This Runtime has no way to go looking for plugins a second time."""
+
+
+class UnifiedPluginProvider:
+    """Vibe's implementation of the Session Runtime's plugin port.
+
+    Four methods, and only ``pin`` reads an installed directory. Everything
+    after it is rooted at the read-only checkouts the Runtime rebuilt, which is
+    what lets a session outlive the plugin being upgraded or uninstalled.
+
+    One instance serves every session. Per-session state — the bound set and
+    ``plugins/data/<session_id>/`` — is keyed by session id, because two
+    sessions pinned to different content must not share a ``${PLUGIN_DATA}``.
+    """
+
+    def __init__(  # noqa: PLR0913 - one collaborator per concern, all keyword-only
+        self,
+        *,
+        storage_root: Path,
+        workdir: Path,
+        installed_roots: Mapping[str, Path],
+        installed_scopes: Mapping[str, SkillScope] | None = None,
+        config_orchestrator: ConfigOrchestrator[VibeConfigSchema] | None = None,
+        plugin_mcp: PluginMCPCatalog | None = None,
+        connector_registry: ConnectorRegistry | None = None,
+        harness_files: HarnessFilesManager | None = None,
+        agent_tools: Callable[[], AgentToolCatalogue] | None = None,
+        agent_types: Callable[[], Sequence[AgentTypeSource]] | None = None,
+        builtin_plugin_roots: list[Path] | None = None,
+        sandbox_skills: SandboxSkills | None = None,
+    ) -> None:
+        self._plugins_root = Path(storage_root).expanduser().resolve() / "plugins"
+        self._workdir = workdir
+        self._installed_roots = dict(installed_roots)
+        self._plugin_scopes = dict(installed_scopes or {})
+        self._config_orchestrator = config_orchestrator
+        self._plugin_mcp = plugin_mcp
+        self._connector_registry = connector_registry
+        self._harness_files = harness_files
+        self._builtin_plugin_roots = builtin_plugin_roots
+        # Read once per bind. Absent, plugin agent types stay unexecutable: Core is
+        # still told about them and the Host strips them for want of a binding, which
+        # beats guessing at a ceiling with no catalogue to measure it against.
+        self._agent_tools = agent_tools
+        # The agents a user or a project wrote. They ride the same projection as
+        # plugin agents because the Host binds a name without asking who owns it,
+        # and read per bind for the same reason as the catalogue above: an edited
+        # file has to reach the next bind.
+        self._agent_types = agent_types
+        # Set when the session runs its tools in a sandbox: Core is pointed at
+        # the copies of the skills there.
+        self._sandbox_skills = sandbox_skills
+        self._bound: dict[str, SessionPlugins] = {}
+        self._binding: set[str] = set()
+        self._observers: list[Callable[[str, SessionPlugins], Awaitable[None]]] = []
+
+    def observe_binds(
+        self, observer: Callable[[str, SessionPlugins], Awaitable[None]]
+    ) -> None:
+        self._observers.append(observer)
+
+    def bound(self, session_id: str) -> SessionPlugins | None:
+        """What this session is actually running, or ``None`` before its bind."""
+        return self._bound.get(session_id)
+
+    @property
+    def installed_roots(self) -> Mapping[str, Path]:
+        """Where each plugin was pinned from, as of the last scan.
+
+        A name missing here was uninstalled since the pin, and the session
+        holding its checkout is the last thing running it.
+        """
+        return dict(self._installed_roots)
+
+    async def rescan(self) -> list[ResolvedPluginDefinition]:
+        """Re-read the installed roots and report the pin they would produce now.
+
+        The Host half of ``plugin/reload``. It re-runs the discovery that built
+        this provider and adopts the roots it found, so a subsequent ``pin``
+        hands over what was just seen rather than what the process started with.
+
+        Nothing is bound and no session changes. The caller routes a difference
+        through ``config/write``, which keeps re-pinning on the one path that
+        knows how to fail without breaking a running session.
+
+        Raises without the discovery inputs the Host resolved from: saying so
+        beats rescanning an empty tree and reporting everything uninstalled.
+        """
+        if self._harness_files is None:
+            raise PluginReloadUnavailableError(
+                "this Runtime cannot rescan for plugins: no discovery roots were "
+                "configured"
+            )
+        plugins = await resolve_session_plugins(
+            self._harness_files,
+            config_orchestrator=self._config_orchestrator,
+            plugin_mcp=self._plugin_mcp,
+            connector_registry=self._connector_registry,
+            builtin_plugin_roots=self._builtin_plugin_roots,
+        )
+        self._installed_roots = {
+            plugin.name: plugin.root
+            for plugin in plugins.materialized.resolution.plugins
+        }
+        self._plugin_scopes = installed_plugin_scopes(plugins)
+        return requested_plugin_definitions(plugins)
+
+    async def pin(
+        self, requested: Sequence[ResolvedPluginDefinition], *, session_id: str
+    ) -> PinnedPlugins:
+        """Hand over the installed root of every plugin the request names.
+
+        The only read of an installed directory in the design, and it reads
+        nothing but the path. The roots come from the resolve that produced the
+        request, so they disagree only if the tree moved in between — which the
+        Runtime catches when the ingest digest misses.
+
+        A name this provider does not hold is left out rather than guessed at,
+        and the Runtime turns the gap into ``plugin_pin_mismatch``.
+
+        Each root travels with the names the ingest must prune from it, taken
+        off the request's own ``source_format`` so it is the set the resolve
+        that produced the request digested with. Deriving it here from
+        anything else would reintroduce the mismatch it exists to prevent.
+        """
+        from mistralai_vibe_local_harness.vibe.plugins import (
+            PinnedPackage,
+            PinnedPlugins,
+        )
+
+        return PinnedPlugins(
+            packages={
+                definition.name: PinnedPackage(
+                    root=self._installed_roots[definition.name],
+                    ignored_names=plugin_runtime_state_names(
+                        DetectedPluginFormat(definition.source_format)
+                    ),
+                )
+                for definition in requested
+                if definition.name in self._installed_roots
+            }
+        )
+
+    async def bind(
+        self, plugins: RestoredPlugins, *, session_id: str
+    ) -> tuple[bytes, SessionPluginProjection]:
+        """Resolve, materialize, snapshot, and project one session's checkouts.
+
+        Nothing installed is read. The checkouts are handed to the resolver as
+        the plugin directories outright, so ``plugin.root`` and every
+        ``${PLUGIN_ROOT}`` land inside the tree the Runtime rebuilt.
+
+        The set is assembled in locals and published in one assignment, so a
+        failed re-bind leaves the previous set bound and running and a rejected
+        ``config/write`` is a no-op rather than a broken session.
+
+        ``plugins.snapshot`` decides which catalogue is published. Bytes are a
+        restore, and the pinned catalogue wins: the remote schemas behind it
+        were never covered by a package digest, so the fresh derivation is
+        measured against the pin rather than replacing it. ``None`` is a create,
+        where the derivation is the pin — unless this session already had one,
+        which makes it a re-pin that carries the tools the derivation lost.
+        """
+        self._binding.add(session_id)
+        previous = self._bound.get(session_id)
+        resolution = await asyncio.to_thread(
+            self._resolve, session_id, plugins.checkouts
+        )
+        materialized = await _materialize(
+            resolution, self._plugin_mcp, self._connector_registry
+        )
+        derived = build_snapshot(materialized)
+        published = _pinned_snapshot(plugins.snapshot)
+        if published is None:
+            published = (
+                derived
+                if previous is None
+                else retain_pinned_tools(derived, previous.snapshot)
+            )
+        bound = SessionPlugins(
+            materialized=materialized,
+            snapshot=published,
+            workdir=self._workdir,
+            routes=(
+                MappingProxyType({})
+                if published is derived
+                else reconcile_plugin_routes(published, materialized)
+            ),
+        )
+        if self._sandbox_skills is not None:
+            await self._sandbox_skills.install(materialized.resolution.skills.values())
+        for observer in self._observers:
+            await observer(session_id, bound)
+        self._bound[session_id] = bound
+        self._binding.discard(session_id)
+        # Derived, never published: the lock records this resolve, not the
+        # ghosts the bound catalogue carries. A restore discards these anyway.
+        return snapshot_bytes(derived), self._project(bound)
+
+    def _project(self, bound: SessionPlugins) -> SessionPluginProjection:
+        # Both halves out of the same resolve: an advertised agent type with no
+        # profile is a name the model can call and the Runtime cannot spawn.
+        from mistralai_vibe_local_harness.vibe.plugins import SessionPluginProjection
+
+        skills = bound.materialized.resolution.skills
+        definitions = project_model_invocable_plugin_contexts(
+            core_plugins(bound), skills
+        )
+        if self._sandbox_skills is not None:
+            from vibe.app_server._sandbox_skills import relocate_plugin_contexts
+
+            definitions = relocate_plugin_contexts(
+                definitions, skills, self._sandbox_skills.locate
+            )
+        agents = list(bound.materialized.resolution.agents)
+        workspace = list(self._agent_types() if self._agent_types is not None else ())
+        if not agents and not workspace:
+            return SessionPluginProjection(definitions=definitions)
+        if self._agent_tools is None:
+            logger.warning(
+                "Not binding %d agent type(s): no tool catalogue to "
+                "resolve their ceilings against",
+                len(agents) + len(workspace),
+            )
+            return SessionPluginProjection(definitions=definitions)
+        tools = self._agent_tools()
+        return SessionPluginProjection(
+            definitions=definitions,
+            # A plugin advertises its agent types inside its own capabilities,
+            # which this module cannot edit, so a workspace agent cannot take a
+            # name a plugin claims without the model reading one owner's
+            # description and getting the other's behaviour. It loses the name
+            # here on both halves at once.
+            agent_profiles=(
+                *resolve_agent_types(
+                    workspace, tools, reserved=plugin_agent_names(agents)
+                ).profiles,
+                *declared_agent_profiles(agents, tools),
+            ),
+        )
+
+    async def info(self, *, session_id: str) -> HarnessPluginInfo:
+        """Project the bound set for ``plugin/info``.
+
+        The Runtime forwards this without reading a field, so what crosses the
+        seam is the shared wire model rather than a Vibe type. A session that
+        has not bound answers with an empty catalogue: a read is not the place
+        to raise, and "nothing is bound" is an answer.
+        """
+        from mistralai_vibe_local_harness.session_protocol import (
+            PluginInfo as HarnessPluginInfo,
+        )
+
+        bound = self._bound.get(session_id)
+        if bound is None:
+            return HarnessPluginInfo()
+        return HarnessPluginInfo.model_validate(
+            plugin_info(bound).model_dump(mode="json", by_alias=True)
+        )
+
+    async def release(self, *, session_id: str) -> None:
+        """Drop a session's bound set and the files its bind staged.
+
+        Never raises: the Runtime calls this in a ``finally``.
+
+        After a failed ``bind`` nothing was published, so the previous set is
+        still the one in ``_bound`` and this returns without touching it —
+        otherwise a rejected re-pin would take a working session's plugins down.
+
+        ``${PLUGIN_DATA}`` survives, being the session's own durable state. Only
+        the staged runtime files go, and the next bind rebuilds them.
+        """
+        if session_id in self._binding:
+            self._binding.discard(session_id)
+            return
+        self._bound.pop(session_id, None)
+        try:
+            await asyncio.to_thread(self._discard_runtime_files, session_id)
+        except Exception:
+            logger.warning(
+                "Failed to drop the staged plugin runtime files of session %r",
+                session_id,
+                exc_info=True,
+            )
+
+    def _resolve(
+        self, session_id: str, checkouts: Mapping[str, Path]
+    ) -> ResolvedPluginSet:
+        """Resolve the checkouts as the plugin set, with a per-session data root.
+
+        Sorted by plugin name so the order the resolver sees does not depend on
+        the order the Runtime happened to check the packages out.
+        """
+        sorted_names = sorted(checkouts)
+        resolution = PluginResolver(
+            plugin_dirs=[checkouts[name] for name in sorted_names],
+            plugin_scopes={
+                checkouts[name].resolve(): self._plugin_scopes.get(
+                    name, SkillScope.PROJECT
+                )
+                for name in sorted_names
+            },
+            data_root_base=self._data_root(session_id),
+            config_orchestrator=self._config_orchestrator,
+        ).resolve()
+        for plugin in resolution.plugins:
+            # ${PLUGIN_DATA} is handed out as writable, so it has to exist first.
+            plugin.data_root.mkdir(parents=True, exist_ok=True)
+        return resolution
+
+    def _data_root(self, session_id: str) -> Path:
+        return self._plugins_root / "data" / session_id
+
+    def _discard_runtime_files(self, session_id: str) -> None:
+        shutil.rmtree(self._data_root(session_id) / ".runtime", ignore_errors=True)
+
+
+def _pinned_snapshot(blob: bytes | None) -> ResolvedPluginSnapshot | None:
+    """The catalogue a restore recorded, or ``None`` when this is a create.
+
+    Empty bytes mean "restored, and the lock pinned no plugins" — nothing to
+    honour and nothing to compare, so it reads the same as a create.
+
+    A blob that will not parse fails the restore. The bytes are digest-verified
+    by the time they arrive, so the only way here is a schema this build no
+    longer understands, and a session whose recorded catalogue cannot be read
+    cannot have its history honestly replayed.
+    """
+    if not blob:
+        return None
+
+    from mistralai_vibe_local_harness.vibe.plugins import (
+        PluginRestoreDiagnostic,
+        PluginRestoreDiagnosticCode,
+        PluginRestoreError,
     )
+
+    try:
+        snapshot = ResolvedPluginSnapshot.model_validate_json(blob)
+        validate_resolved_plugin_snapshot(snapshot)
+    except (ValidationError, ValueError) as error:
+        raise PluginRestoreError([
+            PluginRestoreDiagnostic(
+                code=PluginRestoreDiagnosticCode.LOCK_INVALID,
+                message=f"the pinned plugin snapshot cannot be read: {error}",
+            )
+        ]) from error
+    return snapshot
 
 
 def plugin_issues(plugins: SessionPlugins) -> list[ConfigIssue]:
     """Project the resolution diagnostics onto the session's runtime snapshot.
 
-    Dropping a broken plugin instead of failing the session is only a defensible
-    policy if the operator is told which one went. ``runtime/read`` already
-    carries the config issues the legacy backend reports, so a dropped plugin
-    joins them there rather than opening a surface of its own.
+    Dropping a broken plugin is only defensible if the operator is told which
+    one went, and ``runtime/read`` already carries config issues, so a dropped
+    plugin joins them there rather than opening a surface of its own.
 
-    Resolution emits in pipeline order, which is not a contract, so the list is
-    sorted: two Hosts that resolved the same tree report the same diagnostics in
-    the same order. ``severity``, ``code`` and ``component`` stay Vibe-internal
-    — the wire shape is file and message, and widening it is not this change.
+    Sorted, because resolution emits in pipeline order and that is not a
+    contract. ``severity``, ``code`` and ``component`` stay Vibe-internal.
 
-    Nothing here needs redacting. A diagnostic never quotes a credential: the
-    parse that would have seen one rejects the value with it left out.
+    Nothing is redacted here, because every diagnostic arrives redacted. A
+    parse that would have seen a credential rejects the value with it left out,
+    and a failure quoted from a client Vibe does not author is stripped where
+    it is caught (`redact_failure`). This surface publishes the message
+    verbatim, so a diagnostic that carries a secret has already leaked it.
     """
     return [
         ConfigIssue(file=str(issue.file), message=issue.message)
@@ -170,63 +631,197 @@ def plugin_issues(plugins: SessionPlugins) -> list[ConfigIssue]:
 def plugin_info(plugins: SessionPlugins) -> PluginInfo:
     """Project the resolved plugins into the public ``plugin/info`` catalogue.
 
-    The snapshot's collections are keyed by kind; the public shape is one flat
-    component list, so they fold into it plugin by plugin in snapshot order, and
+    The snapshot's collections are keyed by kind and the public shape is one
+    flat list, so they fold into it plugin by plugin in snapshot order and
     within a plugin in a fixed kind order. Two Hosts that resolved the same tree
-    therefore render the same list, which is the whole point of the snapshot's
-    canonical ordering being carried this far.
+    render the same list, which is what the canonical ordering is carried for.
 
-    Three kinds the contract declares are not emitted yet. ``mcp_server``,
-    ``connector`` and ``tool`` are sourced from the snapshot's tool routes,
-    connectors and tool groups, and those are still empty upstream — plugin MCP
-    servers and connectors are not connected. Emitting them from anything else
-    would report a catalogue the session does not have.
+    ``mcp_server`` is the one kind not read off the snapshot, which carries the
+    catalog those servers answered with and no server definitions. It comes off
+    the materialized set, widened by the servers the pinned routes name: at
+    restore a server that did not answer still owns tools the session runs. One
+    that never answered and owns nothing is reported through ``plugin_issues``
+    instead of listed as part of an environment nobody has.
 
-    ``config`` stays empty on every component. The contract has the field, but
-    the only per-component configuration Vibe holds is a hook's, and a hook
-    config is an operator's command line; the snapshot is Vibe-internal and this
-    projection is not, so it is not widened here without a reason to.
+    ``config`` is populated on that kind alone, through the redacting
+    projection. The only other per-component configuration Vibe holds is a
+    hook's, and a hook config is an operator's command line.
     """
     snapshot = plugins.snapshot
     resolution = plugins.materialized.resolution
-    roots = {plugin.name: plugin.root for plugin in resolution.plugins}
     pins = {plugin.name: plugin.content_digest for plugin in resolution.plugins}
-    agent_kinds: dict[str, PluginComponentKind] = {
-        definition.name: _agent_kind(definition) for definition in resolution.agents
-    }
+    sources = _component_sources(plugins)
     return PluginInfo(
         workdir=str(plugins.workdir),
         components=[
             component
             for entry in snapshot.plugins
-            for component in _plugin_components(
-                snapshot, entry.name, roots, agent_kinds
-            )
+            for component in _plugin_components(sources, entry.name)
         ],
-        # A debugging aid: the two digests answer "which plugin is this session
-        # actually running". It is not a serialized snapshot: the snapshot
-        # schema is Vibe-versioned and must not become an implicit public one by
-        # being echoed through a fixed procedure.
+        # A debugging aid, not a serialized snapshot: that schema is
+        # Vibe-versioned and must not become public by being echoed here.
         raw={
             "version": snapshot.version,
             "plugins": {
                 entry.name: {
                     "manifestDigest": entry.manifest_digest,
-                    "contentSha256": pins[entry.name],
+                    # Absent once a pinned plugin is uninstalled. The session
+                    # runs off the checkout either way.
+                    "contentSha256": pins.get(entry.name),
                 }
                 for entry in snapshot.plugins
+            },
+            # Only the routes that moved: a component absent here is live.
+            "routes": {
+                f"{group}.{function}": status
+                for (group, function), status in sorted(plugins.routes.items())
+                if status != "live"
             },
         },
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PluginRouteFailure:
+    """Why a call into a pinned tool route must not be executed."""
+
+    code: str
+    message: str
+
+    retryable: bool = False
+    """Never. Both causes are settled facts about this bind, so a retry repeats them."""
+
+
+def plugin_route_failure(
+    plugins: SessionPlugins, group: str, function: str
+) -> PluginRouteFailure | None:
+    """The failure a call into one route must produce, or ``None`` to proceed.
+
+    The check ``schema_fingerprint`` exists for. A remote tool's schema is the
+    one part of a plugin environment a package digest cannot pin, so the
+    fingerprint recorded at pin time is compared against what the source
+    answered with at bind.
+
+    The conversation was built against the pinned schema — the model chose
+    arguments for it, the journal records results shaped by it — so running
+    those arguments against a schema that moved is not a degraded call but a
+    call into a different tool wearing the same name.
+    """
+    status = plugins.route_status(group, function)
+    if status == "live":
+        return None
+    name = f"{group}.{function}"
+    if status == "stale":
+        return PluginRouteFailure(
+            code="plugin_catalog_changed",
+            message=(
+                f"The tool {name!r} is not the tool this session pinned: its source "
+                "now advertises a different schema, or no longer advertises it at "
+                "all. Start a new session to pick up the current catalogue."
+            ),
+        )
+    return PluginRouteFailure(
+        code="plugin_source_unavailable",
+        message=(
+            f"The tool {name!r} cannot be called because its source did not answer "
+            "when this session was restored. Reload the plugins once the source is "
+            "reachable again."
+        ),
+    )
+
+
+_RELOAD_NOTICE_CODES = frozenset({
+    "plugin.mcp.connection_failed",
+    "plugin.connector.unavailable",
+    "plugin.connector.runtime_unavailable",
+})
+
+
+def plugin_reload_notices(plugins: SessionPlugins) -> list[str]:
+    """What a reload has to say when it worked and still did not fix everything.
+
+    A reload that reaches here succeeded. What is left is the part a rescan
+    cannot repair — a source still unreachable, and the tools the session keeps
+    carrying because of it — which is a remark, not a failed command. There is
+    no plugin event in the closed union, so a notice is the whole signal and a
+    Client that cares re-reads ``plugin/info``.
+    """
+    notices = [
+        issue.message
+        for issue in sorted(plugins.issues, key=lambda item: item.message)
+        if issue.code in _RELOAD_NOTICE_CODES
+    ]
+    unavailable = sorted(
+        f"{group}.{function}"
+        for (group, function), status in plugins.routes.items()
+        if status == "unavailable"
+    )
+    if unavailable:
+        notices.append(
+            "These plugin tools are no longer offered by their source and calling "
+            f"one will fail: {', '.join(unavailable)}."
+        )
+    return notices
+
+
+def plugin_components_by_owner(
+    plugins: SessionPlugins,
+) -> Mapping[str, tuple[PluginComponent, ...]]:
+    """The same catalogue ``plugin/info`` publishes, kept attributed to its owners.
+
+    ``plugin/info`` folds these into one flat list, and three of the kinds
+    carry a name no client can trace back to a plugin. A Vibe-owned reader in
+    this process keeps the boundaries the projection drops.
+    """
+    sources = _component_sources(plugins)
+    return {
+        entry.name: tuple(_plugin_components(sources, entry.name))
+        for entry in plugins.snapshot.plugins
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _ComponentSources:
+    """The inputs the flat component list is folded from, prepared once."""
+
+    snapshot: ResolvedPluginSnapshot
+    roots: Mapping[str, Path]
+    agent_kinds: Mapping[str, PluginComponentKind]
+    mcp_servers: tuple[PluginMCPServerDefinition, ...]
+
+
+def _component_sources(plugins: SessionPlugins) -> _ComponentSources:
+    materialized = plugins.materialized
+    resolution = materialized.resolution
+    listed = materialized.connected_mcp_sources | {
+        (route.plugin_name, route.source_id)
+        for route in plugins.snapshot.tool_routes
+        if route.source_kind == "mcp"
+    }
+    return _ComponentSources(
+        snapshot=plugins.snapshot,
+        roots={plugin.name: plugin.root for plugin in resolution.plugins},
+        agent_kinds={
+            definition.name: _agent_kind(definition) for definition in resolution.agents
+        },
+        mcp_servers=tuple(
+            sorted(
+                (
+                    definition
+                    for definition in resolution.mcp_servers
+                    if (definition.plugin_name, definition.source_id) in listed
+                ),
+                key=lambda item: (item.plugin_name, item.source_id),
+            )
+        ),
+    )
+
+
 def _plugin_components(
-    snapshot: ResolvedPluginSnapshot,
-    plugin: str,
-    roots: Mapping[str, Path],
-    agent_kinds: Mapping[str, PluginComponentKind],
+    sources: _ComponentSources, plugin: str
 ) -> Iterator[PluginComponent]:
     """Fold one plugin's snapshot collections into the flat component list."""
+    snapshot = sources.snapshot
 
     def owned[T: object](collection: Iterable[T]) -> Iterator[T]:
         return (
@@ -237,7 +832,7 @@ def _plugin_components(
         kind: PluginComponentKind, name: str, ref: PluginPathRef | None
     ) -> PluginComponent:
         return PluginComponent(
-            kind=kind, name=name, source_path=_source_path(ref, roots)
+            kind=kind, name=name, source_path=_source_path(ref, sources.roots)
         )
 
     for skill in owned(snapshot.skills):
@@ -245,11 +840,51 @@ def _plugin_components(
     for folder in owned(snapshot.knowledge):
         yield component("knowledge", folder.name, folder.path)
     for agent in owned(snapshot.agents):
-        yield component(agent_kinds.get(agent.name, "agent"), agent.name, agent.path)
+        yield component(
+            sources.agent_kinds.get(agent.name, "agent"), agent.name, agent.path
+        )
     for library in owned(snapshot.libraries):
         yield component("library", library.alias, library.source_path)
     for hook in owned(snapshot.hooks):
         yield component("hook", hook.declared_name, hook.config_file)
+    for definition in owned(sources.mcp_servers):
+        yield PluginComponent(
+            kind="mcp_server",
+            name=definition.source_id,
+            source_path=str(definition.config_file),
+            config=_mcp_server_config(definition.server),
+        )
+    for connector in owned(snapshot.connectors):
+        yield component("connector", connector.source_id, None)
+    for group in owned(snapshot.tool_groups):
+        for tool in group.tools:
+            yield component("tool", f"{group.name}.{tool.name}", None)
+
+
+def _mcp_server_config(server: MCPServer) -> dict[str, JsonValue]:
+    """Project one MCP server onto the redacted shape ``plugin/info`` publishes.
+
+    Positional, per the contract's redaction rule: a fixed list of positions
+    known to hold no credential, not a dump with the risky keys removed. A field
+    added to the config model upstream stays out until someone adds it here.
+
+    The argument vector is the one position that looked safe and is not, so it
+    is published by name like ``env`` and the headers rather than verbatim.
+    """
+    if isinstance(server, MCPStdio):
+        return {
+            "transport": server.transport,
+            "argv": list(redact_argv(server.argv())),
+            "env": list(redact_names(server.env)),
+            "cwd": server.cwd,
+        }
+    if isinstance(server, MCPHttp | MCPStreamableHttp):
+        return {
+            "transport": server.transport,
+            "url": redact_url(server.url),
+            "headers": list(redact_names(server.http_headers())),
+        }
+    return {}
 
 
 def _agent_kind(definition: PluginAgentDefinition) -> PluginComponentKind:
@@ -275,16 +910,14 @@ def core_plugins(plugins: SessionPlugins) -> list[RustPluginContextDefinition]:
 
     The lock pins what the plugin environment *is*; this is what Core can *use*.
     Core is handed real paths rather than the snapshot's portable refs, because
-    it reads SKILL.md, knowledge folders and agent files off disk itself. The
-    snapshot stays the portable record; this is the local wiring.
+    it reads SKILL.md, knowledge folders and agent files off disk itself.
 
-    Two capability slots are deliberately left empty. Tool groups are still
-    unpopulated upstream — ``MaterializedPluginSet`` produces none until plugin
-    MCP servers and connectors are connected. Hook bindings are withheld because
-    a bound hook makes Core emit a hook call action, and the Runtime has no
-    adapter to execute one; binding them would fail turns rather than run hooks.
+    Tool groups and hook bindings are withheld: Core calls what it advertises,
+    and neither has an execution adapter yet, so advertising them would fail
+    turns rather than run anything. The tool catalogue still reaches the
+    snapshot and ``plugin/info``.
     """
-    from mistralai_rust_harness.protocol import (  # pyright: ignore[reportMissingImports]
+    from mistralai_vibe_local_harness.protocol import (
         RustHarnessCapabilitySet,
         RustPluginContextDefinition,
     )
@@ -312,17 +945,13 @@ def core_plugins(plugins: SessionPlugins) -> list[RustPluginContextDefinition]:
 def _core_skills(
     skills: Mapping[str, SkillInfo], owners: Mapping[str, str]
 ) -> Mapping[str, list[RustSkillDefinition]]:
-    """Group plugin skills by owning plugin, keyed by the ``namespace:name``
-    alias.
+    """Group plugin skills by owning plugin, under their ``namespace:name`` alias.
 
-    Core accepts that alias verbatim, so the name the model sees is the name the
-    resolver already assigned. The path is the runtime path, which for a foreign
-    format is the SKILL.md synthesized during resolution rather than the
-    plugin's own file.
+    Core accepts that alias verbatim, so the name the model sees is the one the
+    resolver assigned. The path is the runtime path, which for a foreign format
+    is the SKILL.md synthesized during resolution.
     """
-    from mistralai_rust_harness.protocol import (  # pyright: ignore[reportMissingImports]
-        RustSkillDefinition,
-    )
+    from mistralai_vibe_local_harness.protocol import RustSkillDefinition
 
     grouped: dict[str, list[RustSkillDefinition]] = defaultdict(list)
     for alias, skill in skills.items():
@@ -349,13 +978,10 @@ def _core_knowledge(
     """Group materialized knowledge folders by owning plugin.
 
     The runtime root is the staged copy under the plugin data root, so Core
-    reads what materialization produced and never the plugin tree itself. That
-    copy is read-only: a plugin publishes knowledge, it does not host a
-    scratchpad.
+    never reads the plugin tree itself. It is read-only: a plugin publishes
+    knowledge, it does not host a scratchpad.
     """
-    from mistralai_rust_harness.protocol import (  # pyright: ignore[reportMissingImports]
-        RustKnowledgeFolderDefinition,
-    )
+    from mistralai_vibe_local_harness.protocol import RustKnowledgeFolderDefinition
 
     grouped: dict[str, list[RustKnowledgeFolderDefinition]] = defaultdict(list)
     for definition in definitions:
@@ -372,36 +998,61 @@ def _core_knowledge(
     return grouped
 
 
+def _plugin_agent_sources(
+    definitions: Iterable[PluginAgentDefinition],
+) -> list[AgentTypeSource]:
+    # The plugin spelling of an agent file, in the shape the shared resolver reads.
+    # One expression, shared by the advertised type and the profile behind it: if
+    # the two drifted, the model would read one file and the child would spawn
+    # from another.
+    return [
+        AgentTypeSource(
+            name=definition.name,
+            profile=definition.profile,
+            path=definition.source_file,
+            owner=definition.plugin_name,
+            source_name=definition.source_name,
+        )
+        for definition in definitions
+    ]
+
+
+def plugin_agent_names(definitions: Iterable[PluginAgentDefinition]) -> frozenset[str]:
+    """The agent-type names plugins claim, whether or not they resolve."""
+    return frozenset(definition.name for definition in definitions)
+
+
 def _core_agents(
     definitions: Iterable[PluginAgentDefinition],
 ) -> Mapping[str, list[RustAgentTypeDefinition]]:
     """Group plugin agent types by owning plugin."""
-    from mistralai_rust_harness.protocol import (  # pyright: ignore[reportMissingImports]
-        RustAgentTypeDefinition,
-    )
-
+    by_plugin: dict[str, list[AgentTypeSource]] = defaultdict(list)
+    for source in _plugin_agent_sources(definitions):
+        by_plugin[source.owner].append(source)
+    # A plugin whose every agent was dropped keeps no entry at all, and a plugin
+    # that declared none never had one. Callers read this per plugin and take a
+    # missing name as "no agent types".
     grouped: dict[str, list[RustAgentTypeDefinition]] = defaultdict(list)
-    for definition in definitions:
-        agent = _accept(
-            RustAgentTypeDefinition,
-            definition.plugin_name,
-            name=definition.name,
-            description=definition.profile.description,
-            path=str(definition.source_file),
-        )
-        if agent is not None:
-            grouped[definition.plugin_name].append(agent)
+    for plugin_name, sources in by_plugin.items():
+        for definition in resolve_agent_types(sources).definitions:
+            grouped[plugin_name].append(definition)
     return grouped
+
+
+def declared_agent_profiles(
+    definitions: Iterable[PluginAgentDefinition], tools: AgentToolCatalogue
+) -> tuple[DeclaredAgentTypeProfile, ...]:
+    """The bindings behind a plugin's agent types."""
+    return resolve_agent_types(_plugin_agent_sources(definitions), tools).profiles
 
 
 def _accept[T](model: type[T], plugin: str, **fields: object) -> T | None:
     """Build a Core definition, dropping it if Core will not have it.
 
-    Core validates harder than the resolver does — a blank skill description or
-    a name that is not a valid alias is rejected there and accepted here. The
-    resolver's contract is that one bad component never stops a session, so the
-    component is dropped rather than allowed to fail config construction, which
-    would take the whole session down.
+    Core validates harder than the resolver — a blank description or a name that
+    is not a valid alias passes here and is rejected there. One bad component
+    never stops a session, so it is dropped rather than allowed to fail config
+    construction and take the session down.
     """
     try:
         return model(**fields)  # pyright: ignore[reportCallIssue]

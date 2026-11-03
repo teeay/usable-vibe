@@ -9,7 +9,8 @@ from vibe.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
 
 @dataclass(frozen=True)
 class CommandContext:
-    vibe_code_enabled: bool = False
+    registry_skills_enabled: bool = False
+    experimental_harness: bool = False
 
 
 CommandAvailability = Callable[[CommandContext], bool]
@@ -22,25 +23,21 @@ class Command:
     handler: str
     exits: bool = False
     side_channel: bool = False
-    # A command that resets the conversation (e.g. /clear) supersedes any
-    # prompts queued before it: at drain time the queue drops those pending
-    # prompts instead of running an LLM turn on the widgets the command is
-    # about to tear down.
-    flushes_pending: bool = False
     is_available: CommandAvailability | None = None
+    forwards_to_model: bool = False
 
 
 class CommandRegistry:
     def __init__(
         self,
         excluded_commands: list[str] | None = None,
-        vibe_code_enabled: bool = False,
+        context: CommandContext | None = None,
     ) -> None:
         if excluded_commands is None:
             excluded_commands = []
         self._disabled_commands = set(excluded_commands)
         self._commands: dict[str, Command] = {}
-        self.refresh(CommandContext(vibe_code_enabled))
+        self.refresh(context)
 
     def _build_commands(self) -> dict[str, Command]:
         return {
@@ -54,19 +51,22 @@ class CommandRegistry:
                 aliases=frozenset(["/config"]),
                 description="Edit config settings",
                 handler="_show_config",
-                side_channel=True,
             ),
             "model": Command(
                 aliases=frozenset(["/model"]),
                 description="Select active model",
                 handler="_show_model",
-                side_channel=True,
+            ),
+            "skills": Command(
+                aliases=frozenset(["/skills"]),
+                description="Browse, import, and manage skills",
+                handler="_show_skills",
+                is_available=lambda ctx: ctx.registry_skills_enabled,
             ),
             "thinking": Command(
                 aliases=frozenset(["/thinking"]),
                 description="Select thinking level",
                 handler="_show_thinking",
-                side_channel=True,
             ),
             "reload": Command(
                 aliases=frozenset(["/reload"]),
@@ -79,7 +79,6 @@ class CommandRegistry:
                     "Start a new conversation. Optionally pass a prompt to seed it."
                 ),
                 handler="_clear_history",
-                flushes_pending=True,
             ),
             "copy": Command(
                 aliases=frozenset(["/copy"]),
@@ -108,7 +107,6 @@ class CommandRegistry:
                     "Change the log level for this session or persist it to config.toml."
                 ),
                 handler="_log_level_command",
-                side_channel=True,
             ),
             "debug": Command(
                 aliases=frozenset(["/debug"]),
@@ -130,7 +128,7 @@ class CommandRegistry:
             ),
             "status": Command(
                 aliases=frozenset(["/status"]),
-                description="Display agent statistics",
+                description="Display agent statistics and model and provider details",
                 handler="_show_status",
                 side_channel=True,
             ),
@@ -144,19 +142,16 @@ class CommandRegistry:
                 aliases=frozenset(["/teleport"]),
                 description="Teleport session to Vibe Code Web",
                 handler="_teleport_command",
-                is_available=lambda ctx: ctx.vibe_code_enabled,
             ),
             "remote-project": Command(
                 aliases=frozenset(["/remote-project"]),
                 description="Select the Vibe Code Web project for this repository",
                 handler="_vibe_code_project_command",
-                is_available=lambda ctx: ctx.vibe_code_enabled,
             ),
             "proxy-setup": Command(
                 aliases=frozenset(["/proxy-setup"]),
                 description="Configure proxy and SSL certificate settings",
                 handler="_show_proxy_setup",
-                side_channel=True,
             ),
             "resume": Command(
                 aliases=frozenset(["/resume", "/continue"]),
@@ -179,11 +174,28 @@ class CommandRegistry:
                 ),
                 handler="_show_mcp",
             ),
+            "plugins": Command(
+                aliases=frozenset(["/plugins"]),
+                description="Display the plugins this session is running",
+                handler="_show_plugins",
+                is_available=lambda ctx: ctx.experimental_harness,
+            ),
+            "reload-plugins": Command(
+                aliases=frozenset(["/reload-plugins"]),
+                description="Re-pin this session's plugins and report what changed",
+                handler="_reload_plugins",
+                is_available=lambda ctx: ctx.experimental_harness,
+            ),
+            "todo": Command(
+                aliases=frozenset(["/todo"]),
+                description="Show the current todo list",
+                handler="_show_todos",
+                is_available=lambda ctx: ctx.experimental_harness,
+            ),
             "voice": Command(
                 aliases=frozenset(["/voice"]),
                 description="Configure voice settings",
                 handler="_show_voice_settings",
-                side_channel=True,
             ),
             "leanstall": Command(
                 aliases=frozenset(["/leanstall"]),
@@ -200,6 +212,15 @@ class CommandRegistry:
                 description="Rewind to a previous message (or press Esc twice)",
                 handler="_start_rewind_mode",
             ),
+            "branch": Command(
+                aliases=frozenset(["/branch"]),
+                description=(
+                    "Fork the current conversation into a new resumable session, "
+                    "leaving this session unchanged. Resume the copy with "
+                    "`vibe --resume <id>`."
+                ),
+                handler="_branch_session",
+            ),
             "retry": Command(
                 aliases=frozenset(["/retry"]),
                 description=(
@@ -211,10 +232,13 @@ class CommandRegistry:
             "loop": Command(
                 aliases=frozenset(["/loop"]),
                 description=(
-                    "Schedule a recurring prompt. "
+                    "Schedule a recurring prompt in natural language: `/loop [schedule] [prompt]`"
+                    if self._context.experimental_harness
+                    else "Schedule a recurring prompt. "
                     "Use `/loop <interval> <prompt>`, `/loop list`, or `/loop cancel <id|all>`"
                 ),
                 handler="_loop_command",
+                forwards_to_model=self._context.experimental_harness,
             ),
             "data-retention": Command(
                 aliases=frozenset(["/data-retention"]),
@@ -226,7 +250,6 @@ class CommandRegistry:
                 aliases=frozenset(["/theme"]),
                 description="Select theme",
                 handler="_show_theme",
-                side_channel=True,
             ),
         }
 
@@ -275,8 +298,6 @@ class CommandRegistry:
         if cmd_name is None:
             return None
 
-        # Bare aliases (e.g. `exit`) match only as the whole input, else a
-        # message starting with one would be swallowed instead of sent.
         if not cmd_word.startswith("/") and cmd_args:
             return None
 

@@ -18,6 +18,7 @@ class BuiltinAgentName(StrEnum):
     ASK = "ask"
     PLAN = "plan"
     ACCEPT_EDITS = "accept-edits"
+    SMART_APPROVE = "smart-approve"
     AUTO_APPROVE = "auto-approve"
     EXPLORE = "explore"
     LEAN = "lean"
@@ -33,6 +34,13 @@ class AgentProfile:
     overrides: dict[str, Any] = field(default_factory=dict)
     install_required: bool = False
     instructions: str | None = None
+    source_path: Path | None = None
+    """The file this profile was parsed from, or ``None`` when it is built in.
+
+    The Unified Harness advertises a subagent to the model with the path of the
+    file behind it, so a profile that reaches that surface has to remember where
+    it came from.
+    """
 
     @classmethod
     def from_toml(cls, path: Path) -> AgentProfile:
@@ -48,6 +56,7 @@ class AgentProfile:
             agent_type=AgentType(data.pop("agent_type", AgentType.AGENT)),
             instructions=data.pop("instructions", None),
             overrides=data,
+            source_path=path,
         )
 
 
@@ -96,6 +105,16 @@ AUTO_APPROVE = AgentProfile(
     AgentSafety.YOLO,
     overrides={"bypass_tool_permissions": True, "disabled_tools": ["exit_plan_mode"]},
 )
+SMART_APPROVE = AgentProfile(
+    BuiltinAgentName.SMART_APPROVE,
+    "Smart Approve",
+    "Classifies each tool call and auto-runs the safe ones, prompting only for risky ones",
+    AgentSafety.SMART,
+    # No static permission overrides: a model classifier gates each call via the
+    # runtime "classify" tool mode (Unified Harness only). The runtime derives that
+    # gate from the active agent; see build_unified_session_context / _rust_tool_modes.
+    overrides={"disabled_tools": ["exit_plan_mode"]},
+)
 
 EXPLORE = AgentProfile(
     name=BuiltinAgentName.EXPLORE,
@@ -119,7 +138,7 @@ LEAN = AgentProfile(
     overrides={
         "system_prompt_id": "lean",
         "active_model": "leanstral",
-        "allowed_models": ["leanstral"],
+        "allowed_models": ["labs-leanstral-1-5"],
         "providers": [
             {
                 "name": "mistral-testing",
@@ -154,6 +173,7 @@ BUILTIN_AGENTS: dict[str, AgentProfile] = {
     BuiltinAgentName.ASK: ASK,
     BuiltinAgentName.PLAN: PLAN,
     BuiltinAgentName.ACCEPT_EDITS: ACCEPT_EDITS,
+    BuiltinAgentName.SMART_APPROVE: SMART_APPROVE,
     BuiltinAgentName.AUTO_APPROVE: AUTO_APPROVE,
     BuiltinAgentName.EXPLORE: EXPLORE,
     BuiltinAgentName.LEAN: LEAN,

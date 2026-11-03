@@ -427,3 +427,90 @@ def test_mismatched_result_type_has_no_body() -> None:
 
 def test_none_result_has_no_body() -> None:
     assert render_result_body("bash", None, dark=True, ansi=False) is None
+
+
+def test_process_start_body_shows_receipt_lines() -> None:
+    from vibe.cli.textual_ui.native_scroll.tool_result_render import (
+        render_process_effect_body,
+    )
+    from vibe.cli.textual_ui.widgets.tool_widgets import ProcessToolOutput
+
+    output = ProcessToolOutput.model_validate({
+        "tool_name": "process.start",
+        "processId": "pid-123456789",
+        "status": "running",
+    })
+    text = _plain(render_process_effect_body(output))
+    assert "processId: pid-123456789" in text
+    assert "status: running" in text
+
+
+def test_process_output_body_shortens_fetched_text() -> None:
+    from vibe.cli.textual_ui.native_scroll.tool_result_render import (
+        render_process_effect_body,
+    )
+    from vibe.cli.textual_ui.widgets.tool_widgets import ProcessToolOutput
+
+    output = ProcessToolOutput.model_validate({
+        "tool_name": "process.output",
+        "output": "\n".join(f"line{i}" for i in range(20)),
+    })
+    text = _plain(render_process_effect_body(output))
+    assert "line0" in text
+    assert "line19" in text
+    assert "line9" not in text
+
+
+def test_process_list_body_shows_short_rows() -> None:
+    from vibe.cli.textual_ui.native_scroll.tool_result_render import (
+        render_process_effect_body,
+    )
+    from vibe.cli.textual_ui.widgets.tool_widgets import ProcessToolOutput
+
+    output = ProcessToolOutput.model_validate({
+        "tool_name": "process.list",
+        "processes": [
+            {"processId": "pid-123456789", "status": "running", "command": "sleep 60"}
+        ],
+    })
+    text = _plain(render_process_effect_body(output))
+    assert "23456789" in text
+    assert "running" in text
+    assert "sleep 60" in text
+
+
+def test_process_unknown_tool_keeps_summary_only() -> None:
+    from vibe.cli.textual_ui.native_scroll.tool_result_render import (
+        render_process_effect_body,
+    )
+    from vibe.cli.textual_ui.widgets.tool_widgets import ProcessToolOutput
+
+    assert (
+        render_process_effect_body(
+            ProcessToolOutput.model_validate({"tool_name": "process.future"})
+        )
+        is None
+    )
+
+
+def test_scratchpad_note_body_shows_content() -> None:
+    from vibe.app_server.models import ScratchpadEffectOutput
+    from vibe.cli.textual_ui.native_scroll.tool_result_render import (
+        render_scratchpad_effect_body,
+    )
+
+    output = ScratchpadEffectOutput(path="notes/todo.md", content="# Plan\n- ship it")
+    text = _plain(render_scratchpad_effect_body(output, dark=True, ansi=False))
+    assert "ship it" in text
+
+
+def test_scratchpad_list_body_shows_one_name_per_row() -> None:
+    from vibe.app_server.models import ScratchpadEffectOutput
+    from vibe.cli.textual_ui.native_scroll.tool_result_render import (
+        render_scratchpad_effect_body,
+    )
+
+    output = ScratchpadEffectOutput(files=["a.md", "b.md"])
+    text = _plain(render_scratchpad_effect_body(output, dark=True, ansi=False))
+    assert "a.md" in text
+    assert "b.md" in text

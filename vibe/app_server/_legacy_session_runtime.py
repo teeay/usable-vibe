@@ -26,6 +26,7 @@ from vibe.app_server._legacy_session_backend import (
     LegacySessionBackend,
     LegacySessionBackendHost,
 )
+from vibe.app_server._loop_prompt import scheduled_loop_display
 from vibe.app_server._projection import project_history
 from vibe.app_server._resources import ResourceRequestHandler
 from vibe.app_server._root_session import RootSessionCoordinator
@@ -51,6 +52,7 @@ from vibe.app_server._tool_io import ClientToolIO
 from vibe.app_server._turns import TurnConflictError, TurnController
 from vibe.app_server._utils import now_ms, public_error
 from vibe.app_server._worktree_effects import WorktreeEffect
+from vibe.app_server._worktree_session import SessionWorktrees, WorktreeResolution
 from vibe.app_server.connector_catalog import (
     ConnectorCatalogError,
     ConnectorCatalogService,
@@ -73,7 +75,6 @@ from vibe.app_server.protocol import (
     ServerErrorParams,
     SessionContinueParams,
     SessionOpenParams,
-    SessionOptions,
     SessionResumeParams,
     SessionStartParams,
     SessionStartResponse,
@@ -82,26 +83,19 @@ from vibe.app_server.protocol import (
 )
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.git.errors import GitError
-from vibe.core.git.worktree import (
-    ManagedWorktree,
-    PreparedWorktree,
-    WorktreeError,
-    WorktreeRepository,
-)
-from vibe.core.git.worktree.naming_model import suggest_worktree_name
+from vibe.core.git.worktree import PreparedWorktree
 from vibe.core.session import last_session_pointer
 from vibe.core.session.session_lease import SessionBusyError
-from vibe.core.types import SessionTitleUpdatedEvent, WorktreeContext
+from vibe.core.telemetry.types import LaunchContext
+from vibe.core.types import (
+    BackgroundWorkEvent,
+    SessionTitleUpdatedEvent,
+    WorktreeContext,
+)
 from vibe.observability.logging import logger
 
 type OpenRoot = Callable[[RootOpenRequest], Awaitable[AgentLoop]]
 type StageRoot = Callable[[AgentLoop], Awaitable[None]]
-
-
-@dataclass(frozen=True, slots=True)
-class WorktreeResolution:
-    options: SessionOptions
-    prepared_worktree: PreparedWorktree | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +117,7 @@ class LegacySessionRuntimeController:
         connector_catalog_service: ConnectorCatalogService | None = None,
         account_gateway: AccountGateway | None = None,
         identity_gateway: IdentityGateway | None = None,
+        launch_context_getter: Callable[[], LaunchContext | None] | None = None,
     ) -> None:
         self._open_root = open_root
         self._runtime_factory = runtime_factory
@@ -133,6 +128,7 @@ class LegacySessionRuntimeController:
         self._connector_catalog_service = connector_catalog_service
         self._account_gateway = account_gateway
         self._identity_gateway = identity_gateway
+        self._launch_context_getter = launch_context_getter
         self._scheduler_enabled = False
         self._scheduler_task: asyncio.Task[None] | None = None
         self._title_drain_task: asyncio.Task[None] | None = None
@@ -141,7 +137,9 @@ class LegacySessionRuntimeController:
         self._title_drain_loop: AgentLoop | None = None
         self._resume_tasks: set[asyncio.Task[None]] = set()
         self._tasks: set[asyncio.Task[None]] = set()
-        self._swept_worktree_buckets: set[str] = set()
+        self._worktrees = SessionWorktrees(
+            launch_context_getter=self._launch_context_getter
+        )
         self._root: LegacySessionBackend | None = None
         self._tool_io = ClientToolIO(services)
         self._sessions = SessionRuntimeRegistry(
@@ -181,7 +179,7 @@ class LegacySessionRuntimeController:
         self, params: SessionResumeParams
     ) -> tuple[LegacySessionBackend, Callable[[], None] | None]:
         self._scheduler_enabled = not params.agent_config.headless
-        _reject_worktree_input(params.agent_config)
+        self._worktrees.reject_input(params.agent_config)
         if root := self._root:
             result = await root.handler.dispatch(
                 "session/resume", params.model_dump(mode="json", by_alias=True)
@@ -212,7 +210,7 @@ class LegacySessionRuntimeController:
         self, params: SessionContinueParams
     ) -> LegacySessionBackend:
         self._scheduler_enabled = not params.agent_config.headless
-        _reject_worktree_input(params.agent_config)
+        self._worktrees.reject_input(params.agent_config)
         if root := self._root:
             await root.handler.dispatch(
                 "session/continue", params.model_dump(mode="json", by_alias=True)
@@ -330,6 +328,7 @@ class LegacySessionRuntimeController:
             self._sessions,
             snapshot_state=snapshot_state,
             tool_io=self._tool_io,
+            background_work_sink=self._handle_background_work,
             session_coordinator=coordinator,
         )
         session = SessionRuntime(agent_loop, turns, execution, history)
@@ -483,6 +482,7 @@ class LegacySessionRuntimeController:
             await self._sessions.close_children()
             self._root_session.attach(replacement.session_id)
             replacement.start_initialize_experiments()
+            replacement.start_fetch_model_catalog()
         except BaseException:
             with suppress(BaseException):
                 await replacement_backend.shutdown()
@@ -523,6 +523,7 @@ class LegacySessionRuntimeController:
         *,
         resumed: bool = False,
         created_worktree: PreparedWorktree | None = None,
+        opened_worktree: WorktreeResolution,
     ) -> PublicSessionState:
         try:
             (
@@ -550,9 +551,9 @@ class LegacySessionRuntimeController:
             assert isinstance(started.response, SessionStartResponse)
             state = started.response.state
             self._schedule_admin_config_fetch()
-            if managed := ManagedWorktree.at(agent_loop.cwd):
-                managed.hold(agent_loop.session_id)
-            self._schedule_worktree_claim_sweep(agent_loop.cwd)
+            self._worktrees.hold(
+                agent_loop.cwd, agent_loop.session_id, opened_worktree.pending_hold
+            )
             if resumed:
                 state = self._root_session.append_checkpoint(
                     current_history=[],
@@ -612,22 +613,6 @@ class LegacySessionRuntimeController:
         )
         self._track_task(task)
 
-    def _schedule_worktree_claim_sweep(self, cwd: Path) -> None:
-        task = asyncio.create_task(
-            self._sweep_worktree_claims(cwd), name="vibe-worktree-claim-sweep"
-        )
-        self._track_task(task)
-
-    async def _sweep_worktree_claims(self, cwd: Path) -> None:
-        try:
-            bucket = await asyncio.to_thread(WorktreeRepository.bucket_for, cwd)
-            if bucket is None or bucket in self._swept_worktree_buckets:
-                return
-            self._swept_worktree_buckets.add(bucket)
-            await asyncio.to_thread(WorktreeRepository.sweep_claims, cwd)
-        except Exception as exc:
-            logger.debug("Worktree claim sweep failed", exc_info=exc)
-
     async def _fetch_admin_config(self) -> None:
         if self._root is None:
             return
@@ -654,7 +639,19 @@ class LegacySessionRuntimeController:
     ) -> OpenedRuntime:
         options = params.agent_config.model_copy(update={"cwd": params.cwd})
         try:
-            worktree_resolution = await self._resolve_worktree(options)
+            if session_id is not None or continue_latest:
+                target = await self._host_handler.legacy_open_target(
+                    session_id, options.cwd
+                )
+                if target is not None:
+                    target_id, stored_cwd = target
+                    if stored_cwd is not None:
+                        await self._worktrees.restore(Path(stored_cwd))
+                        options = options.model_copy(update={"cwd": stored_cwd})
+                    session_id = target_id
+                    if continue_latest:
+                        continue_latest = False
+            worktree_resolution = await self._worktrees.resolve_for_start(options)
             try:
                 agent_loop = await self._open_root(
                     RootOpenRequest(
@@ -666,7 +663,7 @@ class LegacySessionRuntimeController:
                     )
                 )
             except BaseException:
-                await self._cleanup_worktree(worktree_resolution)
+                await self._worktrees.cleanup(worktree_resolution)
                 raise
             return OpenedRuntime(
                 agent_loop=agent_loop, worktree_resolution=worktree_resolution
@@ -675,9 +672,9 @@ class LegacySessionRuntimeController:
             raise RequestFailure(
                 ProtocolErrorCode.UNAUTHORIZED,
                 str(exc),
-                data={"provider": exc.provider},
+                data={"provider": exc.provider, "env_key": exc.env_key},
             ) from exc
-        except RuntimeConfigurationError as exc:
+        except (RuntimeConfigurationError, ValueError) as exc:
             raise RequestFailure(
                 ProtocolErrorCode.INVALID_PARAMS,
                 str(exc),
@@ -685,29 +682,6 @@ class LegacySessionRuntimeController:
             ) from exc
         except GitError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
-
-    async def _resolve_worktree(self, options: SessionOptions) -> WorktreeResolution:
-        if options.worktree is None:
-            return WorktreeResolution(options=options)
-        suggested_name = await self._suggest_worktree_name(options)
-        resolve = asyncio.create_task(
-            asyncio.to_thread(resolve_worktree, options, suggested_name)
-        )
-        try:
-            return await asyncio.shield(resolve)
-        except asyncio.CancelledError:
-            with suppress(BaseException):
-                await self._cleanup_worktree(await resolve)
-            raise
-
-    @staticmethod
-    async def _suggest_worktree_name(options: SessionOptions) -> str | None:
-        worktree = options.worktree
-        if worktree is None or worktree.kind != "auto":
-            return None
-        return await suggest_worktree_name(
-            worktree.prompt, cwd=Path(options.cwd or Path.cwd())
-        )
 
     async def _attach_opened_runtime(
         self, opened: OpenedRuntime, history_limit: int, *, resumed: bool = False
@@ -721,9 +695,10 @@ class LegacySessionRuntimeController:
                 history_limit,
                 resumed=resumed,
                 created_worktree=created,
+                opened_worktree=opened.worktree_resolution,
             )
         except BaseException:
-            await self._cleanup_worktree(opened.worktree_resolution)
+            await self._worktrees.cleanup(opened.worktree_resolution)
             raise
         root = self._root
         if root is not None and created is not None:
@@ -757,23 +732,6 @@ class LegacySessionRuntimeController:
             )
         except Exception as exc:
             logger.warning("Failed to record the created worktree", exc_info=exc)
-
-    async def _cleanup_worktree(self, worktree_resolution: WorktreeResolution) -> None:
-        worktree = worktree_resolution.prepared_worktree
-        if worktree is None or not worktree.created:
-            return
-        try:
-            await asyncio.to_thread(
-                worktree.remove, delete_branch=worktree.branch_created
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to clean up worktree after session startup failure",
-                exc_info=exc,
-            )
-            return
-        if managed := ManagedWorktree.at(worktree.root):
-            managed.forget()
 
     def _ensure_scheduler(self) -> None:
         if self._scheduler_task is not None and not self._scheduler_task.done():
@@ -827,12 +785,18 @@ class LegacySessionRuntimeController:
             try:
                 if isinstance(event, SessionTitleUpdatedEvent):
                     await self._notify_title(event)
+                elif isinstance(event, BackgroundWorkEvent):
+                    await self._handle_background_work(event)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 await self._services.notify(
                     "error", ServerErrorParams(error=public_error(exc))
                 )
+
+    async def _handle_background_work(self, event: BackgroundWorkEvent) -> None:
+        if self._root_session.update_background_work(event):
+            await self._turns.emit_snapshot(include_history=False, include_turns=False)
 
     async def _notify_title(self, event: SessionTitleUpdatedEvent) -> None:
         # The background title is session metadata: reflect it in the public
@@ -884,7 +848,10 @@ class LegacySessionRuntimeController:
             try:
                 delay = self._resources.next_loop_due_in()
                 await asyncio.sleep(max(0.05, min(delay, 1.0)))
-                if self._require_root().session.execution.active is not None:
+                if (
+                    self._require_root().session.execution.active is not None
+                    or self._turns.has_queued_turns
+                ):
                     continue
                 loop = self._resources.due_loop()
                 if loop is None:
@@ -894,6 +861,9 @@ class LegacySessionRuntimeController:
                         TurnStartParams(
                             session_id=self._agent_loop.session_id,
                             message=[TextContentBlock(text=loop.prompt)],
+                            user_display_content=scheduled_loop_display(
+                                loop.id, now_ms()
+                            ),
                         ),
                         scheduled_loop_id=loop.id,
                     )
@@ -909,15 +879,6 @@ class LegacySessionRuntimeController:
                 )
 
 
-def _reject_worktree_input(options: SessionOptions) -> None:
-    if options.worktree is None:
-        return
-    raise RequestFailure(
-        ProtocolErrorCode.INVALID_PARAMS,
-        "worktree is only supported when starting a session",
-    )
-
-
 def create_legacy_session_backend_host(
     *,
     open_root: OpenRoot,
@@ -929,6 +890,7 @@ def create_legacy_session_backend_host(
     connector_catalog_service: ConnectorCatalogService | None = None,
     account_gateway: AccountGateway | None = None,
     identity_gateway: IdentityGateway | None = None,
+    launch_context_getter: Callable[[], LaunchContext | None] | None = None,
 ) -> LegacySessionBackendHost:
     return LegacySessionRuntimeController(
         open_root=open_root,
@@ -940,51 +902,5 @@ def create_legacy_session_backend_host(
         connector_catalog_service=connector_catalog_service,
         account_gateway=account_gateway,
         identity_gateway=identity_gateway,
+        launch_context_getter=launch_context_getter,
     ).create_host()
-
-
-def resolve_worktree(
-    options: SessionOptions, suggested_name: str | None = None
-) -> WorktreeResolution:
-    requested_worktree = options.worktree
-    if requested_worktree is None:
-        return WorktreeResolution(options=options)
-
-    base_cwd = Path(options.cwd or Path.cwd()).expanduser().resolve()
-    if not base_cwd.is_dir():
-        raise WorktreeError(f"Local project path is not a directory: {base_cwd}")
-
-    prepared_worktree: PreparedWorktree | None = None
-    match requested_worktree.kind:
-        case "existing":
-            requested = Path(requested_worktree.cwd).expanduser().resolve()
-            with WorktreeRepository.open(base_cwd) as repository:
-                linked = repository.linked()
-            if not any(worktree.path == requested for worktree in linked):
-                raise WorktreeError(
-                    f"Worktree is not linked to the local project: {requested}"
-                )
-            cwd = requested
-        case "create":
-            with WorktreeRepository.open(base_cwd) as repository:
-                created = repository.prepare(
-                    requested_worktree.name, branch=requested_worktree.branch
-                )
-            prepared_worktree = created
-            cwd = created.path
-        case "auto":
-            with WorktreeRepository.open(base_cwd) as repository:
-                created = repository.prepare_auto(
-                    prompt=requested_worktree.prompt, suggested_name=suggested_name
-                )
-            prepared_worktree = created
-            cwd = created.path
-        case _:
-            raise TypeError(f"Unsupported worktree input: {requested_worktree!r}")
-
-    return WorktreeResolution(
-        options=options.model_copy(
-            update={"cwd": str(cwd), "workspace_roots": [str(cwd)], "worktree": None}
-        ),
-        prepared_worktree=prepared_worktree,
-    )

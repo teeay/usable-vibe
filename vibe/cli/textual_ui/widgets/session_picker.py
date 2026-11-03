@@ -8,9 +8,10 @@ from typing import Any, ClassVar, Literal
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container, Vertical
+from textual.containers import Container, Horizontal, Vertical
 from textual.content import Content
 from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
@@ -18,11 +19,13 @@ from vibe.app_server.models import PublicSession, SavedSessionSummary
 from vibe.cli.textual_ui.shortcut_hints import SHORTCUT_STYLE, shortcut, shortcut_hint
 from vibe.cli.textual_ui.widgets.navigable_option_list import NavigableOptionList
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
+from vibe.cli.textual_ui.widgets.spinner_text import SpinnerText
 
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3600
 _SECONDS_PER_DAY = 86400
 _SECONDS_PER_WEEK = 604800
+_PREVIEW_DEBOUNCE_SECONDS = 0.1
 _DELETE_FEEDBACK_STYLE = "bold"
 _DeleteStateKind = Literal["confirmation", "feedback", "pending"]
 type _PickerSession = PublicSession | SavedSessionSummary
@@ -93,12 +96,30 @@ def _build_header_text(cwd: str | None) -> Text:
     return text
 
 
+def _session_harness_tag(session: _PickerSession) -> str | None:
+    """Return the harness provenance tag for a session, or ``None``.
+
+    Only ``PublicSession`` carries a ``harness`` field; legacy
+    ``SavedSessionSummary`` rows never have one.
+    """
+    if isinstance(session, PublicSession):
+        return session.harness
+    return None
+
+
 def _build_option_text(session: _PickerSession, message: str) -> Content:
     time_str = _format_relative_time(_session_updated_at(session))
     session_id = _session_id(session)[:8]
-    return Content.assemble(
-        (f"{time_str:10}", "dim"), "  ", (f"{session_id}  ", "dim"), message
-    )
+    parts: list[tuple[str, str] | str] = [
+        (f"{time_str:10}", "dim"),
+        "  ",
+        (f"{session_id}  ", "dim"),
+    ]
+    harness = _session_harness_tag(session)
+    if harness is not None:
+        parts.append((f"[{harness}]  ", "dim"))
+    parts.append(message)
+    return Content.assemble(*parts)
 
 
 class SessionPickerApp(Container):
@@ -145,6 +166,7 @@ class SessionPickerApp(Container):
         latest_messages: dict[str, str],
         current_session_id: str | None = None,
         cwd: str | None = None,
+        loading: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(id="sessionpicker-app", **kwargs)
@@ -152,6 +174,9 @@ class SessionPickerApp(Container):
         self._latest_messages = latest_messages
         self._current_session_id = current_session_id
         self._cwd = cwd
+        self._loading = loading
+        self._preview_timer: Timer | None = None
+        self._pending_preview_session_id: str | None = None
         self._delete_state: _DeleteState | None = None
         self._initial_highlighted: int | None = next(
             (i for i, s in enumerate(sessions) if _session_id(s) == current_session_id),
@@ -242,6 +267,29 @@ class SessionPickerApp(Container):
     def _delete_is_pending(self) -> bool:
         return self._delete_state is not None and self._delete_state.kind == "pending"
 
+    def _cancel_pending_preview(self) -> None:
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+            self._preview_timer = None
+        self._pending_preview_session_id = None
+
+    def _schedule_preview(self, session_id: str | None) -> None:
+        self._cancel_pending_preview()
+        if session_id is None:
+            self.post_message(self.SessionHighlighted(session_id=None))
+            return
+        self._pending_preview_session_id = session_id
+        self._preview_timer = self.set_timer(
+            _PREVIEW_DEBOUNCE_SECONDS, self._flush_preview
+        )
+
+    def _flush_preview(self) -> None:
+        session_id = self._pending_preview_session_id
+        self._preview_timer = None
+        self._pending_preview_session_id = None
+        if session_id is not None:
+            self.post_message(self.SessionHighlighted(session_id=session_id))
+
     def _clear_delete_state(self) -> None:
         state = self._delete_state
         if state is None:
@@ -278,7 +326,7 @@ class SessionPickerApp(Container):
         new_id = (
             str(option.id) if option is not None and option.id is not None else None
         )
-        self.post_message(self.SessionHighlighted(session_id=new_id))
+        self._schedule_preview(new_id)
         return True
 
     def add_sessions(
@@ -315,6 +363,13 @@ class SessionPickerApp(Container):
         self, sessions: list[PublicSession], latest_messages: dict[str, str]
     ) -> None:
         """Populate the picker after initial mount. Highlights current session if present."""
+        if not self.is_mounted:
+            return
+        if self._loading:
+            self._loading = False
+            loading = self.query_one("#sessionpicker-loading", Horizontal)
+            loading.query_one(SpinnerText).set_pending(False)
+            loading.display = False
         self.add_sessions(sessions, latest_messages)
         option_list = self._option_list()
         if option_list.highlighted is not None:
@@ -347,6 +402,12 @@ class SessionPickerApp(Container):
             yield NoMarkupStatic(
                 _build_header_text(self._cwd), classes="sessionpicker-header"
             )
+            if self._loading:
+                with Horizontal(id="sessionpicker-loading"):
+                    yield SpinnerText(classes="sessionpicker-loading-indicator")
+                    yield NoMarkupStatic(
+                        "Loading sessions…", classes="sessionpicker-loading-status"
+                    )
             option_list = NavigableOptionList(*options, id="sessionpicker-options")
             if self._initial_highlighted is not None:
                 option_list.highlighted = self._initial_highlighted
@@ -360,13 +421,15 @@ class SessionPickerApp(Container):
             )
 
     def on_mount(self) -> None:
+        if self._loading:
+            self.query_one(SpinnerText).set_pending(True)
         option_list = self.query_one(OptionList)
         option_list.focus()
         option = option_list.highlighted_option
         initial_id = (
             str(option.id) if option is not None and option.id is not None else None
         )
-        self.post_message(self.SessionHighlighted(session_id=initial_id))
+        self._schedule_preview(initial_id)
 
     def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted
@@ -377,7 +440,7 @@ class SessionPickerApp(Container):
         option_id = str(event.option.id) if event.option.id is not None else None
         if self._delete_state is not None and self._delete_state.option_id != option_id:
             self._clear_delete_state()
-        self.post_message(self.SessionHighlighted(session_id=option_id))
+        self._schedule_preview(option_id)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if self._delete_is_pending():
@@ -388,6 +451,7 @@ class SessionPickerApp(Container):
             if self._delete_state_matches(option_id, "confirmation"):
                 return
 
+            self._cancel_pending_preview()
             self.post_message(
                 self.SessionSelected(option_id=option_id, session_id=option_id)
             )
@@ -400,6 +464,7 @@ class SessionPickerApp(Container):
             self._clear_delete_state()
             return
 
+        self._cancel_pending_preview()
         self.post_message(self.Cancelled())
 
     def action_request_delete(self) -> None:
@@ -421,6 +486,7 @@ class SessionPickerApp(Container):
             self._show_delete_state(
                 session, "pending", self._delete_pending_option_text(session)
             )
+            self._cancel_pending_preview()
             self.post_message(
                 self.SessionDeleteRequested(option_id=session_id, session_id=session_id)
             )
@@ -429,3 +495,6 @@ class SessionPickerApp(Container):
         self._show_delete_state(
             session, "confirmation", self._delete_confirmation_option_text(session)
         )
+
+    def on_unmount(self) -> None:
+        self._cancel_pending_preview()

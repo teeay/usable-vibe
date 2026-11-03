@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from pathlib import Path
 import time
 from typing import Any
 from uuid import uuid4
@@ -11,7 +10,10 @@ from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not
 from vibe.app_server._execution import SessionExecution, SessionExecutionKind
 from vibe.app_server._model import validate_wire
 from vibe.app_server._shell import (
+    DEFAULT_MAX_OUTPUT_BYTES,
     ShellController,
+    manual_shell_context,
+    resolve_workspace_cwd,
     shell_effect_cancelled,
     shell_effect_detail,
     shell_effect_error,
@@ -26,7 +28,6 @@ from vibe.app_server.protocol import (
     SessionShellCommandParams,
     SessionShellCommandResponse,
     ShellRunParams,
-    ShellRunResponse,
 )
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.tools.builtins.bash import BashToolConfig
@@ -89,15 +90,19 @@ class ShellRequestHandler:
             output.append(chunk)
             await self._turns.append_effect_output(operation_id, chunk)
 
-        try:
+        async def observe_start() -> None:
             await self._turns.start_effect(
                 session_id=params.session_id,
                 entry_id=operation_id,
                 title="shell",
                 detail=shell_effect_detail(command),
             )
+
+        try:
             try:
-                response = await self._shell.run(run_params, observe_output)
+                response = await self._shell.run(
+                    run_params, observe_output, observe_start
+                )
             except asyncio.CancelledError:
                 await self._turns.complete_effect(
                     operation_id,
@@ -131,14 +136,14 @@ class ShellRequestHandler:
         max_output_bytes = (
             bash_config.max_output_bytes
             if isinstance(bash_config, BashToolConfig)
-            else 16_000
+            else DEFAULT_MAX_OUTPUT_BYTES
         )
         await self._turns.inject(
             ContextInjectParams(
                 session_id=params.session_id,
                 input=[
                     TextContentBlock(
-                        text=_manual_shell_context(
+                        text=manual_shell_context(
                             response, max_output_bytes=max_output_bytes
                         )
                     )
@@ -177,47 +182,4 @@ class ShellRequestHandler:
         )
 
     def _workspace_cwd(self, requested_cwd: str | None) -> str:
-        root = self._agent_loop.cwd.resolve()
-        cwd = Path(requested_cwd).expanduser().resolve() if requested_cwd else root
-        if not cwd.is_dir():
-            raise RequestFailure(
-                ProtocolErrorCode.INVALID_PARAMS,
-                f"Shell working directory does not exist: {cwd}",
-            )
-        try:
-            cwd.relative_to(root)
-        except ValueError as exc:
-            raise RequestFailure(
-                ProtocolErrorCode.FORBIDDEN,
-                f"Shell working directory is outside the workspace: {cwd}",
-            ) from exc
-        return str(cwd)
-
-
-def _manual_shell_context(result: ShellRunResponse, *, max_output_bytes: int) -> str:
-    stdout = _cap_output(result.stdout, max_output_bytes)
-    stderr = _cap_output(result.stderr, max_output_bytes)
-    sections = [
-        "Manual `!` command result from the user. Use this as context only.",
-        f"Command: `{result.command}`",
-        f"Working directory: `{result.cwd}`",
-    ]
-    if result.timed_out:
-        sections.append("Status: timed out")
-    elif result.interrupted:
-        sections.append("Status: interrupted by user")
-    else:
-        sections.append(f"Exit code: {result.exit_code}")
-    if stdout:
-        sections.append(f"Stdout:\n```text\n{stdout.rstrip()}\n```")
-    if stderr:
-        sections.append(f"Stderr:\n```text\n{stderr.rstrip()}\n```")
-    if not stdout and not stderr:
-        sections.append("Output:\n```text\n(no output)\n```")
-    return "\n\n".join(sections)
-
-
-def _cap_output(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}\n... [truncated]"
+        return resolve_workspace_cwd(self._agent_loop.cwd, requested_cwd)

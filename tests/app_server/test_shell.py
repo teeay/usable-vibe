@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import time
 
 import pytest
@@ -8,14 +9,14 @@ from tests.conftest import build_test_agent_loop
 from tests.stubs.app_server import create_test_app_server_session
 from vibe.app_server._projection import project_history
 from vibe.app_server._session_resources import ShellTimelineEvent
-from vibe.app_server._shell_requests import _manual_shell_context
+from vibe.app_server._shell import ShellController, manual_shell_context
 from vibe.app_server.events import HistoryEntryAdded, HistoryEntryUpdated
 from vibe.app_server.models import (
     CompletedEffectState,
     FailedEffectState,
     PublicEffectEntry,
 )
-from vibe.app_server.protocol import ShellRunResponse
+from vibe.app_server.protocol import ShellRunParams, ShellRunResponse
 from vibe.core.types import Role
 from vibe.utils.tool_presentation import ToolEffectKind
 
@@ -38,11 +39,32 @@ def test_manual_shell_context_caps_stdout_and_stderr_independently() -> None:
         exit_code=1,
     )
 
-    context = _manual_shell_context(result, max_output_bytes=5)
+    context = manual_shell_context(result, max_output_bytes=5)
 
     assert context.count("[truncated]") == 2
     assert "oooooo" not in context
     assert "eeeeee" not in context
+
+
+@pytest.mark.asyncio
+async def test_shell_interrupt_is_sticky_before_process_spawn(tmp_path: Path) -> None:
+    controller = ShellController(tmp_path)
+    operation_id = "shell-early-interrupt"
+
+    async def interrupt_on_start() -> None:
+        assert await controller.interrupt(operation_id)
+
+    result = await controller.run(
+        ShellRunParams(
+            session_id="session-1",
+            operation_id=operation_id,
+            command="sleep 10",
+            cwd=str(tmp_path),
+        ),
+        observe_start=interrupt_on_start,
+    )
+
+    assert result.interrupted is True
 
 
 @pytest.mark.asyncio

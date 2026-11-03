@@ -81,6 +81,7 @@ def _tool_call_factory(
 
 
 @pytest.mark.timeout(25)
+@pytest.mark.unified_default
 @pytest.mark.parametrize(
     "streaming_mock_server",
     [pytest.param(_tool_call_factory, id="tool-call-stream")],
@@ -103,8 +104,13 @@ def test_spawn_cli_asks_bash_permission_and_shows_tool_output_after_approval(
             timeout=10,
             child=child,
         )
+        # The unified runtime names builtins by their canonical route
+        # (``file_system.bash`` stands for Vibe's ``bash``).
         wait_for_rendered_text(
-            child, captured, needle="Permission for the bash tool", timeout=10
+            child,
+            captured,
+            needle="Permission for the file_system.bash tool",
+            timeout=10,
         )
         child.send("y")
         child.send("\r")
@@ -117,13 +123,16 @@ def test_spawn_cli_asks_bash_permission_and_shows_tool_output_after_approval(
     rendered = strip_ansi(raw)
     terminal_lines = _terminal_lines(raw)
     assert _ALT_SCREEN not in raw
-    assert "Approved bash" in rendered
+    # The unified runtime passes the canonical route (file_system.bash) as the
+    # approval tool name, matching the live permission form; the durable
+    # receipt mirrors it.
+    assert "Approved file_system.bash" in rendered
     assert PREDICTABLE_OUTPUT in rendered
     # Durable non-assistant blocks (approval outcome, tool call/result) render
     # with the interim-event indentation of 8 columns left.
     indent = " " * 8
-    assert [line for line in terminal_lines if "Approved bash" in line] == [
-        f"{indent}✓ Approved bash"
+    assert [line for line in terminal_lines if "Approved " in line] == [
+        f"{indent}✓ Approved file_system.bash"
     ]
     assert f"{indent}✓ bash: {COMMAND}" in terminal_lines
     assert f"{indent}$ {COMMAND}" not in terminal_lines

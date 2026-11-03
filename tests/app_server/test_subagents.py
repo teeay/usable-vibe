@@ -243,6 +243,14 @@ async def test_task_creates_independently_readable_child_session(monkeypatch) ->
         ]
         assert messages[0].endswith("Inspect the project")
         assert messages[1] == "Child completed"
+        listed_child_history = await session.resources.sessions.list_history(
+            session_id=child_session_id
+        )
+        assert [
+            entry.text
+            for entry in listed_child_history.items
+            if isinstance(entry, PublicMessageEntry)
+        ] == messages
     finally:
         await session.close()
 
@@ -547,8 +555,7 @@ async def test_interrupting_task_leaves_child_idle_and_closes_runtime(
         child_session_id, runtime = next(iter(child_runtimes.items()))
         assert runtime.turns.active_turn is None
         assert runtime.execution.active is None
-        assert runtime.turns._active_task is not None
-        assert runtime.turns._active_task.done()
+        assert runtime.turns._active_task is None
         assert not [
             task
             for task in asyncio.all_tasks()

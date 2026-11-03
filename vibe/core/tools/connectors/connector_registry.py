@@ -25,6 +25,11 @@ from vibe.core.tools.remote import MCPTool, MCPToolResult, RemoteTool, _OpenArgs
 from vibe.core.tools.ui import ToolResultDisplay
 from vibe.core.types import ToolStreamEvent
 from vibe.core.utils import run_sync
+from vibe.core.utils.exceptions import (
+    describe_exception,
+    first_of_type,
+    leaf_exceptions,
+)
 from vibe.observability.logging import logger
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
 
@@ -34,6 +39,7 @@ if TYPE_CHECKING:
 _BOOTSTRAP_TIMEOUT = 30.0
 _BOOTSTRAP_CACHE_TTL_SECONDS = 10 * 60
 _SERVER_ERROR_STATUS = 500
+_MCP_SESSION_TERMINATED_CODE = 32600
 
 
 async def call_tool_http(
@@ -103,11 +109,35 @@ def _connector_tool_to_remote(tool: dict[str, Any]) -> RemoteTool | None:
 
 
 _DEFAULT_BASE_URL = "https://api.mistral.ai"
+# Sent as a repeated query param; a comma-joined string is read as one bogus name.
+# Off-by-default: gated builtins (e.g. document_library) are added only when a
+# caller opts in via ``builtin_connectors``; this is the safe fallback set so any
+# caller that omits ``builtins=`` never silently re-exposes a gated connector.
+_DEFAULT_BUILTIN_CONNECTORS = ("web_search",)
 
 
-def _bootstrap_cache_key(api_key: str, server_url: str | None) -> str:
+def builtin_connectors(*, enable_document_library_connector: bool) -> tuple[str, ...]:
+    """Builtin connectors to request from bootstrap, gated by experimental flags.
+
+    ``document_library`` is withheld unless explicitly enabled so its (currently
+    unstable) MCP tools are not surfaced by default.
+    """
+    connectors = _DEFAULT_BUILTIN_CONNECTORS
+    if enable_document_library_connector:
+        connectors += ("document_library",)
+    return connectors
+
+
+def _bootstrap_cache_key(
+    api_key: str,
+    server_url: str | None,
+    builtins: tuple[str, ...] = _DEFAULT_BUILTIN_CONNECTORS,
+) -> str:
     base_url = server_url or _DEFAULT_BASE_URL
-    return hashlib.sha256(f"{base_url}\0{api_key}".encode()).hexdigest()
+    builtins_key = ",".join(builtins)
+    return hashlib.sha256(
+        f"{base_url}\0{api_key}\0supports_mcp=true\0{builtins_key}".encode()
+    ).hexdigest()
 
 
 def _strip_none(value: Any) -> Any:
@@ -176,6 +206,7 @@ def _connector_bootstrap_cache_payload(connector: dict[str, Any]) -> dict[str, A
     payload: dict[str, Any] = {
         "id": connector.get("id"),
         "name": connector.get("name"),
+        "protocol": connector.get("protocol"),
         "status": {"is_ready": bool(status.get("is_ready", False))},
         "tools": [
             _tool_bootstrap_cache_payload(tool)
@@ -250,7 +281,7 @@ def _bootstrap_error_message(exc: Exception) -> str:
             body = http_err.response.text[:500].strip()
         except Exception:
             body = ""
-        detail = f"Failed to load workspace connectors (HTTP {status})."
+        detail = f"Failed to load connectors (HTTP {status})."
         if body:
             detail += f"\nServer response: {body}"
         if status >= _SERVER_ERROR_STATUS:
@@ -261,29 +292,32 @@ def _bootstrap_error_message(exc: Exception) -> str:
         return detail
     message = str(exc).strip()
     suffix = f": {message}" if message else ""
-    return f"Failed to load workspace connectors: {type(exc).__name__}{suffix}"
+    return f"Failed to load connectors: {type(exc).__name__}{suffix}"
 
 
 def _unwrap_http_status_error(exc: Exception) -> httpx.HTTPStatusError | None:
     """Extract an HTTPStatusError from an exception or ExceptionGroup."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc
-    if isinstance(exc, ExceptionGroup):
-        for inner in exc.exceptions:
-            if found := _unwrap_http_status_error(inner):
-                return found
-    if cause := exc.__cause__:
-        if isinstance(cause, httpx.HTTPStatusError):
-            return cause
+    if found := first_of_type(exc, httpx.HTTPStatusError):
+        return found
+    if isinstance(exc.__cause__, httpx.HTTPStatusError):
+        return exc.__cause__
     return None
 
 
-def _connector_error_message(
-    exc: Exception, connector_id: str, connector_name: str
+def _is_mcp_session_terminated(exc: BaseException) -> bool:
+    from mcp.shared.exceptions import McpError
+
+    # The MCP SDK reports any HTTP 404 from the server as this synthetic error.
+    return (
+        isinstance(exc, McpError)
+        and exc.error.code == _MCP_SESSION_TERMINATED_CODE
+        and exc.error.message == "Session terminated"
+    )
+
+
+def _single_connector_error_message(
+    exc: BaseException, connector_id: str, connector_name: str
 ) -> str:
-    """Return an actionable error message for connector proxy failures."""
-    if http_err := _unwrap_http_status_error(exc):
-        return _format_http_status_error(http_err, connector_name, connector_id)
     if isinstance(exc, httpx.TimeoutException):
         return (
             f"Connector '{connector_name}' timed out. "
@@ -292,15 +326,30 @@ def _connector_error_message(
     if isinstance(exc, httpx.ConnectError):
         return (
             f"Cannot reach connector proxy for '{connector_name}'. "
-            "Check your network connection."
+            f"Check your network connection. ({describe_exception(exc)})"
         )
-    if isinstance(exc, ExceptionGroup):
-        messages = [str(e) for e in exc.exceptions]
+    if _is_mcp_session_terminated(exc):
         return (
-            f"Connector '{connector_name}' call failed with multiple errors: "
-            + "; ".join(messages)
+            f"Connector '{connector_name}' (id: {connector_id}) gateway returned "
+            "HTTP 404 (MCP session terminated). If the API is behind a proxy, "
+            "check that it routes /v1/connectors-gateway/ to the Mistral API."
         )
-    return f"Connector '{connector_name}' call failed: {exc}"
+    return f"Connector '{connector_name}' call failed: {describe_exception(exc)}"
+
+
+def _connector_error_message(
+    exc: Exception, connector_id: str, connector_name: str
+) -> str:
+    """Return an actionable error message for connector proxy failures."""
+    if http_err := _unwrap_http_status_error(exc):
+        return _format_http_status_error(http_err, connector_name, connector_id)
+    leaves = leaf_exceptions(exc)
+    if len(leaves) == 1:
+        return _single_connector_error_message(leaves[0], connector_id, connector_name)
+    return (
+        f"Connector '{connector_name}' call failed with multiple errors: "
+        + "; ".join(describe_exception(leaf) for leaf in leaves)
+    )
 
 
 def create_connector_proxy_tool_class(
@@ -348,6 +397,12 @@ def create_connector_proxy_tool_class(
                     url, self._remote_name, payload, headers=headers
                 )
             except Exception as exc:
+                logger.warning(
+                    "Connector call failed connector=%s tool=%s",
+                    self._connector_name,
+                    self._remote_name,
+                    exc_info=exc,
+                )
                 msg = _connector_error_message(
                     exc, self._connector_id, self._connector_name
                 )
@@ -416,10 +471,12 @@ class ConnectorRegistry:
         server_url: str | None = None,
         *,
         catalog_entries: tuple[ConnectorCatalogEntry, ...] | None = None,
+        builtins: tuple[str, ...] = _DEFAULT_BUILTIN_CONNECTORS,
     ) -> None:
         self._api_key = api_key
         self._server_url = server_url
-        self._bootstrap_cache_key = _bootstrap_cache_key(api_key, server_url)
+        self._builtins = builtins
+        self._bootstrap_cache_key = _bootstrap_cache_key(api_key, server_url, builtins)
         self._cache: dict[str, dict[str, type[BaseTool]]] | None = None
         self._connector_names: list[str] = []
         self._connector_connected: dict[str, bool] = {}
@@ -438,6 +495,7 @@ class ConnectorRegistry:
             api_key=self._api_key,
             server_url=self._server_url,
             catalog_entries=self._host_catalog_entries,
+            builtins=self._builtins,
         )
 
     def reconfigure(self, entries: tuple[ConnectorCatalogEntry, ...]) -> None:
@@ -505,7 +563,11 @@ class ConnectorRegistry:
         base_url = self._server_url or _DEFAULT_BASE_URL
         url = f"{base_url}/v1/connectors/bootstrap"
         headers = {"Authorization": f"Bearer {self._api_key}"}
-        params = {"include_auth_actionable_connectors": "true"}
+        params = {
+            "include_auth_actionable_connectors": "true",
+            "builtin_connectors": self._builtins,
+            "supports_mcp": "true",
+        }
         async with VibeAsyncHTTPClient(
             timeout=_BOOTSTRAP_TIMEOUT, verify=build_ssl_context()
         ) as http:
@@ -515,18 +577,12 @@ class ConnectorRegistry:
 
     def _read_cached_bootstrap(self) -> dict[str, Any] | None:
         entry = _read_bootstrap_cache_entries().get(self._bootstrap_cache_key)
+        if not _is_fresh_bootstrap_cache_entry(entry, int(time.time())):
+            return None
         if not isinstance(entry, dict):
             return None
-
-        stored_at = entry.get("stored_at_timestamp")
         payload = entry.get("payload")
-        if not isinstance(stored_at, int) or not isinstance(payload, dict):
-            return None
-        if stored_at <= int(time.time()) - _BOOTSTRAP_CACHE_TTL_SECONDS:
-            return None
-        if not isinstance(payload.get("connectors"), list):
-            return None
-        return payload
+        return payload if isinstance(payload, dict) else None
 
     def _write_cached_bootstrap(self, payload: dict[str, Any]) -> None:
         now = int(time.time())
@@ -609,7 +665,12 @@ class ConnectorRegistry:
 
             self._bootstrap_error = None
 
-            unique_connectors = _deduplicate_connectors(data.get("connectors") or [])
+            connectors = [
+                connector
+                for connector in data.get("connectors") or []
+                if isinstance(connector, dict)
+            ]
+            unique_connectors = _deduplicate_connectors(connectors)
 
             cache: dict[str, dict[str, type[BaseTool]]] = {}
             all_tools: dict[str, type[BaseTool]] = {}

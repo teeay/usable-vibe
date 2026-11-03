@@ -17,18 +17,19 @@ from vibe.cli.autocompletion.inline_skill_completion import (
 from vibe.cli.autocompletion.path_completion import PathCompletionController
 from vibe.cli.autocompletion.slash_command import SlashCommandController
 from vibe.cli.commands import CommandRegistry
-from vibe.cli.textual_ui.queue_kinds import QueuedItemKind
 from vibe.cli.textual_ui.widgets.chat_input.body import ChatInputBody
 from vibe.cli.textual_ui.widgets.chat_input.completion_manager import (
     MultiCompletionManager,
 )
 from vibe.cli.textual_ui.widgets.chat_input.completion_popup import CompletionPopup
+from vibe.cli.textual_ui.widgets.chat_input.subagent_list import SubagentList
 from vibe.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from vibe.cli.voice_manager.voice_manager_port import VoiceManagerPort
 
 SAFETY_BORDER_CLASSES: dict[AgentSafety, str] = {
     AgentSafety.SAFE: "border-safe",
     AgentSafety.DESTRUCTIVE: "border-warning",
+    AgentSafety.SMART: "border-warning",
     AgentSafety.YOLO: "border-error",
 }
 
@@ -42,15 +43,13 @@ class ChatInputContainer(Vertical):
             super().__init__()
 
     class QueueEditSubmitted(Message):
-        def __init__(self, value: str, kind: QueuedItemKind) -> None:
+        def __init__(self, value: str) -> None:
             self.value = value
-            self.kind = kind
             super().__init__()
 
     class QueueEditConsumed(Message):
-        def __init__(self, value: str, kind: QueuedItemKind) -> None:
+        def __init__(self, value: str) -> None:
             self.value = value
-            self.kind = kind
             super().__init__()
 
     class QueueRemoveRequested(Message):
@@ -74,8 +73,7 @@ class ChatInputContainer(Vertical):
         file_watcher_for_autocomplete_getter: Callable[[], bool] | None = None,
         voice_manager: VoiceManagerPort | None = None,
         queue_edit_active_getter: Callable[[], bool] | None = None,
-        queue_items_getter: Callable[[], list[tuple[int, QueuedItemKind, str]]]
-        | None = None,
+        queue_items_getter: Callable[[], list[tuple[int, str]]] | None = None,
         queue_selected_index_getter: Callable[[], int | None] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -140,6 +138,8 @@ class ChatInputContainer(Vertical):
 
             yield self._body
 
+        yield SubagentList(id="subagent-list")
+
     def on_mount(self) -> None:
         if not self._body:
             return
@@ -152,6 +152,20 @@ class ChatInputContainer(Vertical):
         self, _event: ChatInputBody.CompletionResetRequested
     ) -> None:
         self._completion_manager.reset()
+
+    def on_chat_text_area_navigate_below(
+        self, event: ChatTextArea.NavigateBelow
+    ) -> None:
+        event.stop()
+        subagent_list = self.query_one(SubagentList)
+        if not subagent_list.focus_first() and self.input_widget is not None:
+            self.input_widget.set_app_focus(True)
+
+    def on_subagent_list_focus_input_requested(
+        self, event: SubagentList.FocusInputRequested
+    ) -> None:
+        event.stop()
+        self.focus_input()
 
     @property
     def input_widget(self) -> ChatTextArea | None:
@@ -184,6 +198,21 @@ class ChatInputContainer(Vertical):
     def focus_input(self) -> None:
         if self._body:
             self._body.focus_input()
+
+    def set_subagent_view(
+        self, active: bool, *, restore_input_focus: bool = True
+    ) -> None:
+        input_box = self.query_one(f"#{self.ID_INPUT_BOX}")
+        if not active:
+            input_box.display = True
+            if restore_input_focus:
+                self.focus_input()
+            return
+        if self.input_widget is not None:
+            self.input_widget.set_app_focus(False)
+        input_box.display = False
+        self.clear_completion_suggestions()
+        self.query_one(SubagentList).focus()
 
     def render_completion_suggestions(
         self, suggestions: list[CompletionEntry], selected_index: int
@@ -259,13 +288,13 @@ class ChatInputContainer(Vertical):
         self, event: ChatInputBody.QueueEditSubmitted
     ) -> None:
         event.stop()
-        self.post_message(self.QueueEditSubmitted(event.value, event.kind))
+        self.post_message(self.QueueEditSubmitted(event.value))
 
     def on_chat_input_body_queue_edit_consumed(
         self, event: ChatInputBody.QueueEditConsumed
     ) -> None:
         event.stop()
-        self.post_message(self.QueueEditConsumed(event.value, event.kind))
+        self.post_message(self.QueueEditConsumed(event.value))
 
     def on_chat_input_body_queue_remove_requested(
         self, event: ChatInputBody.QueueRemoveRequested

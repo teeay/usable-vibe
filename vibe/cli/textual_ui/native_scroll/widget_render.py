@@ -30,6 +30,8 @@ from vibe.cli.textual_ui.native_scroll.presentation import (
     HOOK_SEVERITY_ICONS,
     HOOK_SEVERITY_STYLES,
 )
+from vibe.cli.textual_ui.widgets.branch_created_message import BranchCreatedMessage
+from vibe.cli.textual_ui.widgets.fired_loop import FiredLoop
 from vibe.cli.textual_ui.widgets.messages import (
     ErrorMessage,
     HookSystemMessageLine,
@@ -38,6 +40,7 @@ from vibe.cli.textual_ui.widgets.messages import (
     UserMessage,
     WarningMessage,
 )
+from vibe.cli.textual_ui.widgets.model_change import ModelChangeMessage
 from vibe.cli.textual_ui.widgets.rewind_fork_message import RewindForkMessage
 from vibe.core.hooks.models import HookMessageSeverity, HookType
 from vibe.core.types import (
@@ -69,9 +72,13 @@ def render_widget_block(  # noqa: PLR0911
 ) -> RenderableType | None:
     if isinstance(widget, UserMessage):
         if widget.pending:
-            return None  # Queued prompts stay live until drained.
+            return None  # Queued prompts stay live until promoted or steered.
         return render_user_prompt(
-            widget.PROMPT_CHAR, widget.get_content(), widget._images, dark=dark
+            widget.PROMPT_CHAR,
+            widget.get_content(),
+            widget._images,
+            dark=dark,
+            fired_loop=widget.fired_loop,
         )
     if isinstance(widget, UserCommandMessage):
         return Markdown(widget._content)
@@ -86,6 +93,10 @@ def render_widget_block(  # noqa: PLR0911
     if isinstance(widget, HookSystemMessageLine):
         return render_hook_line(widget._hook_name, widget._content, widget._severity)
     if isinstance(widget, RewindForkMessage):
+        return Text(widget.get_content(), style="green")
+    if isinstance(widget, BranchCreatedMessage):
+        return Text(widget.get_content(), style="green")
+    if isinstance(widget, ModelChangeMessage):
         return Text(widget.get_content(), style="green")
     return None
 
@@ -143,6 +154,7 @@ def render_user_prompt(
     images: Sequence[NativeImageAttachment] | None = None,
     *,
     dark: bool = True,
+    fired_loop: FiredLoop | None = None,
 ) -> RenderableType:
     # The prompt marker stays bold; color comes from the band so the text reads
     # white on the dark band and black on the light band, per the band style.
@@ -153,6 +165,8 @@ def render_user_prompt(
     rows: list[RenderableType] = [prompt]
     if images:
         rows.append(_attachments_line(images))
+    if fired_loop is not None:
+        rows.append(Text(fired_loop.label().plain, style="dim"))
     body: RenderableType = Group(*rows) if len(rows) > 1 else prompt
     # A full-width warm gray-red band sets the prompt apart from the response
     # transcript; it replaces the previous ExpandingSeparator rule. ``expand``

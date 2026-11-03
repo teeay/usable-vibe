@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum, auto
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import JsonValue, ValidationError
@@ -24,15 +25,26 @@ from vibe.app_server._session_backend_port import (
     SessionBackendEvent,
     SessionBackendEventDrain,
     SessionBackendExtension,
+    SessionBackendHistoryClearHost,
     SessionBackendHost,
+    SessionBackendHostArchive,
     SessionBackendHostBackgroundTasks,
+    SessionBackendHostConfigRead,
+    SessionBackendHostDelete,
+    SessionBackendHostHistoryList,
+    SessionBackendHostLeaseWatch,
+    SessionBackendHostPin,
+    SessionBackendHostSeenState,
     SessionBackendNotificationSink,
     SessionBackendOpenCallbacks,
+    SessionBackendQueuedTurnSteering,
     SessionBackendResult,
+    SessionBackendRewindForkHost,
     SessionBackendRuntimeView,
     SessionEventSubscription,
 )
 from vibe.app_server._session_backend_services import SessionBackendServices
+from vibe.app_server._session_lease_subscription import SessionLeaseSubscription
 from vibe.app_server.connector_catalog import ConnectorCatalogService
 from vibe.app_server.events import (
     CallbackRequested,
@@ -42,6 +54,7 @@ from vibe.app_server.events import (
 from vibe.app_server.models import OpenCallbackState, PublicCallbackEntry
 from vibe.app_server.protocol import (
     SERVER_METHODS,
+    AgentInstallParams,
     AgentSwitchParams,
     AppServerResponseError,
     CallbackCallParams,
@@ -50,6 +63,7 @@ from vibe.app_server.protocol import (
     CallbackResultParams,
     ClientCapabilities,
     ClientInfo,
+    ConfigReadParams,
     ConfigReloadParams,
     ConfigWriteParams,
     ContextInjectParams,
@@ -63,31 +77,48 @@ from vibe.app_server.protocol import (
     JsonRpcErrorResponse,
     JsonRpcProtocolError,
     JsonRpcSuccessResponse,
+    MCPAuthUrlParams,
+    ModelConfigWriteParams,
     Notification,
     PageRequest,
     ProtocolError,
     ProtocolErrorCode,
     ServerInfo,
     ServerRequest,
+    SessionArchiveParams,
     SessionCompactParams,
     SessionContinueParams,
     SessionContinueResponse,
     SessionDeleteParams,
     SessionForkParams,
     SessionHandoffParams,
+    SessionHistoryClearParams,
+    SessionHistoryClearResponse,
+    SessionHistoryListParams,
     SessionListParams,
+    SessionMarkAsSeenParams,
+    SessionPinParams,
     SessionReadParams,
     SessionReadResponse,
     SessionResumeParams,
     SessionResumeResponse,
+    SessionRewindParams,
     SessionSettingsUpdateParams,
     SessionSnapshotParams,
     SessionStartParams,
     SessionStartResponse,
+    SessionTitleUpdateParams,
     TransportKind,
+    TurnEnqueueParams,
     TurnInterruptParams,
+    TurnQueueReadParams,
+    TurnQueueRemoveParams,
+    TurnQueueReplaceParams,
+    TurnQueueResumeParams,
+    TurnQueueSteerParams,
     TurnStartParams,
     TurnSteerParams,
+    format_invalid_params_issues,
     validate_callback_acknowledgement,
     validate_json_rpc_envelope,
 )
@@ -97,6 +128,7 @@ from vibe.observability.logging import logger
 
 if TYPE_CHECKING:
     from vibe.app_server.mcp_catalog import MCPCatalogService
+    from vibe.app_server.plugin_catalog import PluginCatalogService
 
 
 class InitializationState(StrEnum):
@@ -108,11 +140,17 @@ class InitializationState(StrEnum):
 type SessionBackendHostFactory = Callable[[SessionBackendServices], SessionBackendHost]
 
 
+# Requests that can hand the connection a different session. Their answer is
+# what tells the client the session changed, so notifications raised while they
+# run are held back and flushed once it has been sent: an event naming the new
+# session ahead of the response reaches a client still projecting the old one.
 _SESSION_ATTACHMENT_CANDIDATES = frozenset({
     "session/fork",
     "session/start",
     "session/resume",
     "session/continue",
+    "session/rewind",
+    "session/history/clear",
 })
 
 _SESSION_BACKEND_HOST_LIFECYCLE_METHODS = frozenset({
@@ -121,16 +159,29 @@ _SESSION_BACKEND_HOST_LIFECYCLE_METHODS = frozenset({
     "session/continue",
 })
 
-_SESSION_OPTIONAL_METHODS = frozenset({"config/read", "workspace/trust/decision"})
+_SESSION_OPTIONAL_METHODS = frozenset({
+    "agents/list",
+    "config/read",
+    "workspace/trust/decision",
+})
 
 _SESSION_BACKEND_METHODS = frozenset({
+    "agents/install",
+    "agents/uninstall",
     "callback/result",
     "config/reload",
+    "config/model/write",
     "config/write",
     "session/agent/update",
     "session/compact",
     "session/context/inject",
     "session/settings/update",
+    "session/turn/enqueue",
+    "session/turn/queue/read",
+    "session/turn/queue/remove",
+    "session/turn/queue/replace",
+    "session/turn/queue/steer",
+    "session/turn/queue/resume",
     "turn/interrupt",
     "turn/start",
     "turn/steer",
@@ -156,6 +207,18 @@ class PendingNotification:
     params: ProtocolModel
 
 
+def _consume_task_result(task: asyncio.Task[object]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+@dataclass(frozen=True, slots=True)
+class _ErrorDispatch:
+    error: ProtocolError
+    after_response: Callable[[], None] | None = None
+    on_response_abandoned: Callable[[], None] | None = None
+
+
 class AppServer:
     def __init__(
         self,
@@ -168,6 +231,7 @@ class AppServer:
         host_handler: HostRequestHandler | None = None,
         mcp_catalog_service: MCPCatalogService | None = None,
         connector_catalog_service: ConnectorCatalogService | None = None,
+        plugin_catalog_service: PluginCatalogService | None = None,
     ) -> None:
         self._root: SessionBackend | None = None
         self._host_handler = host_handler or HostRequestHandler(
@@ -184,6 +248,7 @@ class AppServer:
         self._client_requests: dict[int, PendingClientRequest] = {}
         self._abandoned_client_request_ids: set[int] = set()
         self._request_tasks: set[asyncio.Task[None]] = set()
+        self._leases = SessionLeaseSubscription(self._send_notification)
         self._backend_event_task: asyncio.Task[None] | None = None
         self._backend_event_backend: SessionBackend | None = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -202,6 +267,7 @@ class AppServer:
         self._identity_gateway = identity_gateway
         self._mcp_catalog_service = mcp_catalog_service
         self._connector_catalog_service = connector_catalog_service
+        self._plugin_catalog_service = plugin_catalog_service
         self._session_backend_host = session_backend_host_factory(self)
         if self._session_backend_host is None:
             raise TypeError(
@@ -479,6 +545,7 @@ class AppServer:
         self, current: asyncio.Task[object] | None
     ) -> list[BaseException]:
         tasks = [task for task in self._request_tasks if task is not current]
+        tasks.extend(self._leases.take())
         backend_events = self._backend_event_task
         self._backend_event_task = None
         self._backend_event_backend = None
@@ -495,6 +562,7 @@ class AppServer:
         self, current: asyncio.Task[object] | None
     ) -> list[BaseException]:
         tasks = [task for task in self._request_tasks if task is not current]
+        tasks.extend(self._leases.take())
         backend_events = self._backend_event_task
         self._backend_event_task = None
         self._backend_event_backend = None
@@ -533,10 +601,19 @@ class AppServer:
         if attachment_candidate:
             self._begin_attachment()
         outcome = await self._dispatch_or_error(request)
-        if isinstance(outcome, ProtocolError):
-            await self._send_error(request.id, outcome)
+        if isinstance(outcome, _ErrorDispatch):
+            try:
+                await self._send_error(request.id, outcome.error)
+            except BaseException:
+                if outcome.on_response_abandoned is not None:
+                    outcome.on_response_abandoned()
+                if attachment_candidate:
+                    await self._finish_attachment(was_attached)
+                raise
             if attachment_candidate:
                 await self._finish_attachment(was_attached)
+            if outcome.after_response is not None:
+                outcome.after_response()
             if request.method == "session/stop":
                 await self.close()
             return
@@ -547,6 +624,8 @@ class AppServer:
                 "result": outcome.response.model_dump(mode="json", by_alias=True),
             })
         except BaseException:
+            if outcome.on_response_abandoned is not None:
+                outcome.on_response_abandoned()
             if attachment_candidate:
                 await self._finish_attachment(was_attached)
             raise
@@ -575,7 +654,7 @@ class AppServer:
 
     async def _dispatch_or_error(
         self, request: ServerRequest
-    ) -> DispatchResult | ProtocolError:
+    ) -> DispatchResult | _ErrorDispatch:
         try:
             if request.method == "initialize":
                 return DispatchResult(self._initialize(request.params))
@@ -589,25 +668,41 @@ class AppServer:
                 self._validate_open_callback_capabilities()
             return dispatched
         except (RequestFailure, SessionBackendError) as exc:
-            return ProtocolError(code=exc.code, message=str(exc), data=exc.data)
+            return _ErrorDispatch(
+                ProtocolError(code=exc.code, message=str(exc), data=exc.data),
+                after_response=(
+                    exc.after_response if isinstance(exc, SessionBackendError) else None
+                ),
+                on_response_abandoned=(
+                    exc.on_response_abandoned
+                    if isinstance(exc, SessionBackendError)
+                    else None
+                ),
+            )
         except ValidationError as exc:
-            return ProtocolError(
-                code=ProtocolErrorCode.INVALID_PARAMS,
-                message="Invalid request parameters",
-                data=InvalidParamsData(
-                    error_count=exc.error_count(),
-                    issues=[
-                        InvalidParamsIssue(
-                            path=list(issue["loc"]), message=issue["msg"]
-                        )
-                        for issue in exc.errors()
-                    ],
-                ).model_dump(mode="json", by_alias=True),
+            data = InvalidParamsData(
+                error_count=exc.error_count(),
+                issues=[
+                    InvalidParamsIssue(path=list(issue["loc"]), message=issue["msg"])
+                    for issue in exc.errors()
+                ],
+            ).model_dump(mode="json", by_alias=True)
+            logger.warning(
+                "Rejected %s: invalid request parameters: %s",
+                request.method,
+                format_invalid_params_issues(data) or "<no field detail>",
+            )
+            return _ErrorDispatch(
+                ProtocolError(
+                    code=ProtocolErrorCode.INVALID_PARAMS,
+                    message="Invalid request parameters",
+                    data=data,
+                )
             )
         except Exception as exc:
             logger.exception("Unhandled error dispatching %s", request.method)
-            return ProtocolError(
-                code=ProtocolErrorCode.INTERNAL_ERROR, message=str(exc)
+            return _ErrorDispatch(
+                ProtocolError(code=ProtocolErrorCode.INTERNAL_ERROR, message=str(exc))
             )
 
     async def _after_response(
@@ -651,18 +746,46 @@ class AppServer:
             return await self._connector_catalog_service.dispatch(
                 method, raw_params, root=self._root, notify=self._route_notification
             )
+        if (
+            self._plugin_catalog_service is not None
+            and self._plugin_catalog_service.handles(method)
+        ):
+            return await self._plugin_catalog_service.dispatch(
+                method, raw_params, root=self._root
+            )
         if method in {
             "config/schema",
             "session/history/get",
+            "setup/status",
+            "setup/store-credential",
+            "setup/submit-choices",
             "workspace/git/checkouts",
+            "workspace/git/worktrees/limit/update",
             "workspace/git/worktrees/list",
+            "workspace/git/worktrees/prune",
+            "workspace/git/worktrees/reap",
+            "workspace/git/worktrees/reap/cancel",
             "workspace/git/worktrees/remove",
             "workspace/trust/status",
             "workspace/trust/untrustedConfig",
         } or method.startswith("projectLinks/"):
-            return await self._host_handler.dispatch(method, raw_params)
+            # The attached session is the caller; its own worktree holder does
+            # not count as in use for the worktree-remove questions it asks.
+            # The setup methods are session-less by construction: the wizard
+            # runs before any session, so they never build or read a runtime.
+            return await self._host_handler.dispatch(
+                method,
+                raw_params,
+                session_id=self._root.session_id if self._root is not None else None,
+                client_info=self._initialized_client_info(),
+            )
         if method == "session/delete":
             return await self._delete_session(raw_params)
+        if method == "session/lease/subscribe":
+            host = self._session_backend_host
+            if not isinstance(host, SessionBackendHostLeaseWatch):
+                raise method_not_found(method)
+            return await self._leases.subscribe(host)
         if _omits_session_id(method, raw_params):
             return await self._host_handler.dispatch(method, raw_params)
         if self._root is None:
@@ -700,6 +823,19 @@ class AppServer:
         references_child = isinstance(
             root, SessionBackendChildSessionIndex
         ) and root.references_child(params.session_id)
+        if isinstance(self._session_backend_host, SessionBackendHostDelete):
+            response = await self._session_backend_host.delete(params)
+            if is_root:
+                backend_events = self._backend_event_task
+                self._backend_event_task = None
+                self._backend_event_backend = None
+                if backend_events is not None:
+                    await cancel_tasks([backend_events], label="deleted session events")
+                self._root = None
+                self._callback_requests.clear()
+                if self._connector_catalog_service is not None:
+                    self._connector_catalog_service.discard_session(params.session_id)
+            return DispatchResult(response=response)
         if is_root or references_child:
             raise RequestFailure(
                 ProtocolErrorCode.CONFLICT, "Deleting a live session is not supported"
@@ -713,6 +849,8 @@ class AppServer:
             return await self._open_initial_session(method, raw_params)
         if result := await self._dispatch_backend_host_operation(method, raw_params):
             return result
+        if method == "session/history/list":
+            return await self._dispatch_stored_session(method, raw_params)
         if self._host_handler.handles(method):
             return await self._host_handler.dispatch(method, raw_params)
         return await self._open_initial_session(method, raw_params)
@@ -740,32 +878,60 @@ class AppServer:
                 ProtocolErrorCode.NOT_IMPLEMENTED,
                 f"The selected session backend does not support {method}",
             )
+        previous_session_id = root.session_id
         try:
             result = await root.dispatch_extension(method, raw_params)
         except SessionBackendError as exc:
             if exc.code is ProtocolErrorCode.NOT_FOUND and method in {
                 "session/read",
-                "session/rename",
                 "session/history/list",
             }:
-                return await self._host_handler.dispatch(method, raw_params)
+                return await self._dispatch_stored_session(method, raw_params)
             raise
+        if result.session_attached and root.session_id != previous_session_id:
+            subscription = await root.subscribe(
+                SessionReadParams(
+                    session_id=root.session_id, history=PageRequest(limit=200)
+                )
+            )
+            await self._replace_backend_event_task(root, subscription)
+            await self._replay_pending_backend_events(
+                root, subscription.snapshot.last_event_id
+            )
         await self._flush_backend_events(root)
         return result
+
+    async def _dispatch_stored_session(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult:
+        host = self._session_backend_host
+        if method == "session/history/list" and isinstance(
+            host, SessionBackendHostHistoryList
+        ):
+            try:
+                return DispatchResult(
+                    await host.list_history(
+                        validate_wire(SessionHistoryListParams, raw_params)
+                    )
+                )
+            except SessionBackendError as exc:
+                if exc.code is not ProtocolErrorCode.NOT_FOUND:
+                    raise
+        return await self._host_handler.dispatch(method, raw_params)
 
     async def _dispatch_backend_host_operation(
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult | None:
-        if method == "session/list":
-            response = await self._session_backend_host.list(
-                validate_wire(SessionListParams, raw_params)
-            )
+        if method in {"session/list", "session/read", "config/read"}:
+            return await self._dispatch_backend_host_read(method, raw_params)
+        if method == "session/rename":
+            params = validate_wire(SessionTitleUpdateParams, raw_params)
+            response = await self._session_backend_host.rename(params)
+            if self._root is not None and self._root.session_id == params.session_id:
+                await self._flush_backend_events(self._root)
             return DispatchResult(response)
-        if method == "session/read":
-            response = await self._session_backend_host.read(
-                validate_wire(SessionReadParams, raw_params)
-            )
-            return DispatchResult(response)
+        if method in {"session/pin", "session/archive", "session/markAsSeen"}:
+            return await self._dispatch_backend_host_metadata(method, raw_params)
         if method == "session/fork":
             params = validate_wire(SessionForkParams, raw_params)
             result = await self._session_backend_host.fork(params)
@@ -780,8 +946,130 @@ class AppServer:
                         "last_event_id": snapshot.last_event_id,
                     }
                 )
-            return DispatchResult(response, session_attached=result.backend is not None)
+            return DispatchResult(
+                response,
+                after_response=result.after_response,
+                session_attached=result.backend is not None,
+            )
+        if handoff := await self._dispatch_backend_host_handoff(method, raw_params):
+            return handoff
         return await self._dispatch_backend_host_lifecycle(method, raw_params)
+
+    async def _read_stored_session_config(
+        self, raw_params: dict[str, Any]
+    ) -> DispatchResult | None:
+        """A stored session's configuration, answered without resuming it.
+
+        The attached session answers for itself: it is the one holding the
+        configuration the next turn will run. Only a session this connection is
+        not sitting on reaches the store.
+        """
+        params = validate_wire(ConfigReadParams, raw_params)
+        if params.session_id is None:
+            return None
+        if self._root is not None and self._root.session_id == params.session_id:
+            return None
+        if not isinstance(self._session_backend_host, SessionBackendHostConfigRead):
+            return None
+        return DispatchResult(await self._session_backend_host.read_config(params))
+
+    async def _dispatch_backend_host_metadata(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult:
+        if method == "session/pin":
+            if not isinstance(self._session_backend_host, SessionBackendHostPin):
+                raise method_not_found(method)
+            params = validate_wire(SessionPinParams, raw_params)
+            response: ProtocolModel = await self._session_backend_host.pin(params)
+        elif method == "session/archive":
+            if not isinstance(self._session_backend_host, SessionBackendHostArchive):
+                raise method_not_found(method)
+            params = validate_wire(SessionArchiveParams, raw_params)
+            response = await self._session_backend_host.archive(params)
+        else:
+            if not isinstance(self._session_backend_host, SessionBackendHostSeenState):
+                raise method_not_found(method)
+            params = validate_wire(SessionMarkAsSeenParams, raw_params)
+            response = await self._session_backend_host.mark_as_seen(params)
+        if self._root is not None and self._root.session_id == params.session_id:
+            await self._flush_backend_events(self._root)
+        return DispatchResult(response)
+
+    async def _dispatch_backend_host_read(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult | None:
+        if method == "config/read":
+            return await self._read_stored_session_config(raw_params)
+        if method == "session/list":
+            response = await self._session_backend_host.list(
+                validate_wire(SessionListParams, raw_params)
+            )
+            return DispatchResult(response)
+        response = await self._session_backend_host.read(
+            validate_wire(SessionReadParams, raw_params)
+        )
+        return DispatchResult(response)
+
+    async def _dispatch_backend_host_handoff(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult | None:
+        """Route the Host operations that hand the connection a new session.
+
+        Both replace the attached backend rather than mutate it, so both run
+        under a lifecycle transition and answer with the session re-attached.
+        """
+        if rewound := await self._dispatch_rewind_fork(method, raw_params):
+            return rewound
+        return await self._dispatch_history_clear(method, raw_params)
+
+    async def _dispatch_history_clear(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult | None:
+        if method != "session/history/clear":
+            return None
+        if not isinstance(self._session_backend_host, SessionBackendHistoryClearHost):
+            return None
+        root = self._require_root()
+        params = validate_wire(SessionHistoryClearParams, raw_params)
+        async with self._lifecycle_transition():
+            result = await self._session_backend_host.clear_history(root, params)
+            await self._activate_backend(result.backend, 200)
+        return DispatchResult(
+            SessionHistoryClearResponse(
+                state=result.state, session_log=result.session_log
+            ),
+            after_response=result.after_response,
+            session_attached=True,
+            runtime_updated=True,
+        )
+
+    async def _dispatch_rewind_fork(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult | None:
+        """Route the fork half of ``session/rewind`` to the Host, if it owns it.
+
+        Only the fork half: an in-place rewind never changes session identity,
+        so it stays on the attached backend. A Host without this capability —
+        or a request arriving before a session is attached — falls through to
+        the backend's own ``session/rewind``.
+        """
+        if method != "session/rewind" or self._root is None:
+            return None
+        if not isinstance(self._session_backend_host, SessionBackendRewindForkHost):
+            return None
+        params = validate_wire(SessionRewindParams, raw_params)
+        if params.inplace:
+            return None
+        async with self._lifecycle_transition():
+            root = self._require_root()
+            result = await self._session_backend_host.rewind_fork(root, params)
+            await self._activate_backend(result.backend, 200)
+        return DispatchResult(
+            result.response,
+            after_response=result.after_response,
+            session_attached=True,
+            runtime_updated=True,
+        )
 
     async def _dispatch_backend_host_lifecycle(
         self, method: str, raw_params: dict[str, Any]
@@ -847,10 +1135,14 @@ class AppServer:
             backend.session_id,
         )
 
-    async def _dispatch_backend_operation(
+    async def _dispatch_backend_operation(  # noqa: PLR0911 - explicit route ownership
         self, root: SessionBackend, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult | None:
+        if method.startswith("session/turn/"):
+            return await self._dispatch_backend_turn(root, method, raw_params)
         match method.partition("/")[0]:
+            case "agents":
+                return await self._dispatch_backend_agents(root, method, raw_params)
             case "session":
                 return await self._dispatch_backend_session(root, method, raw_params)
             case "turn":
@@ -872,7 +1164,7 @@ class AppServer:
             return DispatchResult(
                 result.response,
                 after_response=result.after_response,
-                runtime_updated=True,
+                runtime_updated=result.response.applied,
             )
         if method == "session/settings/update":
             result = await root.update_settings(
@@ -886,14 +1178,65 @@ class AppServer:
             return DispatchResult(result.response, after_response=result.after_response)
         if method == "session/compact":
             result = await root.compact(validate_wire(SessionCompactParams, raw_params))
-            return DispatchResult(result.response, after_response=result.after_response)
+            return DispatchResult(
+                result.response,
+                after_response=result.after_response,
+                on_response_abandoned=result.on_response_abandoned,
+            )
         return None
+
+    @staticmethod
+    async def _dispatch_backend_agents(
+        root: SessionBackend, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult | None:
+        if method == "agents/install":
+            result = await root.install_agent(
+                validate_wire(AgentInstallParams, raw_params)
+            )
+        elif method == "agents/uninstall":
+            result = await root.uninstall_agent(
+                validate_wire(AgentInstallParams, raw_params)
+            )
+        else:
+            return None
+        return DispatchResult(
+            result.response, after_response=result.after_response, runtime_updated=True
+        )
 
     @staticmethod
     async def _dispatch_backend_turn(
         root: SessionBackend, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult | None:
-        if method == "turn/start":
+        if method == "session/turn/enqueue":
+            result = await root.enqueue_turn(
+                validate_wire(TurnEnqueueParams, raw_params)
+            )
+        elif method == "session/turn/queue/read":
+            result = await root.read_turn_queue(
+                validate_wire(TurnQueueReadParams, raw_params)
+            )
+        elif method == "session/turn/queue/remove":
+            result = await root.remove_queued_turn(
+                validate_wire(TurnQueueRemoveParams, raw_params)
+            )
+        elif method == "session/turn/queue/replace":
+            result = await root.replace_queued_turn(
+                validate_wire(TurnQueueReplaceParams, raw_params)
+            )
+        elif method == "session/turn/queue/steer":
+            if not isinstance(root, SessionBackendQueuedTurnSteering):
+                raise RequestFailure(
+                    ProtocolErrorCode.NOT_IMPLEMENTED,
+                    "The selected session backend does not support queued steering",
+                )
+            result = await root.steer_queued_turn(
+                validate_wire(TurnQueueSteerParams, raw_params)
+            )
+        elif method == "session/turn/queue/resume":
+            result = await root.resume_turn_queue(
+                validate_wire(TurnQueueResumeParams, raw_params)
+            )
+        elif method == "turn/start":
             result = await root.start_turn(validate_wire(TurnStartParams, raw_params))
         elif method == "turn/steer":
             result = await root.steer_turn(validate_wire(TurnSteerParams, raw_params))
@@ -903,7 +1246,12 @@ class AppServer:
             )
         else:
             return None
-        return DispatchResult(result.response, after_response=result.after_response)
+        return DispatchResult(
+            result.response,
+            after_response=result.after_response,
+            on_response_abandoned=result.on_response_abandoned,
+            runtime_updated=result.runtime_updated,
+        )
 
     async def _dispatch_backend_config(
         self, root: SessionBackend, method: str, raw_params: dict[str, Any]
@@ -912,9 +1260,12 @@ class AppServer:
             result = await root.write_config(
                 validate_wire(ConfigWriteParams, raw_params)
             )
-            runtime_updated = (
-                not result.response.rejected and not result.response.failures
+            runtime_updated = result.response.applied
+        elif method == "config/model/write":
+            result = await root.write_model_config(
+                validate_wire(ModelConfigWriteParams, raw_params)
             )
+            runtime_updated = result.response.applied
         elif method == "config/reload":
             plan = (
                 await self._mcp_catalog_service.prepare_config_reload(root)
@@ -1004,7 +1355,8 @@ class AppServer:
         self._client_capabilities = params.capabilities
         self._initialization = InitializationState.INITIALIZE_RECEIVED
         return InitializeResponse(
-            server_info=ServerInfo(name="vibe-app-server", version=__version__)
+            server_info=ServerInfo(name="vibe-app-server", version=__version__),
+            process_id=os.getpid(),
         )
 
     def _initialized_client_info(self) -> ClientInfo:
@@ -1093,7 +1445,12 @@ class AppServer:
         if self._attaching:
             self._pending_notifications.append(PendingNotification(method, params))
             return
-        if not self._connection_attached:
+        sessionless_auth_url = (
+            self._root is None
+            and self._initialization is InitializationState.INITIALIZED
+            and isinstance(params, MCPAuthUrlParams)
+        )
+        if not self._connection_attached and not sessionless_auth_url:
             return
         await self._send_notification(method, params)
 

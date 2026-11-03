@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
-from textual.widgets import OptionList
+import pytest
+from textual.app import App, ComposeResult
+from textual.widgets import Input, OptionList
 from textual.worker import Worker
 
 from vibe.app_server.models import (
@@ -14,20 +17,32 @@ from vibe.app_server.models import (
     MCPState,
     MCPToolSummary,
 )
+from vibe.app_server.protocol import (
+    AppServerResponseError,
+    ProtocolError,
+    ProtocolErrorCode,
+)
+from vibe.cli.textual_ui.app import VibeApp
 from vibe.cli.textual_ui.widgets.mcp_app import (
     _LIST_VIEW_HELP_AUTH,
     _LIST_VIEW_HELP_TOOLS,
+    _MANAGE_CONNECTORS_OPTION_ID,
+    _REFRESHING_LABEL,
     MCPApp,
+    MCPOptionList,
+    _filter_sources,
     _sort_sources_for_menu,
     _source_from_option_id,
     _source_option_id,
     _tool_count_text,
 )
+from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 
 
 def _source(
     name: str,
     *,
+    display_name: str = "",
     kind: MCPSourceKind = MCPSourceKind.SERVER,
     status: MCPSourceStatus = MCPSourceStatus.CONNECTED,
     tools: list[MCPToolSummary] | None = None,
@@ -35,6 +50,7 @@ def _source(
 ) -> MCPSourceSummary:
     return MCPSourceSummary(
         name=name,
+        display_name=display_name,
         kind=kind,
         transport="connector" if kind is MCPSourceKind.CONNECTOR else "stdio",
         status=status,
@@ -45,6 +61,15 @@ def _source(
 
 def _state(*sources: MCPSourceSummary) -> MCPState:
     return MCPState(sources=list(sources))
+
+
+class MCPAppHarness(App[None]):
+    def __init__(self, state: MCPState) -> None:
+        super().__init__()
+        self._state = state
+
+    def compose(self) -> ComposeResult:
+        yield MCPApp(self._state)
 
 
 def _run_worker_mock() -> MagicMock:
@@ -102,6 +127,122 @@ def test_source_sorting_puts_nonempty_sources_first_and_sorts_each_group() -> No
         "Alpha Empty",
         "Zulu Empty",
     ]
+
+
+def test_source_sorting_orders_by_display_name_not_alias() -> None:
+    # Aliases sort the opposite way to the titles the rows actually show.
+    sources = [
+        _source("zeta", display_name="Alpha Wiki", kind=MCPSourceKind.CONNECTOR),
+        _source("alpha", display_name="Zebra Docs", kind=MCPSourceKind.CONNECTOR),
+    ]
+
+    assert [source.name for source in _sort_sources_for_menu(sources)] == [
+        "zeta",
+        "alpha",
+    ]
+
+
+def test_filter_sources_fuzzy_matches_and_ranks_names() -> None:
+    sources = [
+        _source("Slack", kind=MCPSourceKind.CONNECTOR),
+        _source("Google Drive", kind=MCPSourceKind.CONNECTOR),
+        _source("GitHub", kind=MCPSourceKind.CONNECTOR),
+    ]
+
+    assert [source.name for source in _filter_sources(sources, "gd")] == [
+        "Google Drive"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_overview_starts_on_first_source_and_search_wraps_like_a_row() -> None:
+    app = MCPAppHarness(
+        _state(
+            _source("gmail", kind=MCPSourceKind.CONNECTOR),
+            _source("slack", kind=MCPSourceKind.CONNECTOR),
+        )
+    )
+
+    async with app.run_test() as pilot:
+        option_list = app.query_one(MCPOptionList)
+        search = app.query_one("#mcp-search", Input)
+        search_icon = app.query_one("#mcp-search-icon", NoMarkupStatic)
+
+        assert search_icon.content == "🔍"
+        assert search.placeholder == "Search servers and connectors (← to focus)"
+        assert app.screen.focused is option_list
+        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
+            "connector:gmail"
+        )
+
+        await pilot.press("up")
+        assert app.screen.focused is search
+
+        await pilot.press("up")
+        assert app.screen.focused is option_list
+        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
+            "connector:slack"
+        )
+
+        option_list.scroll_to = MagicMock(wraps=option_list.scroll_to)
+        await pilot.press("left")
+        assert app.screen.focused is search
+        option_list.scroll_to.assert_any_call(
+            y=0, animate=False, force=True, immediate=True
+        )
+
+        await pilot.press("down")
+        assert app.screen.focused is option_list
+        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
+            "connector:gmail"
+        )
+
+        await pilot.press("up", "up")
+        assert app.screen.focused is option_list
+        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
+            "connector:slack"
+        )
+
+        await pilot.press("down")
+        assert app.screen.focused is search
+
+        await pilot.press("down")
+        assert app.screen.focused is option_list
+        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
+            "connector:gmail"
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_fuzzy_filters_sources_without_taking_initial_focus() -> None:
+    app = MCPAppHarness(
+        _state(
+            _source("Google Drive", kind=MCPSourceKind.CONNECTOR),
+            _source("GitHub", kind=MCPSourceKind.CONNECTOR),
+            _source("Slack", kind=MCPSourceKind.CONNECTOR),
+        )
+    )
+
+    async with app.run_test() as pilot:
+        option_list = app.query_one(MCPOptionList)
+        await pilot.press("up", "g", "d")
+
+        source_ids = [
+            option.id
+            for option in option_list.options
+            if option.id is not None and option.id.startswith("connector:")
+        ]
+        assert app.screen.focused is app.query_one("#mcp-search", Input)
+        assert source_ids == ["connector:Google Drive"]
+
+        await pilot.press("down")
+        option_list.scroll_to = MagicMock(wraps=option_list.scroll_to)
+        await pilot.press("up")
+
+        assert app.screen.focused is app.query_one("#mcp-search", Input)
+        option_list.scroll_to.assert_any_call(
+            y=0, animate=False, force=True, immediate=True
+        )
 
 
 def test_list_view_sorts_server_and_connector_groups_by_discovered_tools() -> None:
@@ -168,6 +309,19 @@ def test_highlighting_regular_source_uses_tool_help() -> None:
     app._set_help_text.assert_called_once_with(_LIST_VIEW_HELP_TOOLS)
 
 
+def test_highlighting_auth_source_with_bootstrap_error_uses_tool_help() -> None:
+    source = _source("oauth", status=MCPSourceStatus.NEEDS_AUTH, error="boom")
+    app = MCPApp(_state(source))
+    app._viewing_name = None
+    app.query_one = MagicMock(return_value=MagicMock(highlighted=0))
+    app._source_for_option = MagicMock(return_value=source)
+    app._set_help_text = MagicMock()
+
+    app.on_option_list_option_highlighted(MagicMock())
+
+    app._set_help_text.assert_called_once_with(_LIST_VIEW_HELP_TOOLS)
+
+
 def test_oauth_source_detail_requests_server_auth() -> None:
     source = _source("oauth", status=MCPSourceStatus.NEEDS_AUTH)
     app = MCPApp(_state(source))
@@ -218,6 +372,23 @@ def test_connector_detail_shows_bootstrap_error() -> None:
     )
     assert "Failed to bootstrap" in labels
     assert "Slack OAuth token expired" in labels
+
+
+def test_connector_detail_uses_title() -> None:
+    source = _source(
+        "company_wiki",
+        display_name="Company Wiki",
+        kind=MCPSourceKind.CONNECTOR,
+        tools=[MCPToolSummary(name="search", description="Search docs", enabled=True)],
+    )
+    app = MCPApp(_state(source))
+    app.query_one = MagicMock()
+    app._set_help_text = MagicMock()
+    option_list = MagicMock()
+
+    app._show_detail_view(option_list, source)
+
+    app.query_one.return_value.update.assert_any_call("Connector: Company Wiki")
 
 
 def test_connector_detail_shows_error_over_needs_auth() -> None:
@@ -324,6 +495,38 @@ def test_start_refresh_dispatches_one_worker() -> None:
 
     assert app._refreshing is True
     app.run_worker.assert_called_once()
+    assert app.run_worker.call_args.kwargs["exit_on_error"] is False
+
+
+def test_refresh_action_starts_refresh_when_callback_present() -> None:
+    app = MCPApp(_state(), refresh_callback=AsyncMock(return_value="Refreshed"))
+    app._start_refresh = MagicMock()
+
+    app.action_refresh()
+
+    app._start_refresh.assert_called_once()
+
+
+def test_refresh_action_is_noop_without_callback() -> None:
+    app = MCPApp(_state())
+    app._start_refresh = MagicMock()
+
+    app.action_refresh()
+
+    app._start_refresh.assert_not_called()
+
+
+def test_mount_waits_for_interval_before_refreshing() -> None:
+    app = MCPApp(_state(), refresh_callback=AsyncMock(return_value="Refreshed"))
+    app._refresh_view = MagicMock()
+    app.query_one = MagicMock(return_value=MagicMock())
+    app._start_refresh = MagicMock()
+    app.set_interval = MagicMock()
+
+    app.on_mount()
+
+    app._start_refresh.assert_not_called()
+    app.set_interval.assert_called_once_with(60.0, app._start_refresh)
 
 
 def test_finished_refresh_rebuilds_only_while_attached() -> None:
@@ -392,11 +595,50 @@ def test_unavailable_connector_with_no_tools_keeps_tool_count_label() -> None:
     app = MCPApp(_state(source))
     option_list = MagicMock()
 
-    app._add_source_group(option_list, "Workspace Connectors", [source])
+    app._add_source_group(option_list, "Available Connectors", [source])
 
     calls = option_list.add_option.call_args_list
     source_label = calls[1].args[0].prompt
     assert "tool discovery failed" not in source_label.plain
+
+
+@pytest.mark.asyncio
+async def test_manage_connectors_row_shown_and_opens_url() -> None:
+    url = "https://console.mistral.ai/build/connectors?shareContext=%7B%7D"
+    app = MCPAppHarness(
+        MCPState(
+            sources=[_source("gmail", kind=MCPSourceKind.CONNECTOR)],
+            manage_connectors_url=url,
+        )
+    )
+
+    async with app.run_test() as pilot:
+        app.open_url = MagicMock()
+        option_list = app.query_one(MCPOptionList)
+        ids = [option.id for option in option_list.options]
+        assert _MANAGE_CONNECTORS_OPTION_ID in ids
+
+        # The manage row sits directly under the header, above the connectors.
+        assert ids.index(_MANAGE_CONNECTORS_OPTION_ID) < ids.index("connector:gmail")
+        # The initial cursor lands on the connector, not the manage action.
+        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
+            "connector:gmail"
+        )
+
+        option_list.highlighted = ids.index(_MANAGE_CONNECTORS_OPTION_ID)
+        await pilot.press("enter")
+
+        app.open_url.assert_called_once_with(url)
+
+
+@pytest.mark.asyncio
+async def test_manage_connectors_row_hidden_without_url() -> None:
+    app = MCPAppHarness(_state(_source("gmail", kind=MCPSourceKind.CONNECTOR)))
+
+    async with app.run_test():
+        option_list = app.query_one(MCPOptionList)
+        ids = [option.id for option in option_list.options]
+        assert _MANAGE_CONNECTORS_OPTION_ID not in ids
 
 
 def test_detail_view_unavailable_server_shows_discovery_failed() -> None:
@@ -440,3 +682,204 @@ def test_detail_view_connected_server_shows_no_tools_discovered() -> None:
 
     calls = option_list.add_option.call_args_list
     assert "No tools discovered" in calls[0].args[0].prompt
+
+
+def test_a_plugin_owned_server_says_which_plugin_declared_it() -> None:
+    plugin_owned = _source("figma", status=MCPSourceStatus.NEEDS_AUTH)
+    plugin_owned.plugin_name = "figma"
+    configured = _source("local")
+    app = MCPApp(_state(plugin_owned, configured))
+    option_list = MagicMock()
+
+    app._add_source_group(option_list, "Local MCP Servers", [plugin_owned, configured])
+
+    rows = [call.args[0].prompt.plain for call in option_list.add_option.call_args_list]
+    assert "[plugin:figma]" in rows[1]
+    assert "[plugin:" not in rows[2]
+
+
+def test_a_group_of_configured_servers_claims_no_owner_column() -> None:
+    source = _source("local")
+    app = MCPApp(_state(source))
+    option_list = MagicMock()
+
+    app._add_source_group(option_list, "Local MCP Servers", [source])
+
+    row = option_list.add_option.call_args_list[1].args[0].prompt.plain
+    assert row == "  local  [stdio]  no tools  ● connected"
+
+
+def test_a_plugin_owned_server_refuses_the_toggle_instead_of_posting_it() -> None:
+    source = _source("figma")
+    source.plugin_name = "figma"
+    app = MCPApp(_state(source))
+    app._highlighted_source = MagicMock(return_value=source)
+    app._rebuild_preserving_scroll = MagicMock()
+    app.post_message = MagicMock()
+    app.notify = MagicMock()
+
+    app._set_highlighted_disabled(disabled=True)
+
+    app.post_message.assert_not_called()
+    assert source.status is MCPSourceStatus.CONNECTED
+    assert "managed by the figma plugin" in app.notify.call_args.args[0]
+
+
+def test_a_plugin_owned_tool_row_refuses_the_toggle_instead_of_posting_it() -> None:
+    # Prepare
+    source = _source(
+        "figma", tools=[MCPToolSummary(name="get_metadata", description="Metadata")]
+    )
+    source.plugin_name = "figma"
+    app = MCPApp(_state(source))
+    app._viewing_name = "figma"
+    app._viewing_kind = MCPSourceKind.SERVER
+    option_list = MagicMock(highlighted=0)
+    option_list.get_option_at_index.return_value.id = "tool:get_metadata"
+    app.query_one = MagicMock(return_value=option_list)
+    app._rebuild_preserving_scroll = MagicMock()
+    app.post_message = MagicMock()
+    app.notify = MagicMock()
+
+    # Do
+    app._set_highlighted_disabled(disabled=True)
+
+    # Assert
+    app.post_message.assert_not_called()
+    assert app._state.sources[0].tools[0].enabled is True
+    assert "managed by the figma plugin" in app.notify.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_toggle_is_shown_to_the_user_rather_than_raised() -> None:
+    # Prepare
+    app = MagicMock()
+    rejection = AppServerResponseError(
+        ProtocolError(
+            code=ProtocolErrorCode.INVALID_PARAMS,
+            message=(
+                "MCP server 'linear-plugin' is managed by the 'linear-probe' "
+                "plugin and cannot be toggled or removed from the MCP catalog."
+            ),
+        )
+    )
+    app.app_server.resources.mcp.toggle = AsyncMock(side_effect=rejection)
+    message = MCPApp.MCPToggled(
+        name="linear-plugin", kind=MCPSourceKind.SERVER, disabled=True
+    )
+
+    # Do
+    await VibeApp.on_mcpapp_mcptoggled(app, message)
+
+    # Assert
+    assert "managed by the 'linear-probe' plugin" in app.notify.call_args.args[0]
+    app.query_one.return_value.refresh_index.assert_called_once_with()
+    app._refresh_banner.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_enabling_a_failing_server_does_not_paint_it_enabled() -> None:
+    app = MCPAppHarness(
+        _state(
+            _source("sentry", status=MCPSourceStatus.UNAVAILABLE),
+            _source("linear", status=MCPSourceStatus.UNAVAILABLE),
+        )
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.press("e")
+        await pilot.pause()
+
+        statuses = {
+            source.name: source.status
+            for source in app.query_one(MCPApp)._state.sources
+        }
+        assert statuses == {
+            "sentry": MCPSourceStatus.UNAVAILABLE,
+            "linear": MCPSourceStatus.UNAVAILABLE,
+        }
+
+
+def test_enabling_still_reports_the_toggle_to_the_host() -> None:
+    source = _source("local", status=MCPSourceStatus.DISABLED)
+    app = MCPApp(_state(source))
+    app._highlighted_source = MagicMock(return_value=source)
+    app._rebuild_preserving_scroll = MagicMock()
+    app.post_message = MagicMock()
+
+    app._set_highlighted_disabled(disabled=False)
+
+    message = app.post_message.call_args.args[0]
+    assert isinstance(message, MCPApp.MCPToggled)
+    assert message.name == "local"
+    assert message.disabled is False
+
+
+@pytest.mark.asyncio
+async def test_list_title_marks_an_in_flight_refresh() -> None:
+    release = asyncio.Event()
+    state = _state(_source("sentry", status=MCPSourceStatus.UNAVAILABLE))
+
+    async def refresh() -> str:
+        await release.wait()
+        return "Refreshed."
+
+    class Harness(App[None]):
+        def compose(self) -> ComposeResult:
+            yield MCPApp(state, state_getter=lambda: state, refresh_callback=refresh)
+
+    app = Harness()
+    async with app.run_test() as pilot:
+        title = app.query_one("#mcp-title", NoMarkupStatic)
+        assert _REFRESHING_LABEL not in str(title.content)
+
+        app.query_one(MCPApp)._start_refresh()
+        await pilot.pause()
+        assert _REFRESHING_LABEL in str(title.content)
+
+        release.set()
+        await pilot.pause()
+        await pilot.pause()
+
+        assert _REFRESHING_LABEL not in str(title.content)
+
+
+@pytest.mark.asyncio
+async def test_starting_a_refresh_does_not_repost_a_detail_auth_request() -> None:
+    state = _state(_source("sentry", status=MCPSourceStatus.NEEDS_AUTH))
+    release = asyncio.Event()
+
+    async def refresh() -> str:
+        await release.wait()
+        return "Refreshed."
+
+    class Harness(App[None]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.auth_requests: list[str] = []
+
+        def compose(self) -> ComposeResult:
+            yield MCPApp(
+                state,
+                initial_source="sentry",
+                state_getter=lambda: state,
+                refresh_callback=refresh,
+            )
+
+        async def on_mcpapp_mcpoauth_requested(
+            self, message: MCPApp.MCPOAuthRequested
+        ) -> None:
+            self.auth_requests.append(message.server_name)
+
+    app = Harness()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.auth_requests == ["sentry"]
+
+        app.query_one(MCPApp)._start_refresh()
+        await pilot.pause()
+
+        assert app.auth_requests == ["sentry"]
+
+        release.set()
+        await pilot.pause()

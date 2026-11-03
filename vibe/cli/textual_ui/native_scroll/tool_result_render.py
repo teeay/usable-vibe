@@ -26,6 +26,7 @@ collapsed in the full-screen UI (see ``private/ui-map.md``).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import difflib
 from pathlib import Path
 import re
@@ -35,6 +36,8 @@ from rich.console import Group, RenderableType
 from rich.syntax import Syntax
 from rich.text import Text
 
+from vibe.app_server.models import ScratchpadEffectOutput, TodoEffectItem
+from vibe.cli.textual_ui.widgets.tool_widgets import ProcessToolOutput
 from vibe.core.tools.builtins.ask_user_question import AskUserQuestionResult
 from vibe.core.tools.builtins.bash import CapturedShellResult
 from vibe.core.tools.builtins.edit import EditResult
@@ -45,7 +48,7 @@ from vibe.core.tools.builtins.experimental_bash import (
 )
 from vibe.core.tools.builtins.grep import GrepResult
 from vibe.core.tools.builtins.read_file import ReadFileResult
-from vibe.core.tools.builtins.todo import TodoResult
+from vibe.core.tools.builtins.todo import TodoItem, TodoResult
 from vibe.core.tools.builtins.write_file import WriteFileResult
 
 # A unified-diff hunk header, e.g. ``@@ -1,3 +1,4 @@``.
@@ -125,7 +128,7 @@ def render_result_body(
 def render_manual_bash_body(
     command: str, output: str, exit_code: int, *, interrupted: bool = False
 ) -> RenderableType:
-    """Render a durable Rich block for a manual ``!`` / queued bash command.
+    """Render a durable Rich block for a finished manual ``!`` bash command.
 
     Built from raw subprocess data (command, combined output, exit/interrupt
     state), never by scraping ``BashOutputMessage``. Mirrors the widget's
@@ -291,18 +294,132 @@ def _render_grep_result(
 
 
 def _render_todo_result(result: TodoResult) -> RenderableType:
-    if not result.todos:
+    return render_todo_items(result.todos)
+
+
+def render_todo_items(todos: Sequence[TodoItem | TodoEffectItem]) -> RenderableType:
+    if not todos:
         return Text("No todos", style="dim")
     rows: list[RenderableType] = []
     for status in _TODO_STATUS_ORDER:
         icon = _TODO_STATUS_ICONS[status]
-        for todo in result.todos:
+        for todo in todos:
             todo_status = (
                 todo.status.value if hasattr(todo.status, "value") else str(todo.status)
             )
             if todo_status == status:
                 rows.append(Text(f"{icon} {todo.content}"))
     return Group(*rows) if len(rows) > 1 else rows[0]
+
+
+# Process ids longer than this render as their trailing runes, matching the
+# widget's short-pid rows.
+_SHORT_PROCESS_ID_LEN = 8
+
+
+def render_process_effect_body(
+    output: ProcessToolOutput,
+    *,
+    shorten: bool = True,
+    head_lines: int = 3,
+    tail_lines: int = 3,
+) -> RenderableType | None:
+    """Render a durable Rich block for a background-process result.
+
+    Semantic mirror of ``ProcessResultWidget`` branches (never scraped):
+    start/stop metadata lines, fetched output text, the process list, and
+    write receipts. Fetched output shortens like other captured process
+    output; ``None`` means the tool name is unknown and the committer keeps
+    the summary line.
+    """
+    match output.tool_name:
+        case "process.start" | "process.stop":
+            return _process_start_stop_body(output)
+        case "process.output":
+            return _process_output_body(
+                output, shorten=shorten, head_lines=head_lines, tail_lines=tail_lines
+            )
+        case "process.list":
+            return _process_list_body(output)
+        case "process.write":
+            return _process_write_body(output)
+        case _:
+            return None
+
+
+def _process_start_stop_body(output: ProcessToolOutput) -> RenderableType | None:
+    lines = [
+        f"{key}: {value}"
+        for key, value in (
+            ("processId", output.process_id),
+            ("status", output.status),
+            ("exitCode", output.exit_code),
+        )
+        if value is not None and value != ""
+    ]
+    return Text("\n".join(lines)) if lines else None
+
+
+def _process_output_body(
+    output: ProcessToolOutput, *, shorten: bool, head_lines: int, tail_lines: int
+) -> RenderableType:
+    text = (output.output or "").strip("\n")
+    if not text.strip():
+        return Text("(no output)", style="dim")
+    if shorten:
+        text = shorten_text_middle(text, head_lines=head_lines, tail_lines=tail_lines)
+    return Text(text)
+
+
+def _process_list_body(output: ProcessToolOutput) -> RenderableType:
+    if not output.processes:
+        return Text("(no background processes)", style="dim")
+    return Text(
+        "\n".join(
+            f"{_short_process_id(p.get('processId', ''))}  "
+            f"{p.get('status', '?')}  {p.get('command', '?')}"
+            for p in output.processes
+        )
+    )
+
+
+def _process_write_body(output: ProcessToolOutput) -> RenderableType | None:
+    lines = [
+        f"{key}: {value}"
+        for key, value in (
+            ("bytesWritten", output.bytes_written),
+            ("status", output.status),
+        )
+        if value is not None and value != ""
+    ]
+    return Text("\n".join(lines)) if lines else None
+
+
+def _short_process_id(process_id: object) -> str:
+    text = process_id if isinstance(process_id, str) else str(process_id)
+    if len(text) > _SHORT_PROCESS_ID_LEN:
+        return text[-_SHORT_PROCESS_ID_LEN:]
+    return text
+
+
+def render_scratchpad_effect_body(
+    output: ScratchpadEffectOutput, *, dark: bool, ansi: bool
+) -> RenderableType | None:
+    """Render a durable Rich block for a scratchpad read/write/list.
+
+    A note renders like file content; a list renders one name per row,
+    mirroring ``ScratchpadResultWidget``.
+    """
+    if output.content:
+        return _highlighted_block(
+            output.content.strip("\n"),
+            _language_for_path(output.path or ""),
+            dark=dark,
+            ansi=ansi,
+        )
+    if output.files:
+        return Text("\n".join(output.files))
+    return None
 
 
 def _highlighted_block(

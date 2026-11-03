@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Protocol
 
 from vibe.app_server.models import IdentityEntityView, IdentityView
-from vibe.core.agent_loop import AgentLoop
+from vibe.core.config import VibeConfigSchema
 from vibe.core.identity import (
     HttpIdentityGateway,
     IdentityGateway,
@@ -11,6 +12,7 @@ from vibe.core.identity import (
     IdentityGatewayUnavailable,
     IdentityResult,
 )
+from vibe.core.identity_cache import IdentityCache
 from vibe.observability.logging import logger
 from vibe.utils.api_keys import resolve_api_key
 
@@ -20,13 +22,27 @@ __all__ = [
     "IdentityGateway",
     "IdentityGatewayUnauthorized",
     "IdentityGatewayUnavailable",
+    "IdentityHost",
     "IdentityResult",
 ]
 
 
+class IdentityHost(Protocol):
+    """What ``IdentityController`` needs of its session. ``AgentLoop`` satisfies
+    it as it stands; the Unified backend supplies the same two members from its
+    session context, so both backends reach one implementation.
+    """
+
+    @property
+    def config(self) -> VibeConfigSchema: ...
+
+    @property
+    def identity_cache(self) -> IdentityCache: ...
+
+
 class IdentityController:
     def __init__(
-        self, agent_loop: AgentLoop, gateway: IdentityGateway | None = None
+        self, agent_loop: IdentityHost, gateway: IdentityGateway | None = None
     ) -> None:
         self._agent_loop = agent_loop
         self._gateway = gateway or HttpIdentityGateway()
@@ -37,13 +53,9 @@ class IdentityController:
             return await self._read()
 
     async def _read(self) -> IdentityView | None:
-        runtime_config = self._agent_loop.config
-        if not runtime_config.is_active_model_mistral():
-            return None
-
-        try:
-            provider = runtime_config.get_active_provider()
-        except ValueError:
+        # The Mistral identity holds whatever the active model, like /whoami.
+        provider = self._agent_loop.config.get_mistral_provider()
+        if provider is None:
             return None
 
         api_key = await asyncio.to_thread(resolve_api_key, provider.api_key_env_var)

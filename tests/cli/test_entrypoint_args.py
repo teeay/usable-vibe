@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -44,6 +45,19 @@ def test_experimental_harness_flag_is_parseable(
     assert args.experimental_harness is True
 
 
+def test_smart_approve_enables_the_experimental_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Smart approve is a Unified Harness classify gate with no legacy equivalent, so
+    # --smart-approve must turn on the experimental harness rather than relabel a
+    # legacy session that runs ordinary permissions.
+    args = _parse(monkeypatch, ["--smart-approve"])
+
+    assert args.smart_approve is True
+    assert args.experimental_harness is True
+    assert args.agent == "smart-approve"
+
+
 def test_experimental_harness_is_hidden_without_package(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -86,10 +100,32 @@ def test_experimental_harness_factory_comes_from_harness_distribution(
 
     monkeypatch.setattr(_experimental_harness, "import_module", import_stub)
 
-    with pytest.raises(NotImplementedError, match="Harness stub selected"):
+    with pytest.raises(
+        _experimental_harness.ExperimentalHarnessUnavailableError,
+        match="Harness stub selected",
+    ):
         _experimental_harness.create_experimental_harness_host()
 
-    assert imported_modules == ["mistralai_rust_harness.vibe"]
+    assert imported_modules == ["mistralai_vibe_local_harness.vibe"]
+
+
+def test_experimental_harness_factory_reports_unavailable_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(_module_name: str):
+        raise ModuleNotFoundError("No module named 'mistralai_vibe_local_harness'")
+
+    monkeypatch.setattr(_experimental_harness, "import_module", unavailable)
+
+    with pytest.raises(
+        _experimental_harness.ExperimentalHarnessUnavailableError
+    ) as exc_info:
+        _experimental_harness.create_experimental_harness_host()
+
+    message = str(exc_info.value)
+    assert "could not be loaded" in message
+    assert "--legacy-harness" in message
+    assert "uv tool upgrade uvibe" in message
 
 
 def test_worktree_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,3 +208,30 @@ def test_suggest_worktree_name_skips_the_model_without_a_prompt(
     monkeypatch.setattr("vibe.core.config.vibe_schema.load_dotenv_values", explode)
 
     assert entrypoint._suggest_worktree_name(None) is None
+
+
+def test_time_limit_parses_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = _parse(monkeypatch, ["-p", "hi", "--time-limit", "2.5"])
+
+    assert args.time_limit == 2.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "soon"])
+def test_time_limit_rejects_non_positive_values_as_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        _parse(monkeypatch, ["-p", "hi", "--time-limit", value])
+
+    assert exc_info.value.code == 1
+
+
+def test_prompt_file_and_output_dir_resolve_before_workdir_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    args = _parse(monkeypatch, ["--prompt-file", "task.md", "--output-dir", "out"])
+
+    assert args.prompt_file == tmp_path.resolve() / "task.md"
+    assert args.output_dir == tmp_path.resolve() / "out"

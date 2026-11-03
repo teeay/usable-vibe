@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Protocol
 
 from vibe.app_server.models import (
     AccountAction,
     AccountActionKind,
+    AccountApiKeyView,
     AccountPlanKind,
     AccountPlanView,
     AccountStatus,
     AccountView,
 )
-from vibe.core.agent_loop import AgentLoop
 from vibe.core.config import VibeConfigSchema
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.telemetry.send import get_mistral_provider_and_api_key
+from vibe.core.types import Backend
 from vibe.observability.logging import logger
 from vibe.setup.auth.api_key_persistence import (
     apply_provider_to_config,
@@ -41,6 +43,7 @@ __all__ = [
     "AccountGateway",
     "AccountGatewayUnauthorized",
     "AccountGatewayUnavailable",
+    "AccountHost",
     "HttpAccountGateway",
     "WhoAmIResult",
     "fetch_whoami",
@@ -49,10 +52,26 @@ __all__ = [
 
 _PAID_CHAT_PLANS = {"INDIVIDUAL", "EDU", "TEAM"}
 _RECONCILE_REASON = "tenant-domain-reconcile"
+# /whoami answers the plan type from the key scope, so the mapping is one-to-one.
+_KEY_SCOPES = {
+    AccountPlanKind.API: "workspace",
+    AccountPlanKind.CHAT: "vibe",
+    AccountPlanKind.MISTRAL_CODE: "codestral",
+}
+_KEY_PREVIEW_CHARS = 10
+
+
+@dataclass(frozen=True, slots=True)
+class _TenantDomainUpdate:
+    provider_name: str
+    whoami: WhoAmIResult
 
 
 async def reconcile_tenant_domains(
-    orchestrator: ConfigOrchestrator[VibeConfigSchema], whoami: WhoAmIResult
+    orchestrator: ConfigOrchestrator[VibeConfigSchema],
+    whoami: WhoAmIResult,
+    *,
+    provider_name: str,
 ) -> None:
     """Heal config.toml with any tenant URLs from /whoami that differ from
     what's currently persisted. Safe to call every whoami fetch — no-ops when
@@ -70,20 +89,19 @@ async def reconcile_tenant_domains(
         sanitized_api = _sanitize_tenant_url(whoami.api_base, field="api_base")
         if sanitized_api is not None:
             desired_api_base = f"{sanitized_api}/v1"
-            try:
-                active_provider = current.get_active_provider()
-            except ValueError:
-                # No active provider means we can't patch api_base, but that has
-                # no bearing on the top-level vibe_base_url — fall through to the
-                # vibe_base branch instead of returning.
-                active_provider = None
-            if (
-                active_provider is not None
-                and active_provider.api_base != desired_api_base
-            ):
+            provider = next(
+                (
+                    candidate
+                    for candidate in current.providers
+                    if candidate.name == provider_name
+                    and candidate.backend is Backend.MISTRAL
+                ),
+                None,
+            )
+            if provider is not None and provider.api_base != desired_api_base:
                 await apply_provider_to_config(
                     orchestrator,
-                    active_provider.model_copy(update={"api_base": desired_api_base}),
+                    provider.model_copy(update={"api_base": desired_api_base}),
                     reason=_RECONCILE_REASON,
                 )
 
@@ -157,18 +175,38 @@ class _Plan:
             self.kind is AccountPlanKind.MISTRAL_CODE and self.normalized_name == "F"
         )
 
+
+class AccountHost(Protocol):
+    """What ``AccountController`` needs of its session. ``AgentLoop`` satisfies
+    it as it stands, so the legacy construction is unchanged and the Unified
+    backend reaches this same controller through a small shim instead of a
+    second copy of the status ladder.
+
+    ``config`` and ``config_orchestrator`` are declared read-only because
+    ``AgentLoop`` exposes them as properties; a mutable-attribute Protocol would
+    reject it. The Protocol is enforced rather than cast: reaching for a further
+    ``AgentLoop`` member inside the controller has to fail the type check, not
+    the Unified path at runtime.
+    """
+
     @property
-    def teleport_eligible(self) -> bool:
-        return (
-            self.kind is AccountPlanKind.CHAT
-            and self.normalized_name in _PAID_CHAT_PLANS
-            and not self.prompt_switching_to_pro_plan
-        )
+    def config(self) -> VibeConfigSchema: ...
+
+    @property
+    def config_orchestrator(self) -> ConfigOrchestrator[VibeConfigSchema]: ...
+
+    def set_user_plan(self, user_plan: str | None) -> None: ...
+
+    async def apply_account_whoami(
+        self, *, console_base_url: str, api_key: str, whoami: WhoAmIResult
+    ) -> None: ...
+
+    async def clear_account_whoami(self, *, api_key: str) -> None: ...
 
 
 class AccountController:
     def __init__(
-        self, agent_loop: AgentLoop, gateway: AccountGateway | None = None
+        self, agent_loop: AccountHost, gateway: AccountGateway | None = None
     ) -> None:
         self._agent_loop = agent_loop
         self._gateway = gateway or HttpAccountGateway()
@@ -176,26 +214,22 @@ class AccountController:
 
     async def read(self) -> AccountView:
         async with self._lock:
-            fetched, view = await self._read()
+            tenant_update, view = await self._read()
         # Reconcile outside the lock: config writes hit the filesystem and can
         # block, and they don't need the account lock's mutual exclusion.
-        if fetched is not None:
+        if tenant_update is not None:
             await reconcile_tenant_domains(
-                self._agent_loop.config_orchestrator, fetched
+                self._agent_loop.config_orchestrator,
+                tenant_update.whoami,
+                provider_name=tenant_update.provider_name,
             )
         return view
 
-    async def _read(self) -> tuple[WhoAmIResult | None, AccountView]:
+    async def _read(self) -> tuple[_TenantDomainUpdate | None, AccountView]:
         runtime_config = self._agent_loop.config
         vibe_base_url = runtime_config.vibe_base_url
         console_base_url = runtime_config.console_base_url
         upgrade = _account_action(AccountActionKind.UPGRADE_TO_PRO, vibe_base_url)
-        # The account UI is only for Mistral-hosted models: a third-party model
-        # never shows a plan. But we still fetch /whoami whenever a Mistral
-        # credential exists so telemetry's user_plan is populated regardless of
-        # the active backend. The gate below is on rendering, not on fetching.
-        active_mistral = runtime_config.is_active_model_mistral()
-
         # Resolve a Mistral credential (prefers the active provider, else the
         # first configured Mistral provider). Runs in a thread because key
         # resolution can touch the keyring / filesystem.
@@ -218,7 +252,7 @@ class AccountController:
             return None, AccountView(
                 status=(
                     AccountStatus.MISSING_KEY
-                    if active_mistral
+                    if self._agent_loop.config.is_active_model_mistral()
                     else AccountStatus.UNAVAILABLE
                 ),
                 teleport_action=upgrade,
@@ -229,7 +263,7 @@ class AccountController:
         # slow or failed account fetch here would clobber that value —
         # leaking null into telemetry for the rest of the session. Only the
         # success path below overwrites it.
-        _provider, api_key = provider_and_key
+        provider, api_key = provider_and_key
 
         try:
             result = await self._gateway.read(
@@ -243,7 +277,7 @@ class AccountController:
             # otherwise surface the usual upgrade prompts.
             return None, (
                 AccountView(status=AccountStatus.UNAVAILABLE, teleport_action=upgrade)
-                if not active_mistral
+                if not self._agent_loop.config.is_active_model_mistral()
                 else AccountView(
                     status=AccountStatus.UNAUTHORIZED,
                     plan_offer=upgrade,
@@ -268,14 +302,20 @@ class AccountController:
         )
 
         plan = _Plan.from_result(result)
+        plan_view = AccountPlanView(kind=plan.kind, name=plan.name, title=plan.title)
+        api_key_view = AccountApiKeyView(
+            preview=_key_preview(api_key),
+            scope=_KEY_SCOPES[plan.kind],
+            access_scope=result.primitive_access_scope,
+        )
+        tenant_update = _TenantDomainUpdate(provider_name=provider.name, whoami=result)
 
-        if not active_mistral:
-            # Telemetry captured the real plan above; suppress the account UI
-            # for a non-Mistral active model. Return ``fetched=None`` so the
-            # tenant-domain reconcile (which patches the ACTIVE provider) does
-            # not run against a third-party provider.
-            return None, AccountView(
-                status=AccountStatus.UNAVAILABLE, teleport_action=upgrade
+        if not self._agent_loop.config.is_active_model_mistral():
+            return tenant_update, AccountView(
+                status=AccountStatus.UNAVAILABLE,
+                plan=plan_view,
+                teleport_action=upgrade,
+                api_key=api_key_view,
             )
 
         switch_key = _account_action(AccountActionKind.SWITCH_API_KEY, vibe_base_url)
@@ -285,20 +325,21 @@ class AccountController:
         elif plan.offers_upgrade:
             plan_offer = upgrade
 
-        teleport_action: AccountAction | None = None
-        if not plan.teleport_eligible:
-            teleport_action = (
-                switch_key if plan.prompt_switching_to_pro_plan else upgrade
-            )
-
-        return result, AccountView(
+        teleport_eligible = plan.kind is not AccountPlanKind.MISTRAL_CODE
+        return tenant_update, AccountView(
             status=AccountStatus.READY,
-            plan=AccountPlanView(kind=plan.kind, name=plan.name, title=plan.title),
+            plan=plan_view,
             plan_offer=plan_offer,
             rate_limit_action=(upgrade if plan.rate_limit_upgrade_available else None),
-            teleport_eligible=plan.teleport_eligible,
-            teleport_action=teleport_action,
+            teleport_eligible=teleport_eligible,
+            teleport_action=None if teleport_eligible else switch_key,
+            api_key=api_key_view,
         )
+
+
+def _key_preview(api_key: str) -> str:
+    # Never reveal more than a quarter of the secret.
+    return f"{api_key[: min(_KEY_PREVIEW_CHARS, len(api_key) // 4)]}****"
 
 
 def _account_action(kind: AccountActionKind, vibe_base_url: str) -> AccountAction:

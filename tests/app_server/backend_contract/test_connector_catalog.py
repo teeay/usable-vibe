@@ -31,6 +31,7 @@ from vibe.app_server.protocol import (
     ConnectorsReadParams,
     ConnectorsReadResponse,
     ProtocolErrorCode,
+    SessionReadyWaitParams,
     SessionStartParams,
     SessionStartResponse,
     SessionStopParams,
@@ -45,6 +46,7 @@ def _connector(
     connector_id: str,
     name: str,
     *,
+    protocol: str = "mcp",
     ready: bool = True,
     auth_action: str = "none",
     tools: tuple[str, ...] = ("search",),
@@ -52,6 +54,7 @@ def _connector(
     return {
         "id": connector_id,
         "name": name,
+        "protocol": protocol,
         "status": {"is_ready": ready},
         **({"auth_action": {"type": auth_action}} if auth_action != "none" else {}),
         "tools": [
@@ -76,7 +79,9 @@ async def _open_connector_session(
 ) -> tuple[AppServerSession, respx.Route]:
     bootstrap_route = respx_mock.get(f"{MISTRAL_BASE_URL}{CONNECTORS_BOOTSTRAP_PATH}")
     bootstrap_route.mock(return_value=httpx.Response(200, json=payload))
-    return await connection.host.open_session(), bootstrap_route
+    session = await connection.host.open_session()
+    await session.resources.runtime.wait_until_ready()
+    return session, bootstrap_route
 
 
 def _source(response: ConnectorCatalogReadResponse, alias: str):
@@ -207,15 +212,16 @@ async def test_connector_catalog_default_selection_matches_production_compositio
 
 
 @pytest.mark.asyncio
-async def test_invalid_initial_connector_bootstrap_keeps_session_usable(
+async def test_faulty_connector_is_dropped_without_hiding_healthy_siblings(
     backend_contract_connection: BackendContractConnection,
     backend_contract_mistral_api,
     respx_mock: respx.MockRouter,
 ) -> None:
-    """An invalid initial catalog is unavailable instead of aborting session startup."""
-    duplicate_tools = _connector("github/raw", "github", tools=("search", " search "))
+    """One invalid connector is dropped so the rest of the catalog still loads."""
+    faulty = _connector("github/raw", "github", tools=("search", " search "))
+    healthy = _connector("wiki/raw", "wiki")
     session, _ = await _open_connector_session(
-        backend_contract_connection, respx_mock, _payload(duplicate_tools)
+        backend_contract_connection, respx_mock, _payload(faulty, healthy)
     )
     try:
         response = ConnectorCatalogReadResponse.model_validate(
@@ -225,11 +231,11 @@ async def test_invalid_initial_connector_bootstrap_keeps_session_usable(
             )
         )
 
-        assert response.catalog.disposition == "not_loaded"
-        assert response.catalog.catalog_revision is None
+        assert response.catalog.disposition == "memory"
+        assert response.catalog.catalog_revision is not None
+        assert [entry.alias for entry in response.catalog.connectors] == ["wiki"]
         assert response.session is not None
-        assert response.session.sources == []
-        assert session.resources.runtime.connectors.total == 0
+        assert [source.alias for source in response.session.sources] == ["wiki"]
     finally:
         await session.close()
 
@@ -1000,6 +1006,9 @@ async def test_connector_authorization_acknowledges_before_notifications_and_com
             )
         )
         session_id = started.state.session.id
+        await backend_contract_connection.client.request(
+            "session/ready/wait", SessionReadyWaitParams(session_id=session_id)
+        )
         await backend_contract_connection.client.request(
             "connector_catalog/toggle",
             ConnectorCatalogToggleParams(

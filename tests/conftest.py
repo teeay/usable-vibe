@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
+from types import SimpleNamespace
 from typing import Any
 
 import keyring
@@ -50,14 +52,46 @@ from vibe.core.utils.concurrency import run_sync
 from vibe.utils import keyring as keyring_utils
 from vibe.utils.platform import resolve_windows_shell
 
+_TESTS_ROOT = Path(__file__).parent
+_HOST_PLATFORM = sys.platform
+_LOCAL_XDIST_GROUPS = {
+    Path("core/test_history_properties.py"): "history_properties",
+    Path("core/test_system_prompt.py"): "git_processes",
+    Path("core/test_trusted_folders.py"): "git_processes",
+    Path("core/test_worktree.py"): "git_processes",
+}
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--experimental-harness",
         action="store_true",
         default=False,
-        help="Run backend contract tests with the experimental Unified Harness backend.",
+        help="Run backend contract tests with the Unified Harness backend.",
     )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    local_run = not os.environ.get("BUILDKITE") and not os.environ.get("GITHUB_ACTIONS")
+    for item in items:
+        try:
+            relative_path = Path(item.path).relative_to(_TESTS_ROOT)
+        except ValueError:
+            continue
+        if local_run and (group := _LOCAL_XDIST_GROUPS.get(relative_path)):
+            item.add_marker(pytest.mark.xdist_group(name=group))
+            continue
+        if relative_path.parts[0] != "e2e":
+            continue
+        if relative_path.name == "test_mock_server.py":
+            continue
+        group = (
+            "subprocess_characterization"
+            if relative_path.parts[1] == "agent_loop_characterization"
+            else "subprocess_cli"
+        )
+        item.add_marker(pytest.mark.xdist_group(name=group))
 
 
 @pytest.fixture
@@ -102,6 +136,7 @@ def _isolate_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.setenv("GCM_INTERACTIVE", "never")
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "commit.gpgsign")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "false")
@@ -126,6 +161,22 @@ def _disable_os_keyring(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None
     finally:
         keyring_utils.clear_api_key_keyring_cache()
         keyring.set_keyring(original)
+
+
+@pytest.fixture(autouse=True)
+def _stub_clipboard_sinks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite off the host clipboard.
+
+    ``pyperclip`` writes through the OS clipboard tool, ``_copy_osc52`` writes
+    to ``/dev/tty``, and Textual's ``App.copy_to_clipboard`` emits OSC 52 via
+    the driver; each is a real clipboard write outside the headless test
+    driver. Stub all three so no test can clobber the developer's clipboard;
+    tests that exercise them patch on top of these stubs.
+    """
+    monkeypatch.setattr("pyperclip.copy", lambda text: None)
+    monkeypatch.setattr("pyperclip.paste", lambda: "")
+    monkeypatch.setattr("vibe.cli.clipboard._copy_osc52", lambda text: None)
+    monkeypatch.setattr("textual.app.App.copy_to_clipboard", lambda self, text: None)
 
 
 def get_base_config() -> dict[str, Any]:
@@ -171,8 +222,8 @@ def config_dir(
     config_file = config_dir / "config.toml"
     config_file.write_text(tomli_w.dumps(get_base_config()), encoding="utf-8")
 
+    monkeypatch.setattr("vibe.utils.vibe_home._DEFAULT_VIBE_HOME", config_dir)
     monkeypatch.setattr("vibe.core.paths._vibe_home._DEFAULT_VIBE_HOME", config_dir)
-    monkeypatch.setattr("vibe.utils.paths._DEFAULT_VIBE_HOME", config_dir)
     fork_state_dir = tmp_path / ".uvibe"
     fork_state_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
@@ -201,6 +252,8 @@ def _reset_trusted_folders_manager(config_dir: Path) -> None:
     """
     from vibe.core.trusted_folders import trusted_folders_manager
 
+    # Instance monkeypatches can leave restored methods bound to the singleton.
+    vars(trusted_folders_manager).clear()
     trusted_folders_manager._file_path = config_dir / "trusted_folders.toml"
     trusted_folders_manager._trusted = []
     trusted_folders_manager._untrusted = []
@@ -229,7 +282,11 @@ def _scratchpad_dir(
         d.mkdir(parents=True, exist_ok=True)
         return str(d)
 
-    monkeypatch.setattr("vibe.core.scratchpad.tempfile.mkdtemp", _fake_mkdtemp)
+    # Replace Scratchpad's module reference instead of mutating the process-wide
+    # tempfile module, which would also affect build-backend tests.
+    monkeypatch.setattr(
+        "vibe.core.scratchpad.tempfile", SimpleNamespace(mkdtemp=_fake_mkdtemp)
+    )
 
     yield scratchpad_root
 
@@ -252,11 +309,19 @@ def _mock_platform(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("SHELL", "/bin/sh")
+    if not hasattr(os, "getuid"):
+        monkeypatch.setattr(os, "getuid", lambda: 0, raising=False)
     resolve_auto_theme.cache_clear()
     monkeypatch.setattr("vibe.cli._theme_detection.detect_terminal_dark", lambda: None)
     monkeypatch.setattr(
         "vibe.cli._theme_detection.detect_system_preferred_dark", lambda: None
     )
+
+
+@pytest.fixture
+def host_platform(_mock_platform: None, monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setattr(sys, "platform", _HOST_PLATFORM)
+    return _HOST_PLATFORM
 
 
 @pytest.fixture(autouse=True)
@@ -277,6 +342,26 @@ def _disable_auto_title_generation(monkeypatch: pytest.MonkeyPatch) -> None:
         return None
 
     monkeypatch.setattr("vibe.core.session.title_model.generate_session_title", _noop)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_model_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep availability checks off the network; reset their state per test.
+
+    A test that needs a verdict records one with ``MODEL_AVAILABILITY.remember``.
+    """
+    from vibe.core.llm import model_probe
+
+    class _NoVerdictSource:
+        async def check(self, **_: Any) -> dict[str, bool]:
+            return {}
+
+    async def _no_verdict(**_: Any) -> None:
+        return None
+
+    monkeypatch.setattr(model_probe, "_probe", _no_verdict)
+    monkeypatch.setattr(model_probe.MODEL_AVAILABILITY, "_source", _NoVerdictSource())
+    model_probe.MODEL_AVAILABILITY.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -443,6 +528,32 @@ def _prepare_test_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+async def wait_until(
+    pilot: Any, predicate: Callable[[], bool], timeout: float = 2.0
+) -> bool:
+    """Poll the Textual app until ``predicate`` holds, returning whether it did.
+
+    Returns ``True`` as soon as ``predicate()`` is truthy, or ``False`` if the
+    timeout elapses first. It deliberately does not raise: callers assert the
+    result (``assert await wait_until(...)`` to require the state, or
+    ``assert not await wait_until(...)`` to require a state stays absent for the
+    window).
+
+    The short ``pilot.pause`` delay both yields to the message pump and advances
+    wall-clock time so timer/debounce-driven UI state settles. This is *not* a
+    substitute for synchronising on real state: wait on *authoritative* signals
+    (e.g. server-confirmed queue length via ``app.app_server``) rather than the
+    client's optimistic projections (``len(app._queue)`` is set before the enqueue
+    RPC lands), which is a common source of ordering flakes.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await pilot.pause(0.05)
+    return predicate()
+
+
 def build_test_vibe_config(
     config_cls: VibeConfigSchemaType = VibeConfigSchema, **kwargs
 ) -> VibeConfigSchema:
@@ -503,7 +614,6 @@ def build_test_agent_loop(
     enable_streaming: bool = False,
     **kwargs,
 ) -> AgentLoop:
-
     resolved_config = config or build_test_vibe_config()
     orchestrator = run_sync(_load_orchestrator(resolved_config))
     return AgentLoop(

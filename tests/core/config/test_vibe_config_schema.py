@@ -1,15 +1,35 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+from types import UnionType
+from typing import Union, get_args, get_origin
+from unittest.mock import patch
 
 import keyring
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
+from pydantic.fields import FieldInfo
 import pytest
+import tomli_w
 
-from vibe.core.config import MissingAPIKeyError, ModelConfig, ProviderConfig
+from vibe.core.config import (
+    MissingAPIKeyError,
+    ModelConfig,
+    ProviderConfig,
+    UtilityFeature,
+)
+from vibe.core.config._defaults import DEFAULT_AUTO_COMPACT_THRESHOLD
+from vibe.core.config.layers.environment import EnvironmentLayer
+from vibe.core.config.layers.user import UserConfigLayer
+from vibe.core.config.orchestrator import ConfigOrchestrator
+from vibe.core.config.schema import MergeFieldMetadata
 from vibe.core.config.vibe_schema import VibeConfigSchema
+from vibe.core.utils.merge import MergeStrategy
 
 _ROUTED_TEST_ALIAS = "target-testing-model-alias"
+# The schema resolves unset thresholds to the floor, so the expected model
+# carries it explicitly.
 _ROUTED_TEST_MODEL = ModelConfig(
     name="target-testing-model-name",
     provider="mistral",
@@ -17,6 +37,7 @@ _ROUTED_TEST_MODEL = ModelConfig(
     input_price=0.0,
     output_price=0.0,
     supports_images=False,
+    auto_compact_threshold=DEFAULT_AUTO_COMPACT_THRESHOLD,
 )
 _ROUTED_TEST_MODEL_JSON = _ROUTED_TEST_MODEL.model_dump_json()
 
@@ -29,6 +50,7 @@ async def test_full_toml_to_vibe_config_schema(tmp_path: Path) -> None:
 disable_welcome_banner_animation = true
 api_timeout = 300.0
 api_retry_max_elapsed_time = 120.0
+api_stream_idle_timeout = 600.0
 active_model = "codestral"
 disabled_tools = ["bash"]
 default_agent = "plan"
@@ -58,6 +80,7 @@ provider = "mistral"
     assert config.disable_welcome_banner_animation is True
     assert config.api_timeout == 300.0
     assert config.api_retry_max_elapsed_time == 120.0
+    assert config.api_stream_idle_timeout == 600.0
     assert config.active_model == "codestral"
     assert config.models["codestral"].alias == "codestral"
     assert "bash" in config.disabled_tools
@@ -68,6 +91,12 @@ provider = "mistral"
     assert config.native_scroll_tool_output_head_lines == 4
     assert config.native_scroll_tool_output_tail_lines == 2
     assert config.native_scroll_cursor_shape == "underscore"
+
+
+def test_stream_idle_timeout_is_off_by_default_and_never_negative() -> None:
+    assert VibeConfigSchema().api_stream_idle_timeout == 0.0
+    with pytest.raises(ValidationError):
+        VibeConfigSchema(api_stream_idle_timeout=-1.0)
 
 
 def test_duplicate_model_alias_last_wins() -> None:
@@ -82,18 +111,28 @@ def test_duplicate_model_alias_last_wins() -> None:
     assert config.models["same"].name == "model-b"
 
 
-def test_unknown_active_model_falls_back_to_first(
+def test_unknown_active_model_falls_back_to_default(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level("WARNING"):
         config = VibeConfigSchema(active_model="does-not-exist")
 
-    fallback = next(iter(config.models))
-    assert config.active_model == fallback
-    assert config.get_active_model().alias == fallback
+    assert config.active_model == ""
+    assert config.get_active_model().alias == config.resolve_default_model_alias()
     assert (
         "Active model 'does-not-exist' is not in your configured models" in caplog.text
     )
+
+
+def test_unknown_active_model_uses_routed_default() -> None:
+    config = VibeConfigSchema.model_validate({
+        "active_model": "does-not-exist",
+        "routed_default_model": _ROUTED_TEST_ALIAS,
+        "routed_model_config": _ROUTED_TEST_MODEL_JSON,
+    })
+
+    assert config.active_model == ""
+    assert config.get_active_model().alias == _ROUTED_TEST_ALIAS
 
 
 def test_active_model_defaults_to_unpinned_sentinel() -> None:
@@ -106,6 +145,58 @@ def test_active_model_defaults_to_unpinned_sentinel() -> None:
 
 def test_default_agent_is_accept_edits() -> None:
     assert VibeConfigSchema().default_agent == "accept-edits"
+
+
+def test_file_watcher_for_autocomplete_is_enabled_by_default() -> None:
+    assert VibeConfigSchema().file_watcher_for_autocomplete is True
+
+
+def test_subagent_status_list_is_enabled_by_default() -> None:
+    assert VibeConfigSchema().show_subagent_status_list is True
+
+
+def test_smart_approve_is_not_offered_by_default() -> None:
+    config = VibeConfigSchema()
+    assert config.smart_approve_offered() is False
+    assert config.resolve_default_agent() == "accept-edits"
+
+
+def test_smart_approve_available_flag_offers_without_defaulting() -> None:
+    config = VibeConfigSchema(smart_approve_available=True, default_agent="ask")
+    assert config.smart_approve_offered() is True
+    assert config.resolve_default_agent() == "ask"
+
+
+def test_smart_approve_default_flag_offers_and_defaults() -> None:
+    config = VibeConfigSchema(smart_approve_default=True)
+    assert config.smart_approve_offered() is True
+    assert config.resolve_default_agent() == "smart-approve"
+
+
+def test_default_model_carries_the_sourced_values() -> None:
+    # The default model is what a fresh install runs; a typo in a price,
+    # level set, or window would otherwise ship silently. Sources: Mistral's
+    # model card (prices, 256k window) and the API docs (reasoning_effort:
+    # none and high).
+    from vibe.core.config.vibe_schema import DEFAULT_ACTIVE_MODEL_CONFIG, DEFAULT_MODELS
+
+    assert DEFAULT_MODELS == [DEFAULT_ACTIVE_MODEL_CONFIG]
+    default = DEFAULT_ACTIVE_MODEL_CONFIG
+    assert (default.name, default.alias) == (
+        "mistral-vibe-cli-latest",
+        "mistral-medium-3.5",
+    )
+    assert default.display_name == "Mistral Medium 3.5"
+    assert default.temperature == 1.0
+    assert (default.input_price, default.output_price, default.cached_input_price) == (
+        1.5,
+        7.5,
+        0.15,
+    )
+    assert default.thinking == "high"
+    assert list(default.thinking_levels) == ["off", "high"]
+    assert default.max_context_length == 262144
+    assert default.supports_images is True
 
 
 def test_unpinned_active_model_resolves_to_default_model() -> None:
@@ -254,13 +345,13 @@ def test_gated_model_not_injected_without_routing() -> None:
 
 def test_routed_model_available_but_not_active_when_pinned_to_other() -> None:
     config = VibeConfigSchema.model_validate({
-        "active_model": "devstral-small",
+        "active_model": "mistral-medium-3.5",
         "routed_default_model": _ROUTED_TEST_ALIAS,
         "routed_model_config": _ROUTED_TEST_MODEL_JSON,
     })
 
-    assert config.active_model == "devstral-small"
-    assert config.get_active_model().alias == "devstral-small"
+    assert config.active_model == "mistral-medium-3.5"
+    assert config.get_active_model().alias == "mistral-medium-3.5"
     assert _ROUTED_TEST_ALIAS in config.models
     assert config.resolve_default_model_alias() == _ROUTED_TEST_ALIAS
 
@@ -313,6 +404,122 @@ def test_sparse_user_entry_merges_routed_model_fields() -> None:
     assert merged.supports_images == _ROUTED_TEST_MODEL.supports_images
 
 
+_EXTRA_MODEL_ALIAS = "extra-dropdown-model"
+_EXTRA_MODEL = ModelConfig(
+    name="extra-dropdown-model-name",
+    provider="mistral",
+    alias=_EXTRA_MODEL_ALIAS,
+    input_price=0.0,
+    output_price=0.0,
+    supports_images=False,
+)
+_EXTRA_MODELS_JSON = f"[{_EXTRA_MODEL.model_dump_json()}]"
+
+
+def test_routed_extra_model_added_to_dropdown_without_becoming_default() -> None:
+    from vibe.core.config.vibe_schema import DEFAULT_ACTIVE_MODEL_CONFIG
+
+    config = VibeConfigSchema.model_validate({
+        "active_model": "",
+        "routed_extra_models": _EXTRA_MODELS_JSON,
+    })
+
+    # Present in the dropdown ...
+    assert _EXTRA_MODEL_ALIAS in config.models
+    assert _EXTRA_MODEL_ALIAS in config.available_models()
+    # ... but never the default: it does not touch routed_default_model.
+    assert config.resolve_default_model_alias() == DEFAULT_ACTIVE_MODEL_CONFIG.alias
+    assert config.get_active_model().alias == DEFAULT_ACTIVE_MODEL_CONFIG.alias
+
+
+def test_routed_extra_models_accepts_multiple_definitions() -> None:
+    second = ModelConfig(name="second-name", provider="mistral", alias="second-extra")
+    payload = f"[{_EXTRA_MODEL.model_dump_json()},{second.model_dump_json()}]"
+
+    config = VibeConfigSchema.model_validate({"routed_extra_models": payload})
+
+    assert _EXTRA_MODEL_ALIAS in config.models
+    assert "second-extra" in config.models
+
+
+def test_routed_extra_model_becomes_default_when_named_by_routed_default() -> None:
+    # New flag adds the model; old flag names it as default. The two compose:
+    # the model is both in the dropdown and promoted to default.
+    config = VibeConfigSchema.model_validate({
+        "active_model": "",
+        "routed_extra_models": _EXTRA_MODELS_JSON,
+        "routed_default_model": _EXTRA_MODEL_ALIAS,
+    })
+
+    assert _EXTRA_MODEL_ALIAS in config.models
+    assert config.resolve_default_model_alias() == _EXTRA_MODEL_ALIAS
+    assert config.get_active_model().alias == _EXTRA_MODEL_ALIAS
+
+
+def test_routed_extra_models_compose_with_routed_model_config() -> None:
+    # Old add-and-default flag and the new add-only flag stay independent: the
+    # routed default model is the default, the extra model is only in the dropdown.
+    config = VibeConfigSchema.model_validate({
+        "active_model": "",
+        "routed_default_model": _ROUTED_TEST_ALIAS,
+        "routed_model_config": _ROUTED_TEST_MODEL_JSON,
+        "routed_extra_models": _EXTRA_MODELS_JSON,
+    })
+
+    assert config.models.get(_ROUTED_TEST_ALIAS) == _ROUTED_TEST_MODEL
+    assert _EXTRA_MODEL_ALIAS in config.models
+    assert config.resolve_default_model_alias() == _ROUTED_TEST_ALIAS
+    assert config.get_active_model().alias == _ROUTED_TEST_ALIAS
+
+
+def test_malformed_routed_extra_models_fails_open() -> None:
+    config = VibeConfigSchema.model_validate({"routed_extra_models": "not-json"})
+
+    assert config.routed_extra_models == []
+    assert _EXTRA_MODEL_ALIAS not in config.models
+
+
+def test_invalid_routed_extra_model_entries_are_dropped() -> None:
+    payload = json.dumps([
+        {"not": "a model"},
+        json.loads(_EXTRA_MODEL.model_dump_json()),
+    ])
+
+    config = VibeConfigSchema.model_validate({"routed_extra_models": payload})
+
+    aliases = {model.alias for model in config.routed_extra_models}
+    assert aliases == {_EXTRA_MODEL_ALIAS}
+    assert _EXTRA_MODEL_ALIAS in config.models
+
+
+def test_empty_alias_extra_model_is_not_injected_and_keeps_default() -> None:
+    from vibe.core.config.vibe_schema import DEFAULT_ACTIVE_MODEL_CONFIG
+
+    # An empty alias would collide with the unpinned active_model sentinel ("")
+    # and hijack the default. It must be dropped, not injected.
+    empty_alias = ModelConfig(name="", provider="mistral", alias="")
+    config = VibeConfigSchema.model_validate({
+        "active_model": "",
+        "routed_extra_models": f"[{empty_alias.model_dump_json()}]",
+    })
+
+    assert "" not in config.models
+    assert config.resolve_default_model_alias() == DEFAULT_ACTIVE_MODEL_CONFIG.alias
+    assert config.get_active_model().alias == DEFAULT_ACTIVE_MODEL_CONFIG.alias
+
+
+def test_user_model_entry_wins_over_routed_extra_injection() -> None:
+    user_model = ModelConfig(
+        name="my-own-model", provider="mistral", alias=_EXTRA_MODEL_ALIAS
+    )
+    config = VibeConfigSchema.model_validate({
+        "routed_extra_models": _EXTRA_MODELS_JSON,
+        "models": [user_model],
+    })
+
+    assert config.models[_EXTRA_MODEL_ALIAS].name == "my-own-model"
+
+
 def test_native_scroll_tool_output_config_defaults() -> None:
     config = VibeConfigSchema()
 
@@ -360,7 +567,7 @@ def test_known_active_model_is_not_overridden(caplog: pytest.LogCaptureFixture) 
     assert "is not in your configured models" not in caplog.text
 
 
-def test_allowed_models_filters_available_models() -> None:
+def test_allowed_model_names_filter_available_models() -> None:
     models = [
         ModelConfig(name="model-a", provider="mistral", alias="a"),
         ModelConfig(name="model-b", provider="mistral", alias="b"),
@@ -368,25 +575,122 @@ def test_allowed_models_filters_available_models() -> None:
     ]
     config = VibeConfigSchema.model_validate({
         "models": models,
-        "allowed_models": ["a", "c"],
+        "allowed_models": ["model-a", "model-c"],
     })
 
     assert set(config.available_models()) == {"a", "c"}
     assert set(config.models) == {"a", "b", "c"}
 
 
-def test_unmatched_allowed_model_emits_validation_warning() -> None:
+def test_unmatched_allowed_model_name_emits_validation_warning() -> None:
     models = [
         ModelConfig(name="model-a", provider="mistral", alias="a"),
         ModelConfig(name="model-b", provider="mistral", alias="b"),
     ]
     config = VibeConfigSchema.model_validate({
         "models": models,
-        "allowed_models": ["a", "does-not-exist"],
+        "allowed_models": ["model-a", "does-not-exist"],
     })
 
     assert len(config.validation_warnings) == 1
     assert "does-not-exist" in config.validation_warnings[0]
+
+
+def test_unknown_utility_model_emits_validation_warning() -> None:
+    models = [ModelConfig(name="model-a", provider="mistral", alias="a")]
+    config = VibeConfigSchema.model_validate({
+        "models": models,
+        "utility_models": {"title": "a", "smart_approve": "does-not-exist"},
+    })
+
+    assert len(config.validation_warnings) == 1
+    assert "does-not-exist" in config.validation_warnings[0]
+    assert "smart_approve" in config.validation_warnings[0]
+
+
+def test_get_utility_model_resolves_aliases_and_the_active_sentinel() -> None:
+    models = [
+        ModelConfig(name="model-a", provider="mistral", alias="a"),
+        ModelConfig(name="model-b", provider="mistral", alias="b"),
+    ]
+    config = VibeConfigSchema.model_validate({
+        "models": models,
+        "active_model": "b",
+        "utility_models": {"title": "a", "smart_approve": "active"},
+    })
+
+    title = config.get_utility_model(UtilityFeature.TITLE)
+    smart_approve = config.get_utility_model(UtilityFeature.SMART_APPROVE)
+
+    assert title is not None
+    assert title.name == "model-a"
+    assert smart_approve is not None
+    assert smart_approve.name == "model-b"
+
+
+def test_get_utility_model_is_none_for_unset_and_unknown_aliases() -> None:
+    models = [ModelConfig(name="model-a", provider="mistral", alias="a")]
+    config = VibeConfigSchema.model_validate({
+        "models": models,
+        "utility_models": {"smart_approve": "typo"},
+    })
+
+    assert config.get_utility_model(UtilityFeature.TITLE) is None
+    assert config.get_utility_model(UtilityFeature.SMART_APPROVE) is None
+
+
+def test_a_utility_model_cannot_bypass_allowed_models_by_alias() -> None:
+    models = [
+        ModelConfig(name="model-a", provider="mistral", alias="a"),
+        ModelConfig(name="model-b", provider="mistral", alias="model-a"),
+    ]
+    config = VibeConfigSchema.model_validate({
+        "models": models,
+        "allowed_models": ["model-a"],
+        "utility_models": {"title": "a", "smart_approve": "model-a"},
+    })
+
+    title = config.get_utility_model(UtilityFeature.TITLE)
+
+    assert title is not None
+    assert title.name == "model-a"
+    assert config.get_utility_model(UtilityFeature.SMART_APPROVE) is None
+
+
+def test_a_model_aliased_active_wins_over_the_selector() -> None:
+    models = [
+        ModelConfig(name="model-a", provider="mistral", alias="a"),
+        ModelConfig(name="model-b", provider="mistral", alias="active"),
+    ]
+    config = VibeConfigSchema.model_validate({
+        "models": models,
+        "active_model": "a",
+        "utility_models": {"title": "active"},
+    })
+
+    title = config.get_utility_model(UtilityFeature.TITLE)
+
+    assert title is not None
+    assert title.name == "model-b"
+
+
+def test_an_allowlist_block_is_not_reported_as_a_typo() -> None:
+    models = [
+        ModelConfig(name="model-a", provider="mistral", alias="a"),
+        ModelConfig(name="model-b", provider="mistral", alias="b"),
+    ]
+    config = VibeConfigSchema.model_validate({
+        "models": models,
+        "allowed_models": ["model-a"],
+        "utility_models": {"title": "b", "smart_approve": "typo"},
+    })
+
+    warnings = config.validation_warnings
+    title_warning = next(w for w in warnings if "'b'" in w)
+    typo_warning = next(w for w in warnings if "'typo'" in w)
+
+    assert "excluded by allowed_models" in title_warning
+    assert "not one of your configured models" in typo_warning
 
 
 def test_matched_allowed_models_emit_no_warning() -> None:
@@ -396,28 +700,33 @@ def test_matched_allowed_models_emit_no_warning() -> None:
     ]
     config = VibeConfigSchema.model_validate({
         "models": models,
-        "allowed_models": ["a", "b*"],
+        "allowed_models": ["model-a", "model-b*"],
     })
 
     assert config.validation_warnings == ()
 
 
-def test_disallowed_active_model_pin_falls_back_to_allowed_model() -> None:
+def test_disallowed_active_model_pin_falls_back_to_allowed_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     models = [
         ModelConfig(name="model-a", provider="mistral", alias="a"),
         ModelConfig(name="model-b", provider="mistral", alias="b"),
     ]
     # "b" is configured but excluded by the allowlist, so it must never resolve
     # as the active model even though it is pinned.
-    config = VibeConfigSchema.model_validate({
-        "active_model": "b",
-        "models": models,
-        "allowed_models": ["a"],
-    })
+    with caplog.at_level("WARNING"):
+        config = VibeConfigSchema.model_validate({
+            "active_model": "b",
+            "models": models,
+            "allowed_models": ["model-a"],
+        })
 
     active = config.get_active_model()
     assert active.alias == "a"
     assert active.alias in config.available_models()
+    assert len(config.validation_warnings) == 1
+    assert "Active model 'b' is excluded by allowed_models" in caplog.text
 
 
 def test_allowed_active_model_pin_is_respected() -> None:
@@ -428,7 +737,7 @@ def test_allowed_active_model_pin_is_respected() -> None:
     config = VibeConfigSchema.model_validate({
         "active_model": "b",
         "models": models,
-        "allowed_models": ["a", "b"],
+        "allowed_models": ["model-a", "model-b"],
     })
 
     assert config.get_active_model().alias == "b"
@@ -442,11 +751,25 @@ def test_default_alias_resolves_within_allowed_models() -> None:
     config = VibeConfigSchema.model_validate({
         "active_model": "",
         "models": models,
-        "allowed_models": ["b"],
+        "allowed_models": ["model-b"],
     })
 
     assert config.resolve_default_model_alias() == "b"
     assert config.get_active_model().alias == "b"
+
+
+def test_allowed_model_names_cannot_be_matched_by_an_alias() -> None:
+    config = VibeConfigSchema.model_validate({
+        "models": [
+            ModelConfig(name="approved-model", provider="mistral", alias="approved"),
+            ModelConfig(
+                name="blocked-model", provider="mistral", alias="approved-model"
+            ),
+        ],
+        "allowed_models": ["approved-model"],
+    })
+
+    assert set(config.available_models()) == {"approved"}
 
 
 def test_allowed_models_matching_nothing_falls_back_to_all() -> None:
@@ -466,12 +789,27 @@ def test_allowed_models_matching_nothing_falls_back_to_all() -> None:
     assert "does-not-exist" in config.validation_warnings[0]
 
 
+def test_admin_allowed_models_matching_nothing_are_rejected() -> None:
+    models = [
+        ModelConfig(name="model-a", provider="mistral", alias="a"),
+        ModelConfig(name="model-b", provider="mistral", alias="b"),
+    ]
+
+    with pytest.raises(
+        ValueError, match="Admin allowed_models matches none of the configured models"
+    ):
+        VibeConfigSchema.validate_merged(
+            {"models": models, "allowed_models": ["does-not-exist"]},
+            origins={"allowed_models": "admin"},
+        )
+
+
 def test_no_models_raises() -> None:
     with pytest.raises(ValueError, match="No models are configured"):
         VibeConfigSchema.model_validate({"models": []})
 
 
-def test_compaction_model_provider_must_match_active() -> None:
+def test_compaction_model_on_another_provider_yields_to_the_active_model() -> None:
     providers = [
         ProviderConfig(
             name="mistral",
@@ -485,15 +823,165 @@ def test_compaction_model_provider_must_match_active() -> None:
         ),
     ]
     compaction = ModelConfig(name="compact-model", provider="other", alias="compact")
-    with pytest.raises(ValueError, match="must share the same provider"):
-        VibeConfigSchema(compaction_model=compaction, providers=providers)
+
+    config = VibeConfigSchema(compaction_model=compaction, providers=providers)
+
+    assert config.get_compaction_model() == config.get_active_model()
+    assert any(
+        "Compaction model 'compact'" in warning
+        for warning in config.validation_warnings
+    )
 
 
-def test_check_api_key_raises_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_vision_model_must_support_images() -> None:
+    vision = ModelConfig(name="blind-model", provider="mistral", alias="vision")
+    with pytest.raises(ValueError, match="must set supports_images"):
+        VibeConfigSchema(vision_model=vision)
+
+
+def test_vision_model_may_use_another_provider() -> None:
+    providers = [
+        ProviderConfig(
+            name="mistral",
+            api_base="https://api.mistral.ai/v1",
+            api_key_env_var="MISTRAL_API_KEY",
+        ),
+        ProviderConfig(
+            name="other",
+            api_base="https://other.ai/v1",
+            api_key_env_var="OTHER_API_KEY",
+        ),
+    ]
+    vision = ModelConfig(
+        name="sees-model", provider="other", alias="vision", supports_images=True
+    )
+    models = [ModelConfig(name="blind-model", provider="mistral", alias="blind")]
+
+    config = VibeConfigSchema.model_validate({
+        "active_model": "blind",
+        "models": models,
+        "providers": providers,
+        "vision_model": vision,
+    })
+
+    assert config.get_vision_fallback_model() == vision
+
+
+def test_vision_falls_back_to_a_model_on_the_active_provider() -> None:
+    models = [
+        ModelConfig(name="blind-model", provider="mistral", alias="blind"),
+        ModelConfig(
+            name="sees-model", provider="mistral", alias="sees", supports_images=True
+        ),
+    ]
+
+    config = VibeConfigSchema.model_validate({
+        "active_model": "blind",
+        "models": models,
+    })
+
+    fallback = config.get_vision_fallback_model()
+    assert fallback is not None
+    assert fallback.alias == "sees"
+
+
+def test_vision_never_falls_back_across_providers() -> None:
+    providers = [
+        ProviderConfig(
+            name="mistral",
+            api_base="https://api.mistral.ai/v1",
+            api_key_env_var="MISTRAL_API_KEY",
+        ),
+        ProviderConfig(
+            name="local", api_base="http://127.0.0.1:8080/v1", api_key_env_var=""
+        ),
+    ]
+    models = [
+        ModelConfig(name="blind-model", provider="local", alias="blind"),
+        ModelConfig(
+            name="sees-model", provider="mistral", alias="sees", supports_images=True
+        ),
+    ]
+
+    config = VibeConfigSchema.model_validate({
+        "active_model": "blind",
+        "models": models,
+        "providers": providers,
+    })
+
+    # Reaching another provider would ship the image somewhere the session was
+    # not already talking; only an explicit vision_model may do that.
+    assert config.get_vision_fallback_model() is None
+
+
+def test_vision_fallback_skips_models_the_allowlist_excludes() -> None:
+    models = [
+        ModelConfig(name="blind-model", provider="mistral", alias="blind"),
+        ModelConfig(
+            name="sees-model", provider="mistral", alias="sees", supports_images=True
+        ),
+    ]
+
+    config = VibeConfigSchema.model_validate({
+        "active_model": "blind",
+        "models": models,
+        "allowed_models": ["blind-model"],
+    })
+
+    assert config.get_vision_fallback_model() is None
+
+
+def test_explicit_vision_model_wins_over_the_provider_scan() -> None:
+    models = [
+        ModelConfig(name="blind-model", provider="mistral", alias="blind"),
+        ModelConfig(
+            name="sees-model", provider="mistral", alias="sees", supports_images=True
+        ),
+    ]
+    chosen = ModelConfig(
+        name="chosen-model", provider="mistral", alias="chosen", supports_images=True
+    )
+
+    config = VibeConfigSchema.model_validate({
+        "active_model": "blind",
+        "models": models,
+        "vision_model": chosen,
+    })
+
+    fallback = config.get_vision_fallback_model()
+    assert fallback is not None
+    assert fallback.alias == "chosen"
+
+
+def test_no_vision_fallback_when_the_active_model_sees_images() -> None:
+    vision = ModelConfig(
+        name="sees-model", provider="mistral", alias="vision", supports_images=True
+    )
+    models = [
+        ModelConfig(
+            name="also-sees", provider="mistral", alias="active", supports_images=True
+        )
+    ]
+
+    config = VibeConfigSchema.model_validate({
+        "active_model": "active",
+        "models": models,
+        "vision_model": vision,
+    })
+
+    assert config.get_vision_fallback_model() is None
+
+
+def test_api_key_readiness_is_separate_from_schema_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     monkeypatch.setattr(keyring, "get_password", lambda service, username: None)
+
+    config = VibeConfigSchema()
+
     with pytest.raises(MissingAPIKeyError):
-        VibeConfigSchema()
+        config.require_active_provider_api_key()
 
 
 def test_theme_is_preserved_for_the_client_to_interpret() -> None:
@@ -519,3 +1007,255 @@ def test_log_level_rejects_invalid() -> None:
 @pytest.mark.parametrize("level", ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
 def test_log_level_accepts_canonical_levels(level: str) -> None:
     assert VibeConfigSchema(log_level=level).log_level == level
+
+
+@pytest.mark.asyncio
+async def test_a_layer_setting_one_nested_field_keeps_the_others(
+    tmp_path: Path,
+) -> None:
+    """A layer contributes only the keys it names, so the rest must survive it.
+
+    A nested config group is a bag of independent settings. Every layer above
+    the first contributes a partial table -- one `VIBE_SESSION_LOGGING__*`
+    variable, or a project file overriding a single key -- and taking the whole
+    group from the topmost layer silently resets the keys it never mentioned to
+    their class defaults.
+    """
+    toml_path = tmp_path / "config.toml"
+    save_dir = tmp_path / "sessions"
+    # Serialized rather than formatted: a Windows path interpolated into a
+    # double-quoted TOML string turns its separators into escapes, and the
+    # layer would fail to parse instead of exercising the merge.
+    toml_path.write_text(
+        tomli_w.dumps({
+            "session_logging": {
+                "enabled": False,
+                "save_dir": str(save_dir),
+                "session_prefix": "mine",
+            }
+        })
+    )
+
+    with patch.dict(
+        os.environ, {"VIBE_SESSION_LOGGING__GENERATE_TITLES": "true"}, clear=True
+    ):
+        user = UserConfigLayer(path=toml_path)
+        orchestrator = await ConfigOrchestrator.create(
+            schema=VibeConfigSchema,
+            layers=[user, EnvironmentLayer(schema=VibeConfigSchema)],
+            default_layer_resolver=lambda: user,
+        )
+
+    session_logging = orchestrator.config.session_logging
+    assert session_logging.generate_titles is True
+    assert session_logging.enabled is False
+    assert session_logging.session_prefix == "mine"
+    assert session_logging.save_dir == str(save_dir)
+
+
+# Nested models the winning layer is meant to supply whole. GrowthBook hands
+# ``routed_model_config`` over atomically as one experiment-chosen model, so
+# merging it per field would splice leftover user keys into a definition the
+# experiment never described.
+ATOMIC_NESTED_FIELDS = frozenset({"routed_model_config"})
+
+
+def _nested_model_fields() -> dict[str, FieldInfo]:
+    """Schema fields whose value is a nested model, optional ones included.
+
+    ``X | None`` is not a ``type``, so an isinstance check alone silently skips
+    every optional nested field -- which is most of them.
+    """
+    nested: dict[str, FieldInfo] = {}
+    for name, info in VibeConfigSchema.model_fields.items():
+        annotation = info.annotation
+        # Only unions are unwrapped. A container of models -- ``list[ModelConfig]``
+        # -- is not a settings group: it has its own merge semantics (union by
+        # key, replace for a runtime-supplied payload) and per-field merging
+        # would be meaningless for it.
+        candidates = (
+            get_args(annotation)
+            if get_origin(annotation) in {Union, UnionType}
+            else (annotation,)
+        )
+        if any(
+            isinstance(candidate, type) and issubclass(candidate, BaseModel)
+            for candidate in candidates
+        ):
+            nested[name] = info
+    return nested
+
+
+def test_nested_model_fields_merge_per_field_unless_atomic_by_design() -> None:
+    """A nested model is a bag of settings, so one layer must not supply all of it.
+
+    Structural rather than behavioural, so a field added later cannot
+    reintroduce the loss without this failing. Anything genuinely atomic goes
+    in ``ATOMIC_NESTED_FIELDS`` with a reason, rather than being annotated
+    wrongly to keep this assertion green.
+    """
+    replaced = sorted(
+        name
+        for name, info in _nested_model_fields().items()
+        if name not in ATOMIC_NESTED_FIELDS
+        and (metadata := MergeFieldMetadata.from_field(info)) is not None
+        and metadata.merge_strategy is MergeStrategy.REPLACE
+    )
+    assert replaced == []
+
+
+def test_the_guard_inspects_the_optional_nested_fields_too() -> None:
+    """The guard is worthless if its generator cannot see the risky fields.
+
+    ``compaction_model`` is the one that motivated widening it: a user-level
+    full table plus a project-level single key used to replace the whole table
+    with that key, then fail validation on the required fields it dropped.
+    """
+    inspected = _nested_model_fields()
+    assert "compaction_model" in inspected
+    assert "routed_model_config" in inspected
+    assert {"session_logging", "project_context", "experiments"} <= set(inspected)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_key_in_a_lower_layer_does_not_break_config_load(
+    tmp_path: Path,
+) -> None:
+    """Per-field merging puts every layer's keys in front of the validator.
+
+    Under wholesale replacement an unrecognised key was discarded along with
+    the rest of the losing group. Now it survives to validation, so a group
+    that forbids extras would turn a project file naming a setting from a newer
+    Vibe into a startup failure for whoever is running an older one.
+    """
+    toml_path = tmp_path / "config.toml"
+    save_dir = tmp_path / "sessions"
+    toml_path.write_text(
+        tomli_w.dumps({
+            "session_logging": {
+                "save_dir": str(save_dir),
+                "a_setting_from_a_newer_vibe": True,
+            }
+        })
+    )
+
+    with patch.dict(
+        os.environ, {"VIBE_SESSION_LOGGING__GENERATE_TITLES": "true"}, clear=True
+    ):
+        user = UserConfigLayer(path=toml_path)
+        orchestrator = await ConfigOrchestrator.create(
+            schema=VibeConfigSchema,
+            layers=[user, EnvironmentLayer(schema=VibeConfigSchema)],
+            default_layer_resolver=lambda: user,
+        )
+
+    session_logging = orchestrator.config.session_logging
+    assert session_logging.save_dir == str(save_dir)
+    assert session_logging.generate_titles is True
+
+
+@pytest.mark.asyncio
+async def test_a_mistyped_group_is_reported_not_silently_dropped(
+    tmp_path: Path,
+) -> None:
+    """A scalar where a table belongs is user error, reported as such.
+
+    The merge strategies raise ``TypeError`` when layers disagree on shape, and
+    nothing on the CLI startup path catches that -- one mistyped line ended in
+    a traceback. It is re-raised as a ``ValueError`` naming the field and the
+    layer, which that path prints before exiting.
+
+    Keeping one side instead would be worse than the traceback: several fields
+    coerce rather than reject, so the mistyped layer would win silently. See
+    the test below.
+    """
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text('session_logging = "oops"\n')
+
+    with patch.dict(
+        os.environ, {"VIBE_SESSION_LOGGING__GENERATE_TITLES": "true"}, clear=True
+    ):
+        user = UserConfigLayer(path=toml_path)
+        with pytest.raises(ValueError, match="session_logging") as exc_info:
+            _ = await ConfigOrchestrator.create(
+                schema=VibeConfigSchema,
+                layers=[user, EnvironmentLayer(schema=VibeConfigSchema)],
+                default_layer_resolver=lambda: user,
+            )
+
+    assert not isinstance(exc_info.value, ValidationError)
+
+
+@pytest.mark.asyncio
+async def test_a_mistyped_higher_layer_never_silently_discards_a_lower_one(
+    tmp_path: Path,
+) -> None:
+    """The reason a shape clash must raise rather than pick a side.
+
+    ``tools`` coerces a bad value to ``{}`` instead of rejecting it, so letting
+    the mistyped layer win would drop the tool permissions the layer below had
+    set -- no error, no warning, and the permission quietly gone.
+    """
+    user_toml = tmp_path / "user.toml"
+    project_toml = tmp_path / "project.toml"
+    user_toml.write_text('tools = { shell = { permission = "always" } }\n')
+    project_toml.write_text('tools = "oops"\n')
+
+    with patch.dict(os.environ, {}, clear=True):
+        user = UserConfigLayer(path=user_toml)
+        project = UserConfigLayer(path=project_toml, name="project-toml")
+        with pytest.raises(ValueError, match="tools"):
+            _ = await ConfigOrchestrator.create(
+                schema=VibeConfigSchema,
+                layers=[user, project],
+                default_layer_resolver=lambda: user,
+            )
+
+
+@pytest.mark.asyncio
+async def test_a_mistyped_group_alone_is_reported_as_a_validation_error(
+    tmp_path: Path,
+) -> None:
+    """With nothing to merge against, the schema reports it as it always did."""
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text('session_logging = "oops"\n')
+
+    with patch.dict(os.environ, {}, clear=True):
+        user = UserConfigLayer(path=toml_path)
+        with pytest.raises(ValidationError) as exc_info:
+            _ = await ConfigOrchestrator.create(
+                schema=VibeConfigSchema,
+                layers=[user],
+                default_layer_resolver=lambda: user,
+            )
+
+    assert "session_logging" in str(exc_info.value)
+
+
+def test_published_schema_does_not_advertise_the_unset_sentinel() -> None:
+    """The sentinel is a merge-internal blank, not a setting default."""
+    schema = VibeConfigSchema.model_json_schema(mode="serialization", by_alias=True)
+
+    assert "default" not in schema["properties"]["auto_compact_threshold"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_positive_context_window_is_reported_as_a_validation_error(
+    tmp_path: Path,
+) -> None:
+    """0 or a negative window would silently disable compaction."""
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text(
+        '[[models]]\nname = "m"\nprovider = "p"\nalias = "m"\nmax_context_length = 0\n'
+    )
+
+    with patch.dict(os.environ, {}, clear=True):
+        user = UserConfigLayer(path=toml_path)
+        with pytest.raises(ValidationError) as exc_info:
+            _ = await ConfigOrchestrator.create(
+                schema=VibeConfigSchema,
+                layers=[user],
+                default_layer_resolver=lambda: user,
+            )
+
+    assert "max_context_length" in str(exc_info.value)

@@ -110,6 +110,22 @@ TextArea > .text-area--cursor {
     }
 }
 
+/* Pinned todo line. `height: 1` is load-bearing: this sits between the input
+   and the bottom bar, so any growth would shove the input box up mid-keystroke. */
+#todo-status-row {
+    height: 1;
+    width: 100%;
+    background: transparent;
+    color: $text-muted;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+
+    &:hover {
+        color: $foreground;
+        text-style: underline;
+    }
+}
+
 #bottom-bar {
     height: auto;
     width: 100%;
@@ -153,9 +169,67 @@ TextArea > .text-area--cursor {
     margin-bottom: 0;
 }
 
+#subagent-transcripts {
+    display: none;
+    layout: stream;
+    width: 100%;
+    height: auto;
+    text-align: left;
+    margin-top: 1;
+    margin-bottom: 0;
+}
+
+.subagent-transcript {
+    layout: stream;
+    width: 100%;
+    height: auto;
+}
+
 #input-container {
     padding: 0;
     margin: 0;
+}
+
+#subagent-list {
+    display: none;
+    width: 100%;
+    height: auto;
+    max-height: 7;
+    padding: 0 1;
+    color: $foreground;
+    border: none;
+    background: transparent;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    pointer: pointer;
+
+    &.subagent-view {
+        border-top: solid $foreground;
+        border-title-align: right;
+        border-title-color: $foreground;
+    }
+}
+
+#subagent-list > .option-list--option-hover {
+    color: $primary-darken-1;
+}
+
+#subagent-list > .option-list--option-highlighted,
+#subagent-list:focus > .option-list--option-highlighted {
+    color: $primary;
+}
+
+#subagent-list:focus {
+    border: none;
+}
+
+#subagent-list.subagent-view:focus {
+    border-top: solid $foreground;
+}
+
+#subagent-list > .option-list--option-highlighted,
+#subagent-list:focus > .option-list--option-highlighted {
+    background: $surface;
 }
 
 #completion-popup {
@@ -405,6 +479,34 @@ Markdown {
     height: auto;
 }
 
+.user-message-severity .user-message-container {
+    padding: 0 1;
+}
+
+.user-message-info .user-message-container {
+    border-left: heavy $success;
+}
+
+.user-message-info .user-message-content {
+    color: $success;
+}
+
+.user-message-warning .user-message-container {
+    border-left: heavy $warning;
+}
+
+.user-message-warning .user-message-content {
+    color: $warning;
+}
+
+.user-message-error .user-message-container {
+    border-left: heavy $error;
+}
+
+.user-message-error .user-message-content {
+    color: $error;
+}
+
 .user-message-row {
     width: 100%;
     height: auto;
@@ -453,6 +555,15 @@ Markdown {
     .user-message-content {
         color: $mistral_orange;
     }
+}
+
+.user-message-fired-loop .user-message-prompt {
+    color: $primary;
+}
+
+.user-message-fired-loop-line {
+    width: 100%;
+    height: auto;
 }
 
 .user-message-separator {
@@ -651,6 +762,27 @@ Markdown {
         & > MarkdownBlock:last-child {
             margin-bottom: 0;
         }
+
+        /* Headings inside a command message carry no margins: a rule that
+           touches one margin edge replaces the whole margin, so this zeroes
+           top and bottom together. A heading therefore follows its content
+           directly, and the gap before it is only the previous block's
+           bottom margin. */
+        MarkdownHeader {
+            margin: 0;
+        }
+    }
+}
+
+/* /status marks each exact count as emphasis to render it as secondary text. */
+.agent-statistics MarkdownBlock {
+    & > .em {
+        text-style: none;
+        color: $text-muted;
+    }
+
+    &:ansi > .em {
+        text-style: dim;
     }
 }
 
@@ -663,14 +795,6 @@ Markdown {
         margin-top: 0;
     }
 
-    &.queued {
-        margin-top: 0;
-
-        .bash-command,
-        .bash-prompt {
-            text-style: italic;
-        }
-    }
 }
 
 .bash-command-line {
@@ -902,6 +1026,8 @@ StatusMessage {
 }
 
 .compact-message,
+.model-change-message,
+.reload-config-message,
 .tool-call {
     width: 100%;
     height: auto;
@@ -921,10 +1047,52 @@ StatusMessage {
     text-wrap: wrap;
 }
 
+.branch-created-message {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+    margin-bottom: 0;
+}
+
+.branch-created-message .status-indicator-text {
+    width: auto;
+    max-width: 100%;
+    text-wrap: wrap;
+}
+
 .tool-group {
     width: 100%;
     height: auto;
     margin-top: 1;
+}
+
+.tool-group-header {
+    width: 100%;
+    height: auto;
+}
+
+/* Match the dimmed grey of expanded tool-call headers so the folded summary
+   reads as the same muted line. text-opacity for truecolor themes; ANSI themes
+   fall back to dim. */
+.tool-group-header .status-indicator-text {
+    text-opacity: 55%;
+
+    &:ansi {
+        text-style: dim;
+    }
+}
+
+.tool-group-body {
+    width: 100%;
+    height: auto;
+}
+
+.tool-group-content {
+    width: 1fr;
+    height: auto;
+    /* The inner pane also carries .tool-group for packing / parent checks;
+       do not inherit that class's conversation-level top margin. */
+    margin-top: 0;
 }
 
 .tool-call-header .status-indicator-text {
@@ -1081,6 +1249,10 @@ StatusMessage {
     color: $warning;
 }
 
+.tool-result-approval-note {
+    color: $text-muted;
+}
+
 .diff-scroll {
     width: 1fr;
     height: auto;
@@ -1202,7 +1374,7 @@ StatusMessage {
 
 }
 
-#config-app, #voice-app, #mcp-app, #connectorauth-app, #mcpoauth-app {
+#config-app, #voice-app, #mcp-app, #plugins-app, #connectorauth-app, #mcpoauth-app, #skillsbrowser-app {
     width: 100%;
     height: auto;
     background: transparent;
@@ -1211,7 +1383,7 @@ StatusMessage {
     margin: 0;
 }
 
-#config-content, #voice-content, #mcp-content, #connectorauth-content, #mcpoauth-content {
+#config-content, #voice-content, #mcp-content, #plugins-content, #connectorauth-content, #mcpoauth-content, #skillsbrowser-content {
     width: 100%;
     height: auto;
 }
@@ -1222,14 +1394,113 @@ StatusMessage {
     color: $primary;
 }
 
-#config-options, #mcp-options, #connectorauth-options, #mcpoauth-options {
+#config-options, #mcp-options, #plugins-options, #connectorauth-options, #mcpoauth-options {
     width: 100%;
     max-height: 50vh;
     border: none;
 }
 
-#config-options:focus, #mcp-options:focus, #connectorauth-options:focus, #mcpoauth-options:focus {
+#mcp-search-row {
+    width: 100%;
+    background: transparent;
+    padding-left: 1;
+    margin-bottom: 1;
+}
+
+#mcp-search-icon {
+    width: 2;
+    height: 1;
+    color: $text-muted;
+    margin-right: 1;
+
+    &:ansi {
+        text-style: dim;
+    }
+}
+
+#mcp-search {
+    width: 1fr;
+    height: 1;
+    background: transparent;
     border: none;
+    padding: 0;
+}
+
+#config-options:focus, #mcp-options:focus, #plugins-options:focus, #connectorauth-options:focus, #mcpoauth-options:focus {
+    border: none;
+}
+
+#plugins-filter {
+    width: 100%;
+    height: auto;
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+
+/* Skills browser: two panes (option list + live preview), fixed height so the
+   layout does not jump as row/preview content changes. */
+#skillsbrowser-title {
+    margin: 0 0 1 0;
+}
+
+#skillsbrowser-tabs {
+    width: 100%;
+    height: 1;
+    margin: 0 0 1 0;
+}
+
+#skillsbrowser-search {
+    width: 100%;
+    margin: 0 0 1 0;
+    border: none;
+    padding: 0 1;
+    background: $panel;
+    color: $foreground;
+}
+
+#skillsbrowser-search:focus {
+    border: none;
+    background: $surface;
+    color: $text;
+}
+
+#skillsbrowser-search .input--cursor {
+    background: $foreground;
+    color: $background;
+}
+
+#skillsbrowser-search .input--selection {
+    background: $primary;
+    color: $foreground;
+}
+
+#skillsbrowser-body {
+    layout: horizontal;
+    width: 100%;
+    height: 50vh;
+}
+
+#skillsbrowser-options {
+    width: 1fr;
+    height: 100%;
+    border: none;
+}
+
+#skillsbrowser-options:focus {
+    border: none;
+}
+
+#skillsbrowser-preview {
+    width: 1fr;
+    height: 100%;
+    padding: 0 1;
+    border-left: solid $foreground-muted;
+}
+
+#skillsbrowser-preview-body {
+    width: 100%;
+    height: auto;
 }
 
 #connectorauth-detail, #mcpoauth-detail {
@@ -1301,6 +1572,12 @@ StatusMessage {
     height: auto;
     text-style: bold;
     color: $warning;
+}
+
+.approval-reason {
+    height: auto;
+    color: $warning;
+    margin-bottom: 1;
 }
 
 .approval-tool-info-container {
@@ -1535,6 +1812,19 @@ NarratorStatus {
     height: 3;
 }
 
+/* The LeChonk variant (26x15 dots) renders 13 cols by 4 rows; the default
+   12x3 pinning above would clip its bottom row and right column. The class
+   is toggled by PetitChat.set_variant(). */
+.banner-chat.lechonk {
+    width: 14;
+    height: 4;
+}
+
+.banner-chat.lechonk .petit-chat {
+    width: 14;
+    height: 4;
+}
+
 #banner-info {
     width: auto;
     height: auto;
@@ -1693,6 +1983,22 @@ NarratorStatus {
     margin-bottom: 1;
     text-wrap: nowrap;
     text-overflow: ellipsis;
+}
+
+#sessionpicker-loading {
+    width: 100%;
+    height: auto;
+    color: $text-muted;
+}
+
+.sessionpicker-loading-indicator,
+.sessionpicker-loading-status {
+    width: auto;
+    height: auto;
+}
+
+.sessionpicker-loading-indicator {
+    margin-right: 1;
 }
 
 .sessionpicker-help {
@@ -2088,12 +2394,6 @@ FeedbackBar {
 
 .user-message.queue-selected {
     .user-message-content {
-        text-style: bold reverse;
-    }
-}
-
-.bash-output-message.queue-selected {
-    .bash-command {
         text-style: bold reverse;
     }
 }

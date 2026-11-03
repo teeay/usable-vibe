@@ -4,16 +4,31 @@ from unittest.mock import patch
 
 import pytest
 from textual import events
+from textual.app import App, ComposeResult
 
 from tests.stubs.app_config import build_test_app_config
 from vibe.app_server.models import (
     EffectCallDisplay,
+    PathGrantScope,
     ShellEffectDetail,
     ShellEffectInput,
 )
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
+from vibe.permissions import PermissionScope, RequiredPermission
 
 _TEST_GRACE_PERIOD_S = 0.5
+
+
+def _shell_approval(reason: str | None) -> ApprovalApp:
+    return ApprovalApp(
+        effect=ShellEffectDetail(
+            tool_name="bash",
+            input=ShellEffectInput(command="rm -rf build"),
+            display=EffectCallDisplay(summary="bash", status_text="Running"),
+        ),
+        config=build_test_app_config(),
+        reason=reason,
+    )
 
 
 @pytest.fixture
@@ -130,3 +145,130 @@ class TestVimKeybindings:
             assert approval_app.selected_option == 1
             approval_app.on_key(events.Key("k", "k"))
             assert approval_app.selected_option == 0
+
+
+class TestReasonRendering:
+    @pytest.mark.asyncio
+    async def test_reason_is_rendered_as_a_warning_line(self) -> None:
+        approval = _shell_approval("deletes the build directory")
+
+        class _Harness(App[None]):
+            def compose(self) -> ComposeResult:
+                yield approval
+
+        async with _Harness().run_test() as pilot:
+            await pilot.pause()
+
+            reason_widget = approval.query_one(".approval-reason")
+            assert "deletes the build directory" in str(reason_widget.render())
+
+    @pytest.mark.asyncio
+    async def test_no_reason_line_when_reason_is_absent(self) -> None:
+        approval = _shell_approval(None)
+
+        class _Harness(App[None]):
+            def compose(self) -> ComposeResult:
+                yield approval
+
+        async with _Harness().run_test() as pilot:
+            await pilot.pause()
+
+            assert not approval.query(".approval-reason")
+
+
+def _make_scoped_approval() -> ApprovalApp:
+    return ApprovalApp(
+        effect=ShellEffectDetail(
+            tool_name="bash",
+            input=ShellEffectInput(command="cat /outside/config.json"),
+            display=EffectCallDisplay(summary="bash", status_text="Running"),
+        ),
+        config=build_test_app_config(),
+        required_permissions=[
+            RequiredPermission(
+                scope=PermissionScope.OUTSIDE_DIRECTORY,
+                invocation_pattern="/outside/config.json",
+                session_pattern="vibe-path:exact:/outside/config.json",
+                label="outside workdir (/outside/config.json)",
+            )
+        ],
+        path_scope_choices=[PathGrantScope.EXACT],
+    )
+
+
+class TestPathScopeOptions:
+    @pytest.fixture
+    def scoped_approval(self) -> ApprovalApp:
+        return _make_scoped_approval()
+
+    def test_builds_exact_file_session_and_permanent_choices(
+        self, scoped_approval: ApprovalApp
+    ) -> None:
+        assert [option[0] for option in scoped_approval.options] == [
+            "Allow once",
+            "Allow this file only for this session",
+            "Always allow this file",
+            "Deny",
+        ]
+
+    def test_builds_recursive_folder_session_and_permanent_choices(
+        self, scoped_approval: ApprovalApp
+    ) -> None:
+        scoped_approval.path_scope_choices = [PathGrantScope.DIRECTORY_RECURSIVE]
+
+        assert [option[0] for option in scoped_approval._build_options()] == [
+            "Allow once",
+            "Allow this folder for this session",
+            "Always allow this folder",
+            "Deny",
+        ]
+
+    def test_builds_plural_recursive_choices_for_multiple_targets(
+        self, scoped_approval: ApprovalApp
+    ) -> None:
+        scoped_approval.required_permissions.append(
+            RequiredPermission(
+                scope=PermissionScope.OUTSIDE_DIRECTORY,
+                invocation_pattern="/var/log",
+                session_pattern="vibe-path:exact:/var/log",
+                label="outside workdir (/var/log)",
+                path_scope_root="/var/log",
+            )
+        )
+        scoped_approval.path_scope_choices = [PathGrantScope.DIRECTORY_RECURSIVE]
+
+        assert [option[0] for option in scoped_approval._build_options()] == [
+            "Allow once",
+            "Allow these folders for this session",
+            "Always allow these folders",
+            "Deny",
+        ]
+
+    def test_number_four_always_selects_deny(
+        self, scoped_approval: ApprovalApp
+    ) -> None:
+        scoped_approval.path_scope_choices = list(PathGrantScope)
+        scoped_approval.options = scoped_approval._build_options()
+
+        with patch.object(scoped_approval, "post_message") as posted:
+            scoped_approval.action_select_4()
+
+        assert isinstance(posted.call_args.args[0], ApprovalApp.ApprovalRejected)
+
+    def test_scoped_choices_post_the_selected_typed_scope(self) -> None:
+        # Single-shot resolution: each approval app resolves exactly once, so
+        # each choice needs a fresh app.
+        posted_messages = []
+        for action in ("action_select_2", "action_select_3", "action_reject"):
+            scoped_approval = _make_scoped_approval()
+            with patch.object(scoped_approval, "post_message") as posted:
+                getattr(scoped_approval, action)()
+            assert len(posted.call_args_list) == 1
+            posted_messages.append(posted.call_args_list[0].args[0])
+
+        session_message, permanent_message, rejected = posted_messages
+        assert isinstance(session_message, ApprovalApp.ApprovalGrantedAlwaysTool)
+        assert session_message.path_scope is PathGrantScope.EXACT
+        assert isinstance(permanent_message, ApprovalApp.ApprovalGrantedAlwaysPermanent)
+        assert permanent_message.path_scope is PathGrantScope.EXACT
+        assert isinstance(rejected, ApprovalApp.ApprovalRejected)

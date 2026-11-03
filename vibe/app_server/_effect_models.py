@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from enum import StrEnum, auto
-from typing import Annotated, ClassVar, Literal, cast
+from typing import Annotated, ClassVar, Literal, Self, cast
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from vibe.app_server._model import ProtocolModel
 from vibe.questions import UserQuestionRequest
 from vibe.utils.tool_presentation import EffectCallDisplay, ToolEffectKind
+
+# The ``tool_name`` on the effect behind a manual `!<command>`. A model's shell
+# call carries the real tool's name (``bash``, ``git_bash``, ``powershell``), so
+# this is what tells a user's own shell output apart from the agent's -- the
+# ``SHELL`` effect kind alone covers both.
+MANUAL_SHELL_TOOL_NAME = "shell"
 
 
 class ShellEffectInput(ProtocolModel):
@@ -38,6 +44,17 @@ class FileEditEffectInput(ProtocolModel):
     replace_all: bool = False
 
 
+class FileEditEffectChange(ProtocolModel):
+    old_string: str
+    new_string: str
+    replace_all: bool = False
+
+
+class FileEditEffectBatchInput(ProtocolModel):
+    file_path: str
+    changes: list[FileEditEffectChange] = Field(min_length=1)
+
+
 class FileEditEffectOccurrence(ProtocolModel):
     start_line: int | None = None
     old_text: str
@@ -46,9 +63,18 @@ class FileEditEffectOccurrence(ProtocolModel):
 
 class FileEditEffectOutput(ProtocolModel):
     file: str
-    old_string: str
-    new_string: str
+    old_string: str | None = None
+    new_string: str | None = None
     occurrences: list[FileEditEffectOccurrence] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_diff_content(self) -> Self:
+        has_legacy_pair = self.old_string is not None and self.new_string is not None
+        if (self.old_string is None) != (self.new_string is None):
+            raise ValueError("old_string and new_string must be provided together")
+        if not has_legacy_pair and not self.occurrences:
+            raise ValueError("file edit output requires a diff pair or occurrences")
+        return self
 
 
 class FileSearchEffectInput(ProtocolModel):
@@ -74,7 +100,7 @@ class FileReadEffectInput(ProtocolModel):
 
     file_path: str
     offset: int | None = None
-    limit: int = DEFAULT_LIMIT
+    limit: int | None = DEFAULT_LIMIT
 
 
 class FileReadEffectOutput(ProtocolModel):
@@ -83,7 +109,7 @@ class FileReadEffectOutput(ProtocolModel):
     num_lines: int
     start_line: int
     requested_offset: int | None = None
-    requested_limit: int = FileReadEffectInput.DEFAULT_LIMIT
+    requested_limit: int | None = FileReadEffectInput.DEFAULT_LIMIT
     total_lines: int | None = None
     was_truncated: bool = False
 
@@ -125,6 +151,12 @@ class FileWriteEffectInput(ProtocolModel):
 class FileWriteEffectOutput(ProtocolModel):
     file_path: str
     content: str
+    # A reader diffs an overwrite from these. `previous_content` is absent when
+    # the Runtime could not read the file back as text. `file_existed` defaults
+    # only for the legacy `write_file` builtin, whose result does not carry it;
+    # the Unified Harness path always states it (`_WriteResult`).
+    file_existed: bool = False
+    previous_content: str | None = None
 
 
 class WebSearchEffectInput(ProtocolModel):
@@ -184,6 +216,14 @@ class WorktreeEffectInput(ProtocolModel):
     path: str
 
 
+# Replaced by patch while the worktree is being prepared. File counts are set
+# only while checking out, and only once git has reported them.
+class WorktreeEffectProgress(ProtocolModel):
+    phase: Literal["naming", "fetching", "checking_out"]
+    completed_files: int | None = None
+    total_files: int | None = None
+
+
 class _EffectDetailBase(ProtocolModel):
     tool_name: str
     display: EffectCallDisplay
@@ -201,7 +241,7 @@ class ShellEffectDetail(_EffectDetailBase):
 
 class FileEditEffectDetail(_EffectDetailBase):
     kind: Literal[ToolEffectKind.FILE_EDIT] = ToolEffectKind.FILE_EDIT
-    input: FileEditEffectInput | None = None
+    input: FileEditEffectInput | FileEditEffectBatchInput | None = None
 
 
 class FileSearchEffectDetail(_EffectDetailBase):
@@ -244,15 +284,60 @@ class SkillEffectDetail(_EffectDetailBase):
     input: SkillEffectInput | None = None
 
 
+# The card is built when the call starts -- before its arguments finish
+# streaming and before a child session exists -- then filled in by patch. `None`
+# here means "not known yet", not "this shape carries no such field".
 class SubagentEffectDetail(_EffectDetailBase):
     kind: Literal[ToolEffectKind.SUBAGENT] = ToolEffectKind.SUBAGENT
     input: SubagentEffectInput | None = None
     child_session_id: str | None = None
+    # `input.agent` is the profile a spawn ran, not the name it gave the child.
+    agent_name: str | None = None
 
 
 class WorktreeEffectDetail(_EffectDetailBase):
     kind: Literal[ToolEffectKind.WORKTREE] = ToolEffectKind.WORKTREE
     input: WorktreeEffectInput | None = None
+    progress: WorktreeEffectProgress | None = None
+
+
+class ProcessEffectDetail(_EffectDetailBase):
+    kind: Literal[ToolEffectKind.PROCESS] = ToolEffectKind.PROCESS
+    input: JsonValue = None
+
+
+class ScratchpadListInput(ProtocolModel):
+    action: Literal["list"] = "list"
+
+
+class ScratchpadReadInput(ProtocolModel):
+    action: Literal["read"] = "read"
+    path: str
+
+
+class ScratchpadWriteInput(ProtocolModel):
+    action: Literal["write"] = "write"
+    path: str
+    content: str
+
+
+# A list names no file, a read names one, and a write carries the note it saved.
+ScratchpadEffectInput = Annotated[
+    ScratchpadListInput | ScratchpadReadInput | ScratchpadWriteInput,
+    Field(discriminator="action"),
+]
+
+
+# A write or read carries the note's text, a list the scratchpad's file names.
+class ScratchpadEffectOutput(ProtocolModel):
+    path: str | None = None
+    content: str | None = None
+    files: list[str] = Field(default_factory=list)
+
+
+class ScratchpadEffectDetail(_EffectDetailBase):
+    kind: Literal[ToolEffectKind.SCRATCHPAD] = ToolEffectKind.SCRATCHPAD
+    input: ScratchpadEffectInput
 
 
 EffectDetail = Annotated[
@@ -268,7 +353,9 @@ EffectDetail = Annotated[
     | WebFetchEffectDetail
     | SkillEffectDetail
     | SubagentEffectDetail
-    | WorktreeEffectDetail,
+    | WorktreeEffectDetail
+    | ProcessEffectDetail
+    | ScratchpadEffectDetail,
     Field(discriminator="kind"),
 ]
 

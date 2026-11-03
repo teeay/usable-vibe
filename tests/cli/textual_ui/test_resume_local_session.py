@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tests.conftest import build_test_vibe_app
-from vibe.app_server.models import AgentStatsSnapshot, PreparedPrompt
+from vibe.app_server.models import (
+    AgentStatsSnapshot,
+    IdleSessionStatus,
+    PreparedPrompt,
+    PublicSession,
+)
 from vibe.app_server.protocol import (
     AppServerResponseError,
     ProtocolError,
@@ -16,7 +21,10 @@ from vibe.app_server.session import AppServerSession
 from vibe.cli.textual_ui.app import VibeApp
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.context_progress import ContextProgress
+from vibe.cli.textual_ui.widgets.loading import LoadingWidget
 from vibe.cli.textual_ui.widgets.messages import ErrorMessage
+from vibe.cli.textual_ui.widgets.session_picker import SessionPickerApp
+from vibe.cli.textual_ui.widgets.spinner_text import SpinnerText
 
 _RESUMED_TOKENS = 50_000
 _RESUMED_CONTEXT_WINDOW = 200_000
@@ -166,6 +174,40 @@ async def test_resume_local_session_updates_context_progress(vibe_app: VibeApp) 
 
 
 @pytest.mark.asyncio
+async def test_resume_local_session_updates_banner_model(vibe_app: VibeApp) -> None:
+    async with vibe_app.run_test():
+        banner = vibe_app._banner
+        assert banner is not None
+        previous_model = banner.state.active_model
+        resumed_model = vibe_app.config.active_model.model_copy(
+            update={
+                "name": "resumed-model",
+                "alias": "resumed-model",
+                "display_name": "Resumed Model",
+            }
+        )
+        resumed_config = vibe_app.config.model_copy(
+            update={"active_model": resumed_model}
+        )
+
+        def _apply_resumed_model(*args: object) -> None:
+            vibe_app.app_server._state.config = resumed_config
+
+        vibe_app.app_server.resume = AsyncMock(side_effect=_apply_resumed_model)
+        with (
+            patch.object(
+                vibe_app, "_rebuild_transcript_from_current_session", AsyncMock()
+            ),
+            patch.object(vibe_app, "_mount_and_scroll", AsyncMock()),
+            patch.object(vibe_app, "_finish_resume_notices", AsyncMock()),
+        ):
+            await vibe_app._resume_local_session("abcd1234")
+
+        assert banner.state.active_model != previous_model
+        assert banner.state.active_model == f"Resumed Model[{resumed_model.thinking}]"
+
+
+@pytest.mark.asyncio
 async def test_resume_local_session_shows_zero_when_no_llm_activity(
     vibe_app: VibeApp,
 ) -> None:
@@ -181,18 +223,81 @@ async def test_resume_local_session_shows_zero_when_no_llm_activity(
 
 
 @pytest.mark.asyncio
-async def test_enqueue_prompt_prepares_eagerly(vibe_app: VibeApp) -> None:
+async def test_successful_resume_replaces_stale_turn_presentation(
+    vibe_app: VibeApp,
+) -> None:
     async with vibe_app.run_test():
-        prepared = PreparedPrompt(display_text="hello", prompt_text="hello-prepared")
-        prepare = AsyncMock(return_value=prepared)
-        with patch.object(vibe_app, "_prepare_prompt_or_abort", prepare):
-            result = await vibe_app._enqueue_prompt_with_resources("hello")
+        await vibe_app._ensure_loading_widget()
+        stale_loading = vibe_app._loading_widget
+        assert isinstance(stale_loading, LoadingWidget)
+        vibe_app._begin_pending_turn()
 
-        assert result is True
-        prepare.assert_awaited_once_with("hello")
-        items = vibe_app._queue.queue.items
-        assert len(items) == 1
-        assert items[0].prepared_prompt is prepared
+        vibe_app.app_server.resume = AsyncMock()
+        clear_queue = AsyncMock()
+        sync_queue = AsyncMock()
+        with (
+            patch.object(vibe_app._queue, "clear_server_queue", clear_queue),
+            patch.object(vibe_app._queue, "sync_server_queue", sync_queue),
+            patch.object(
+                vibe_app, "_rebuild_transcript_from_current_session", AsyncMock()
+            ),
+            patch.object(vibe_app, "_mount_and_scroll", AsyncMock()),
+            patch.object(vibe_app, "_finish_resume_notices", AsyncMock()),
+        ):
+            await vibe_app._resume_local_session("abcd1234")
+
+        assert vibe_app._loading_widget is None
+        assert stale_loading.parent is None
+        assert vibe_app._pending_turn is False
+        assert vibe_app._resume_ui_ready.is_set()
+        clear_queue.assert_awaited_once_with()
+        sync_queue.assert_awaited_once_with(vibe_app.app_server.turn_queue)
+
+
+@pytest.mark.asyncio
+async def test_failed_resume_preserves_current_turn_presentation(
+    vibe_app: VibeApp,
+) -> None:
+    async with vibe_app.run_test():
+        await vibe_app._ensure_loading_widget()
+        loading = vibe_app._loading_widget
+        assert isinstance(loading, LoadingWidget)
+        vibe_app._begin_pending_turn()
+
+        vibe_app.app_server.resume = AsyncMock(side_effect=RuntimeError("boom"))
+        clear_queue = AsyncMock()
+        sync_queue = AsyncMock()
+        with (
+            patch.object(vibe_app._queue, "clear_server_queue", clear_queue),
+            patch.object(vibe_app._queue, "sync_server_queue", sync_queue),
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                await vibe_app._resume_local_session("abcd1234")
+
+        assert vibe_app._loading_widget is loading
+        assert loading.parent is not None
+        assert vibe_app._pending_turn is True
+        assert vibe_app._resume_ui_ready.is_set()
+        clear_queue.assert_not_awaited()
+        sync_queue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_prompt_prepares_eagerly(vibe_app: VibeApp) -> None:
+    prepared = PreparedPrompt(display_text="hello", prompt_text="hello-prepared")
+    prepare = AsyncMock(return_value=prepared)
+    enqueue = AsyncMock()
+    with (
+        patch.object(vibe_app, "_prepare_prompt_or_abort", prepare),
+        patch.object(vibe_app._queue, "enqueue_prompt", enqueue),
+    ):
+        result = await vibe_app._enqueue_prompt_with_resources("hello")
+
+    assert result is True
+    prepare.assert_awaited_once_with("hello")
+    enqueue.assert_awaited_once_with(
+        "hello", skill_name=None, prepared_prompt=prepared, optimistic_start=False
+    )
 
 
 @pytest.mark.asyncio
@@ -209,29 +314,27 @@ async def test_submit_during_fresh_bootstrap_waits_then_dispatches() -> None:
 
     app._start_app_server = _latched_starter
 
-    turn = AsyncMock()
+    enqueue = AsyncMock()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause(0.1)
         assert app._app_server is None
         assert not app._session_ready.is_set()
 
-        with patch.object(app, "_handle_turn", turn):
+        with patch.object(app._queue, "enqueue_prompt", enqueue):
             submit = asyncio.create_task(app._handle_user_message("hello"))
             await asyncio.sleep(0.05)
             # Blocked on _session_ready inside _prepare_prompt_or_abort — no
             # RuntimeError from the unbound app_server property.
             assert not submit.done()
             assert app._loading_widget is not None
-            turn.assert_not_awaited()
+            enqueue.assert_not_awaited()
 
             release.set()
             await pilot.pause(0.3)
             await submit
-            if app._agent_task is not None:
-                await app._agent_task
 
         assert app._session_ready.is_set()
-        turn.assert_awaited_once()
+        enqueue.assert_awaited_once()
 
 
 async def _assert_submit_during_resume_window_dispatches(
@@ -249,7 +352,7 @@ async def _assert_submit_during_resume_window_dispatches(
         async def _blocked_resume(_session_id: str) -> None:
             await gate.wait()
 
-        turn = AsyncMock()
+        enqueue = AsyncMock()
         with (
             patch.object(
                 app.app_server.resources.sessions,
@@ -260,7 +363,7 @@ async def _assert_submit_during_resume_window_dispatches(
                 app, "_resume_local_session", AsyncMock(side_effect=_blocked_resume)
             ),
             patch.object(app, "_process_startup_prompt_when_available", AsyncMock()),
-            patch.object(app, "_handle_turn", turn),
+            patch.object(app._queue, "enqueue_prompt", enqueue),
         ):
             resume_task = asyncio.create_task(app._auto_resume_on_startup())
             await asyncio.sleep(0.05)
@@ -269,16 +372,14 @@ async def _assert_submit_during_resume_window_dispatches(
             submit = asyncio.create_task(app._handle_user_message("go"))
             await asyncio.sleep(0.05)
             assert not submit.done()
-            turn.assert_not_awaited()
+            enqueue.assert_not_awaited()
 
             gate.set()
             await resume_task
             await submit
-            if app._agent_task is not None:
-                await app._agent_task
 
         assert app._session_ready.is_set()
-        turn.assert_awaited_once()
+        enqueue.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -420,6 +521,45 @@ async def test_session_ready_set_on_picker_zero_sessions(vibe_app: VibeApp) -> N
         ):
             await vibe_app._show_session_picker()
         assert vibe_app._session_ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_session_picker_shows_spinner_while_sessions_load(
+    vibe_app: VibeApp,
+) -> None:
+    list_started = asyncio.Event()
+    release_list = asyncio.Event()
+
+    async with vibe_app.run_test(size=(120, 40)) as pilot:
+        session = PublicSession(
+            id="saved-session",
+            status=IdleSessionStatus(),
+            created_at=1_000,
+            updated_at=1_000,
+            cwd=vibe_app.app_server.cwd,
+        )
+
+        async def list_sessions(_cwd: str | None) -> list[PublicSession]:
+            list_started.set()
+            await release_list.wait()
+            return [session]
+
+        with patch.object(
+            vibe_app.app_server.resources.sessions,
+            "list",
+            AsyncMock(side_effect=list_sessions),
+        ):
+            task = asyncio.create_task(vibe_app._show_session_picker())
+            await asyncio.wait_for(list_started.wait(), timeout=1)
+            await pilot.pause()
+
+            picker = vibe_app.query_one(SessionPickerApp)
+            loading = picker.query_one("#sessionpicker-loading")
+            assert loading.display is True
+            assert loading.query_one(SpinnerText)._timer is not None
+
+            release_list.set()
+            await task
 
 
 @pytest.mark.asyncio

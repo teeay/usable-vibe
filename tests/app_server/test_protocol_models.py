@@ -2,38 +2,91 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from pydantic import ValidationError
 import pytest
 
 from vibe.app_server._model import validate_wire
 from vibe.app_server.models import (
     IdleSessionStatus,
+    MCPSourceSummary,
+    PublicQueuedTurn,
     PublicRetryCategory,
     PublicRetryState,
     PublicSession,
     PublicSessionState,
+    PublicTurn,
+    PublicTurnQueue,
+    PublicTurnStatus,
+    TextContentBlock,
+    validate_history_entry,
 )
 from vibe.app_server.protocol import (
     SERVER_METHODS,
     AgentConfig,
+    AppServerResponseError,
     CallbackResult,
     CallbackResultError,
     CallbackResultResponse,
     EventWatermarkResponse,
+    FeedbackShouldShowResponse,
     InitializeParams,
+    InvalidParamsData,
+    InvalidParamsIssue,
+    MessageAnnotations,
     PageRequest,
+    ProtocolError,
+    ProtocolErrorCode,
     SessionContinueResponse,
+    SessionEmbeddedResourceContentBlock,
     SessionForkResponse,
     SessionHistoryListParams,
+    SessionImageContentBlock,
     SessionReadResponse,
+    SessionResourceLinkContentBlock,
     SessionResumeResponse,
     SessionShellCommandResponse,
     SessionStartParams,
     SessionStartResponse,
+    SessionTextContentBlock,
+    TurnContextInputEntry,
+    TurnEnqueueParams,
+    TurnEnqueueResponse,
     TurnInterruptResponse,
+    TurnQueueReadResponse,
+    TurnQueueRemoveParams,
+    TurnQueueRemoveResponse,
+    TurnQueueReplaceParams,
+    TurnQueueReplaceResponse,
+    TurnQueueResumeResponse,
+    TurnQueueSteerParams,
+    TurnQueueSteerResponse,
+    TurnQueueUpdatedParams,
     TurnStartResponse,
+    TurnSteerParams,
     TurnSteerResponse,
+    TurnUserInputEntry,
 )
+from vibe.user_content import UserDisplayContent
+
+
+def _turn_queue() -> PublicTurnQueue:
+    return PublicTurnQueue(
+        items=[
+            PublicQueuedTurn(
+                id="queue-1",
+                created_at=10,
+                entries=[
+                    TurnUserInputEntry(
+                        entry_id="user-2",
+                        content=[SessionTextContentBlock(text="next prompt")],
+                    )
+                ],
+            )
+        ],
+        paused=True,
+    )
 
 
 def test_public_protocol_has_no_session_mcp_methods() -> None:
@@ -58,6 +111,21 @@ def test_wire_models_serialize_camel_case_and_reject_snake_case_wire_keys() -> N
         validate_wire(SessionHistoryListParams, {"session_id": "session-1"})
 
 
+def test_feedback_response_serializes_cooldown_and_accepts_legacy_shape() -> None:
+    response = FeedbackShouldShowResponse(show=True, snooze_duration_seconds=604_800)
+
+    assert response.model_dump(mode="json") == {
+        "show": True,
+        "snoozeDurationSeconds": 604_800,
+    }
+    assert (
+        validate_wire(
+            FeedbackShouldShowResponse, {"show": True}
+        ).snooze_duration_seconds
+        is None
+    )
+
+
 def test_public_session_state_carries_optional_retry_state() -> None:
     session = PublicSession(
         id="session-1", status=IdleSessionStatus(), created_at=1, updated_at=1
@@ -79,7 +147,67 @@ def test_public_session_state_carries_optional_retry_state() -> None:
         "turnId": "turn-1",
         "category": "rate_limited",
         "detail": "HTTP 429",
+        "retryAt": None,
+        "retryAttempt": None,
     }
+
+
+def test_public_session_state_carries_optional_runtime_quiescence() -> None:
+    session = PublicSession(
+        id="session-1", status=IdleSessionStatus(), created_at=1, updated_at=1
+    )
+
+    unknown = PublicSessionState(event_id=0, session=session)
+    pending = PublicSessionState(event_id=1, session=session, is_quiescent=False)
+
+    assert unknown.model_dump(mode="json")["isQuiescent"] is None
+    assert pending.model_dump(mode="json")["isQuiescent"] is False
+
+
+def test_public_session_harness_field_defaults_to_none() -> None:
+    session = PublicSession(
+        id="session-1", status=IdleSessionStatus(), created_at=1, updated_at=1
+    )
+
+    assert session.harness is None
+    assert session.model_dump(mode="json")["harness"] is None
+
+
+def test_public_session_serializes_nullable_bumped_at() -> None:
+    session = PublicSession(
+        id="session-1",
+        status=IdleSessionStatus(),
+        created_at=1,
+        updated_at=1,
+        bumped_at=42,
+    )
+
+    assert session.model_dump(mode="json")["bumpedAt"] == 42
+
+
+@pytest.mark.parametrize("harness", ["legacy", "unified"])
+def test_public_session_harness_field_accepts_provenance(harness: str) -> None:
+    session = PublicSession(
+        id="session-1",
+        status=IdleSessionStatus(),
+        created_at=1,
+        updated_at=1,
+        harness=harness,  # type: ignore[arg-type]
+    )
+
+    assert session.harness == harness
+    assert session.model_dump(mode="json")["harness"] == harness
+
+
+def test_public_session_harness_field_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError):
+        PublicSession(
+            id="session-1",
+            status=IdleSessionStatus(),
+            created_at=1,
+            updated_at=1,
+            harness="other",  # type: ignore[arg-type]
+        )
 
 
 def test_agent_config_carries_app_server_and_vibe_launch_fields() -> None:
@@ -167,6 +295,357 @@ def test_page_request_uses_canonical_pagination_shape() -> None:
     }
 
 
+def test_public_turn_queue_serializes_order_and_turn_link() -> None:
+    queue = _turn_queue()
+    turn = PublicTurn(
+        id="turn-2",
+        session_id="session-1",
+        status=PublicTurnStatus.IN_PROGRESS,
+        started_at=20,
+        queue_item_id="queue-1",
+    )
+
+    assert queue.model_dump(mode="json") == {
+        "items": [
+            {
+                "id": "queue-1",
+                "createdAt": 10,
+                "entries": [
+                    {
+                        "role": "user",
+                        "entryId": "user-2",
+                        "content": [{"type": "text", "text": "next prompt"}],
+                        "annotations": {},
+                    }
+                ],
+            }
+        ],
+        "paused": True,
+        "maxItems": 32,
+    }
+    assert turn.model_dump(mode="json")["queueItemId"] == "queue-1"
+
+
+def test_turn_queue_protocol_models_use_camel_case() -> None:
+    queue = _turn_queue()
+    params = TurnEnqueueParams(
+        idempotency_key="enqueue-1",
+        session_id="session-1",
+        entries=[
+            TurnUserInputEntry(
+                entry_id="user-2", content=[SessionTextContentBlock(text="next prompt")]
+            )
+        ],
+    )
+    replace = TurnQueueReplaceParams(
+        idempotency_key="replace-1",
+        session_id="session-1",
+        queue_item_id="queue-1",
+        entries=params.entries,
+    )
+    remove = TurnQueueRemoveParams(session_id="session-1", queue_item_id="queue-1")
+    notification = TurnQueueUpdatedParams(
+        event_id=3, session_id="session-1", emitted_at=30, queue=queue
+    )
+
+    assert params.model_dump(mode="json") == {
+        "idempotencyKey": "enqueue-1",
+        "sessionId": "session-1",
+        "entries": [
+            {
+                "role": "user",
+                "entryId": "user-2",
+                "content": [{"type": "text", "text": "next prompt"}],
+                "annotations": {},
+            }
+        ],
+    }
+    assert params.input == params.entries[0].content
+    assert replace.model_dump(mode="json") == {
+        "idempotencyKey": "replace-1",
+        "sessionId": "session-1",
+        "entries": params.model_dump(mode="json")["entries"],
+        "queueItemId": "queue-1",
+    }
+    assert remove.model_dump(mode="json") == {
+        "sessionId": "session-1",
+        "queueItemId": "queue-1",
+    }
+    assert notification.model_dump(mode="json") == {
+        "eventId": 3,
+        "sessionId": "session-1",
+        "emittedAt": 30,
+        "queue": queue.model_dump(mode="json"),
+    }
+
+    assert (
+        TurnEnqueueParams(
+            session_id="session-1",
+            entries=[
+                TurnUserInputEntry(
+                    content=[SessionTextContentBlock(text="next prompt")]
+                )
+            ],
+        ).idempotency_key
+        is None
+    )
+
+
+def test_canonical_enqueue_rejects_the_old_vibe_payload() -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(
+            TurnEnqueueParams,
+            {
+                "sessionId": "session-1",
+                "messageEntryId": "user-2",
+                "message": [{"type": "text", "text": "next prompt"}],
+                "replaceQueueItemId": "queue-1",
+            },
+        )
+
+
+def test_canonical_enqueue_accepts_context_user_content_and_annotations() -> None:
+    display = UserDisplayContent(
+        version="1", host="vibe", content=[{"type": "text", "text": "display text"}]
+    )
+    params = TurnEnqueueParams(
+        session_id="session-1",
+        entries=[
+            TurnContextInputEntry(
+                entry_id="context-1",
+                content=[SessionTextContentBlock(text="hidden context")],
+            ),
+            TurnUserInputEntry(
+                entry_id="user-1",
+                content=[
+                    SessionTextContentBlock(text="visible prompt"),
+                    SessionImageContentBlock(
+                        uri="data:image/png;base64,aGVsbG8=",
+                        media_type="image/png",
+                        alt_text="image.png",
+                    ),
+                    SessionResourceLinkContentBlock(
+                        uri="file:///workspace/notes.md", name="notes.md"
+                    ),
+                    SessionEmbeddedResourceContentBlock(
+                        uri="file:///workspace/context.txt",
+                        media_type="text/plain",
+                        text="attached context",
+                    ),
+                ],
+                annotations=MessageAnnotations.model_validate({
+                    "vibe.userDisplayContent": display
+                }),
+            ),
+        ],
+    )
+
+    dumped = params.model_dump(mode="json")
+
+    assert [entry["role"] for entry in dumped["entries"]] == ["context", "user"]
+    assert [block["type"] for block in dumped["entries"][1]["content"]] == [
+        "text",
+        "image",
+        "resource_link",
+        "embedded_resource",
+    ]
+    assert dumped["entries"][1]["annotations"] == {
+        "vibe.userDisplayContent": display.model_dump(mode="json")
+    }
+
+
+def test_turn_steer_preserves_user_display_content() -> None:
+    """*Prepare*: Host-owned display metadata for a steered user message.
+    *Do*: Serialize the typed `turn/steer` request.
+    *Assert*: The display metadata remains in the camel-case wire payload.
+    """
+    # Prepare
+    display = UserDisplayContent(
+        version="1", host="code-local", content=[{"type": "text", "text": "display"}]
+    )
+
+    # Do
+    params = TurnSteerParams(
+        session_id="session-1",
+        expected_turn_id="turn-1",
+        message=[TextContentBlock(text="model input")],
+        user_display_content=display,
+    )
+
+    # Assert
+    assert params.model_dump(mode="json", by_alias=True)["userDisplayContent"] == (
+        display.model_dump(mode="json", by_alias=True)
+    )
+
+
+@pytest.mark.parametrize(
+    ("input_fields", "expected_input_entry_id"),
+    [
+        pytest.param({}, None, id="omitted"),
+        pytest.param({"inputEntryId": None}, None, id="null"),
+        pytest.param({"inputEntryId": "steer-1"}, "steer-1", id="linked"),
+    ],
+)
+def test_public_models_serialize_nullable_input_entry_id(
+    input_fields: dict[str, str | None], expected_input_entry_id: str | None
+) -> None:
+    """*Prepare*: Turn, message, and callback payloads with absent or linked input.
+    *Do*: Parse and serialize the public app-server models.
+    *Assert*: Missing input IDs become null without mutating the original payloads.
+    """
+    # Prepare
+    turn = {
+        "id": "turn-1",
+        "sessionId": "session-1",
+        "status": "in_progress",
+        "startedAt": 1,
+        **input_fields,
+    }
+    entry_base = {
+        "sessionId": "session-1",
+        "turnId": "turn-1",
+        "createdAt": 2,
+        "updatedAt": 2,
+        "generationStatus": "completed",
+        "relatedEntryId": None,
+        **input_fields,
+    }
+    entries = [
+        {
+            **entry_base,
+            "type": "message",
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Done"}],
+            "source": "harness",
+        },
+        {
+            **entry_base,
+            "type": "callback",
+            "id": "callback-entry-1",
+            "callbackId": "callback-1",
+            "relatedEntryId": "effect-1",
+            "title": "Choose an option",
+            "detail": {
+                "kind": "user_input",
+                "request": {
+                    "questions": [
+                        {
+                            "question": "Continue?",
+                            "options": [{"label": "Yes"}, {"label": "No"}],
+                        }
+                    ]
+                },
+            },
+            "state": {"status": "open"},
+        },
+    ]
+    original_turn = deepcopy(turn)
+    original_entries = deepcopy(entries)
+
+    # Do
+    parsed_turn = validate_wire(PublicTurn, turn)
+    parsed_entries = [validate_history_entry(entry) for entry in entries]
+    serialized_turn = parsed_turn.model_dump(mode="json", by_alias=True)
+    serialized_entries = [
+        entry.model_dump(mode="json", by_alias=True) for entry in parsed_entries
+    ]
+
+    # Assert
+    assert parsed_turn.input_entry_id == expected_input_entry_id
+    assert serialized_turn["inputEntryId"] == expected_input_entry_id
+    assert [entry.input_entry_id for entry in parsed_entries] == [
+        expected_input_entry_id,
+        expected_input_entry_id,
+    ]
+    assert [entry["inputEntryId"] for entry in serialized_entries] == [
+        expected_input_entry_id,
+        expected_input_entry_id,
+    ]
+    assert [entry["relatedEntryId"] for entry in serialized_entries] == [
+        None,
+        "effect-1",
+    ]
+    assert turn == original_turn
+    assert entries == original_entries
+
+
+def test_canonical_enqueue_requires_the_user_entry_to_be_last() -> None:
+    with pytest.raises(ValidationError, match="final turn input entry"):
+        TurnEnqueueParams(
+            session_id="session-1",
+            entries=[
+                TurnUserInputEntry(
+                    content=[SessionTextContentBlock(text="visible prompt")]
+                ),
+                TurnContextInputEntry(
+                    content=[SessionTextContentBlock(text="hidden context")]
+                ),
+            ],
+        )
+
+
+def test_turn_queue_methods_are_advertised() -> None:
+    assert {
+        "session/turn/enqueue",
+        "session/turn/queue/read",
+        "session/turn/queue/remove",
+        "session/turn/queue/replace",
+        "session/turn/queue/steer",
+        "session/turn/queue/resume",
+    }.issubset(SERVER_METHODS)
+    assert {
+        "turn/enqueue",
+        "turn/queue/read",
+        "turn/queue/remove",
+        "turn/queue/resume",
+        "vibe/turn/queue/replace",
+    }.isdisjoint(SERVER_METHODS)
+
+
+def test_background_process_output_method_is_advertised() -> None:
+    """*Prepare*: The app-server's public method catalogue.
+    *Do*: Inspect the background-process output method.
+    *Assert*: Clients can discover the typed output read capability.
+    """
+    # Prepare
+    method = "session/backgroundProcess/output"
+
+    # Do
+    is_advertised = method in SERVER_METHODS
+
+    # Assert
+    assert is_advertised
+
+
+def test_turn_queue_command_results_are_minimal() -> None:
+    assert TurnEnqueueResponse(queue_item_id="queue-1").model_dump(mode="json") == {
+        "queueItemId": "queue-1"
+    }
+    assert TurnQueueReplaceResponse(queue_item_id="queue-1").model_dump(
+        mode="json"
+    ) == {"queueItemId": "queue-1"}
+    assert TurnQueueReadResponse(queue=_turn_queue()).model_dump(mode="json") == {
+        "queue": _turn_queue().model_dump(mode="json")
+    }
+    assert TurnQueueRemoveResponse().model_dump(mode="json") == {}
+    assert TurnQueueResumeResponse().model_dump(mode="json") == {}
+    assert TurnQueueSteerParams(
+        session_id="session-1", queue_item_id="queue-1", expected_turn_id="turn-1"
+    ).model_dump(mode="json") == {
+        "sessionId": "session-1",
+        "queueItemId": "queue-1",
+        "expectedTurnId": "turn-1",
+    }
+    assert TurnQueueSteerResponse(
+        queue_item_id="queue-1", turn_id="turn-1", last_event_id=7
+    ).model_dump(mode="json") == {
+        "queueItemId": "queue-1",
+        "turnId": "turn-1",
+        "lastEventId": 7,
+    }
+
+
 @pytest.mark.parametrize(
     "response_type",
     [
@@ -228,3 +707,146 @@ def test_callback_result_accepts_rfc_output_or_error_shapes() -> None:
         "output": None,
         "error": None,
     }
+
+
+def test_an_mcp_source_names_its_owning_plugin_without_breaking_older_clients() -> None:
+    configured = validate_wire(
+        MCPSourceSummary,
+        {
+            "name": "linear",
+            "kind": "server",
+            "transport": "http",
+            "status": "connected",
+        },
+    )
+    owned = validate_wire(
+        MCPSourceSummary,
+        {
+            "name": "figma",
+            "kind": "server",
+            "transport": "http",
+            "status": "needs_auth",
+            "pluginName": "figma",
+        },
+    )
+
+    assert configured.plugin_name is None
+    assert owned.plugin_name == "figma"
+    assert owned.model_dump(mode="json")["pluginName"] == "figma"
+
+    with pytest.raises(ValidationError):
+        validate_wire(
+            MCPSourceSummary,
+            {
+                "name": "figma",
+                "kind": "server",
+                "transport": "http",
+                "status": "needs_auth",
+                "plugin_name": "figma",
+            },
+        )
+
+
+def test_response_error_message_surfaces_invalid_params_detail() -> None:
+    """A validation rejection must name the offending field and reason.
+
+    The generic ``"Invalid request parameters"`` string on its own hides the
+    only useful part of the failure, so the rendered message folds in the
+    field path and the validator message.
+    """
+    error = ProtocolError(
+        code=ProtocolErrorCode.INVALID_PARAMS,
+        message="Invalid request parameters",
+        data=InvalidParamsData(
+            error_count=1,
+            issues=[
+                InvalidParamsIssue(
+                    path=["agentConfig", "mcpServers", 0, "url"],
+                    message="Field required",
+                )
+            ],
+        ).model_dump(mode="json", by_alias=True),
+    )
+
+    exc = AppServerResponseError(error)
+
+    text = str(exc)
+    assert "Invalid request parameters" in text
+    assert "agentConfig.mcpServers.0.url" in text
+    assert "Field required" in text
+    # The structured detail stays reachable for programmatic handling.
+    assert exc.error.code is ProtocolErrorCode.INVALID_PARAMS
+
+
+def test_response_error_message_lists_every_issue() -> None:
+    error = ProtocolError(
+        code=ProtocolErrorCode.INVALID_PARAMS,
+        message="Invalid request parameters",
+        data=InvalidParamsData(
+            error_count=2,
+            issues=[
+                InvalidParamsIssue(path=["sessionId"], message="Field required"),
+                InvalidParamsIssue(
+                    path=["session_id"], message="Extra inputs are not permitted"
+                ),
+            ],
+        ).model_dump(mode="json", by_alias=True),
+    )
+
+    text = str(AppServerResponseError(error))
+
+    assert "sessionId: Field required" in text
+    assert "session_id: Extra inputs are not permitted" in text
+
+
+def test_response_error_message_preserves_plain_errors() -> None:
+    """Errors without invalid-params detail keep their original message."""
+    error = ProtocolError(code=ProtocolErrorCode.NOT_FOUND, message="No such session")
+
+    assert str(AppServerResponseError(error)) == "No such session"
+
+
+def test_validate_backend_wire_ignores_unknown_fields() -> None:
+    """Reading backend output tolerates fields the client does not know (ADR 0014)."""
+    from vibe.app_server._model import validate_backend_wire
+    from vibe.app_server.models import TokenUsage
+
+    result = validate_backend_wire(
+        TokenUsage,
+        {"inputTokens": 1, "outputTokens": 2, "totalTokens": 3, "cachedInputTokens": 4},
+    )
+
+    assert result.input_tokens == 1
+    assert result.output_tokens == 2
+    assert result.total_tokens == 3
+
+
+def test_validate_backend_wire_respects_model_defaults() -> None:
+    from vibe.app_server._model import validate_backend_wire
+    from vibe.app_server.models import TokenUsage
+
+    result = validate_backend_wire(TokenUsage, {"inputTokens": 5})
+
+    assert result.input_tokens == 5
+    assert result.output_tokens == 0
+    assert result.total_tokens == 0
+
+
+def test_validate_backend_wire_still_rejects_bad_known_fields() -> None:
+    """Tolerance is only for unknown fields — real type errors still surface."""
+    from vibe.app_server._model import validate_backend_wire
+    from vibe.app_server.models import TokenUsage
+
+    with pytest.raises(ValidationError):
+        validate_backend_wire(TokenUsage, {"inputTokens": "not-an-int"})
+
+
+def test_validate_backend_wire_still_requires_fields_without_defaults() -> None:
+    """A field the harness dropped that the client needs is a real break."""
+    from vibe.app_server._model import ProtocolModel, validate_backend_wire
+
+    class _Needs(ProtocolModel):
+        required_value: int
+
+    with pytest.raises(ValidationError):
+        validate_backend_wire(_Needs, {"unrelated": 1})

@@ -1,11 +1,11 @@
 """Native-scroll coverage for the local input / command lifecycles (Phase 3).
 
-These tests assert the shipped native path: queued prompts/bash and the queue
-header are live in ``#live-queue`` (never the hidden ``#messages`` tree), queued
-prompts commit exactly once when activated, manual/queued bash commits one
-durable block on finish, and ``/clear`` / ``/compact`` route their durable
-outcome through the committer while their live widgets never become hidden
-transcript.
+These tests assert the shipped native path: queued prompts and the queue
+header are live in ``#live-queue`` (never the hidden ``#messages`` tree),
+queued prompts commit exactly once when promoted, running manual bash shows
+only the loading widget live, finished bash commits one durable block, and
+``/clear`` / ``/compact`` route their durable outcome through the committer
+while their live widgets never become hidden transcript.
 """
 
 from __future__ import annotations
@@ -14,18 +14,43 @@ import asyncio
 
 import pytest
 
-from tests.conftest import build_test_vibe_app
+from tests.conftest import build_test_agent_loop, build_test_vibe_app, wait_until
+from tests.mock.utils import mock_llm_chunk
+from tests.stubs.fake_backend import FakeBackend
 from vibe.app_server.models import (
     PublicEntryGenerationStatus,
     PublicMessageEntry,
     TextContentBlock,
 )
+from vibe.cli.textual_ui.app import VibeApp
+from vibe.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
 from vibe.cli.textual_ui.widgets.messages import (
     BashOutputMessage,
     QueueHeaderMessage,
     UserMessage,
 )
+
+
+class _BlockingBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__([[mock_llm_chunk(content="done")]] * 4)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def complete(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            self.started.set()
+            await self.release.wait()
+        return await super().complete(**kwargs)
+
+
+def _blocked_app() -> tuple[VibeApp, _BlockingBackend]:
+    backend = _BlockingBackend()
+    agent_loop = build_test_agent_loop(backend=backend)
+    return build_test_vibe_app(agent_loop=agent_loop), backend
 
 
 def _entry(
@@ -49,14 +74,17 @@ def _set_history(app: object, entries: list[PublicMessageEntry]) -> None:
 
 @pytest.mark.asyncio
 async def test_queued_prompt_is_live_not_hidden() -> None:
-    app = build_test_vibe_app()
+    app, backend = _blocked_app()
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app._committer is not None
-        app._committer.drain_lines()  # drop the startup-header baseline
-        app._queue.set_paused(True)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("block queue"))
+        assert await wait_until(pilot, backend.started.is_set)
         await app._queue.enqueue_prompt("queued one")
+        assert await wait_until(pilot, lambda: len(app._queue) == 1)
         await pilot.pause()
+        app._committer.drain_lines()  # drop the startup header + block prompt
 
         live = list(app._live_queue.children)
         assert any(isinstance(c, QueueHeaderMessage) for c in live)
@@ -65,41 +93,52 @@ async def test_queued_prompt_is_live_not_hidden() -> None:
         assert list(app._messages_area.children) == []
         assert app._committer is not None
         assert app._committer.has_pending is False
+        backend.release.set()
 
 
 @pytest.mark.asyncio
 async def test_queue_header_tracks_pause_resume() -> None:
-    app = build_test_vibe_app()
+    app, backend = _blocked_app()
     async with app.run_test() as pilot:
         await pilot.pause()
-        app._queue.set_paused(True)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("block queue"))
+        assert await wait_until(pilot, backend.started.is_set)
         await app._queue.enqueue_prompt("one")
-        await pilot.pause()
+        assert await wait_until(pilot, lambda: app._queue.header is not None)
 
         header = app._queue.header
         assert header is not None
         assert header in app._live_queue.children
-
-        app._queue.set_paused(True)
-        assert app._queue.queue.paused is True
-        assert header._paused is True
-
-        app._queue.set_paused(False)
-        assert app._queue.queue.paused is False
         assert header._paused is False
+
+        await pilot.press("escape")
+        assert await wait_until(pilot, lambda: app.app_server.turn_queue.paused)
+        assert await wait_until(pilot, lambda: header._paused is True)
+
+        backend.release.set()
+        await app.app_server.resume_turn_queue()
+        assert await wait_until(
+            pilot,
+            lambda: app._queue.header is None and not app._agent_job_active(),
+            timeout=5.0,
+        )
 
 
 @pytest.mark.asyncio
 async def test_queue_pop_removes_live_widget_without_committing() -> None:
-    app = build_test_vibe_app()
+    app, backend = _blocked_app()
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app._committer is not None
-        app._committer.drain_lines()  # drop the startup-header baseline
-        app._queue.set_paused(True)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("block queue"))
+        assert await wait_until(pilot, backend.started.is_set)
         await app._queue.enqueue_prompt("first")
         await app._queue.enqueue_prompt("second")
+        assert await wait_until(pilot, lambda: len(app._queue) == 2)
         await pilot.pause()
+        app._committer.drain_lines()  # drop the startup header + block prompt
 
         pending = [c for c in app._live_queue.children if isinstance(c, UserMessage)]
         assert len(pending) == 2
@@ -112,23 +151,30 @@ async def test_queue_pop_removes_live_widget_without_committing() -> None:
         assert app._committer is not None
         assert app._committer.has_pending is False
         assert list(app._messages_area.children) == []
+        backend.release.set()
 
 
 @pytest.mark.asyncio
-async def test_queued_bash_widget_is_live_in_live_queue() -> None:
+async def test_running_bash_shows_loading_and_commits_on_finish() -> None:
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app._committer is not None
         app._committer.drain_lines()  # drop the startup-header baseline
-        app._queue.set_paused(True)
-        await app._queue.enqueue_bash("echo hi", app.app_server.cwd)
-        await pilot.pause()
+        task = asyncio.create_task(app._handle_bash_command("sleep 0.5"))
+        assert await wait_until(pilot, lambda: app._loading_widget is not None)
 
-        assert any(isinstance(c, BashOutputMessage) for c in app._live_queue.children)
         assert list(app._messages_area.children) == []
         assert app._committer is not None
         assert app._committer.has_pending is False
+
+        await asyncio.wait_for(task, timeout=5.0)
+        await pilot.pause()
+
+        assert app._loading_widget is None
+        assert app._committer is not None
+        text = "\n".join(app._committer.drain_lines())
+        assert "$ sleep 0.5" in text
 
 
 @pytest.mark.asyncio
@@ -136,8 +182,8 @@ async def test_activated_queue_prompt_commits_once_to_scrollback() -> None:
     app = build_test_vibe_app()
     async with app.run_test() as pilot:
         await pilot.pause()
-        # The activation path used by the drain engine when a queued prompt
-        # becomes active: commits via the same native prompt path, exactly once.
+        # The activation path used by the server-queue engine when a queued
+        # prompt promotes: commits via the same native prompt path, exactly once.
         await app._commit_queue_prompt("activated prompt", None)
         await pilot.pause()
 

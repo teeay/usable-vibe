@@ -30,6 +30,7 @@ from vibe.core.config.types import (
     ConflictStrategy,
 )
 from vibe.core.utils.concurrency import run_sync
+from vibe.observability.logging import logger
 
 
 class ConfigPatchValidationError(Exception):
@@ -113,10 +114,9 @@ class ConfigOrchestrator[S: ConfigSchema]:
         layers: list[ConfigLayer[RawConfig]],
         default_layer_resolver: DefaultLayerResolver,
         bus: EventBus | None = None,
-        validation_context: dict[str, Any] | None = None,
     ) -> ConfigOrchestrator[S]:
         """Build an orchestrator from a schema and an ordered list of layers."""
-        builder = ConfigBuilder[S](schema, validation_context=validation_context)
+        builder = ConfigBuilder[S](schema)
         builder.add_layers(layers)
         config = await builder.build()
         instance = cls(builder, config, default_layer_resolver, bus)
@@ -179,9 +179,20 @@ class ConfigOrchestrator[S: ConfigSchema]:
         value = getattr(data, "active_model", "")
         return value if isinstance(value, str) else ""
 
-    async def reload(self) -> None:
+    async def reload(
+        self, *, preflight: Callable[[S], Awaitable[None]] | None = None
+    ) -> None:
         """Force-reload all layers and atomically replace the config snapshot."""
-        self._config = await self._builder.build(force_load=True)
+        async with self._mutation_lock:
+            await self._reload_locked(preflight=preflight)
+
+    async def _reload_locked(
+        self, *, preflight: Callable[[S], Awaitable[None]] | None = None
+    ) -> None:
+        candidate = await self._builder.build(force_load=True)
+        if preflight is not None:
+            await preflight(candidate)
+        self._config = candidate
 
     async def set_field(
         self,
@@ -197,6 +208,28 @@ class ConfigOrchestrator[S: ConfigSchema]:
             reason=reason,
             preflight=preflight,
         )
+
+    async def set_field_or_warn(
+        self,
+        path: str,
+        value: Any,
+        reason: str = "No reason",
+        *,
+        target_layer: str | None = None,
+        preflight: Callable[[S], Awaitable[None]] | None = None,
+    ) -> None:
+        """Write a field, logging rather than raising when it never reaches disk.
+
+        `set_field` returns its errors instead of raising, so a caller that
+        ignores the return value cannot tell a failed write from a successful
+        one. Use this where the write is a durable copy of state that already
+        holds in memory, and failing the caller would be worse than losing it.
+        """
+        failures = await self.set_field(
+            path, value, reason, target_layer=target_layer, preflight=preflight
+        )
+        if failures:
+            logger.warning("Failed to persist %s: %s", path, failures[0])
 
     async def mutate_field(
         self,
@@ -320,7 +353,7 @@ class ConfigOrchestrator[S: ConfigSchema]:
         failures = [r for r in results if isinstance(r, BaseException)]
         has_success = any(not isinstance(r, BaseException) for r in results)
 
-        await self.reload()
+        await self._reload_locked()
         after = self._config.model_dump(mode="json")
         changed_keys = _changed_keys_between(before, after)
         if has_success and changed_keys:

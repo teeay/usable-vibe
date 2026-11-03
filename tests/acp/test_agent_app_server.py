@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
 import socket
@@ -19,6 +20,7 @@ from acp.schema import (
     AgentThoughtChunk,
     AllowedOutcome,
     ClientCapabilities,
+    ConfigOptionUpdate,
     EnvVariable,
     FileSystemCapabilities,
     HttpHeader,
@@ -37,15 +39,27 @@ from tests.stubs.app_server import start_test_app_server
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_client import FakeClient
 from vibe.acp.agent import RETRYING_EXT_METHOD, VibeAcpAgent
-from vibe.app_server.local import LocalHarnessOptions
+from vibe.acp.exceptions import ConfigurationError, UnauthenticatedError
+from vibe.app_server.events import SessionUpdated
+from vibe.app_server.local import LocalHarnessHost, LocalHarnessOptions
 from vibe.app_server.models import PublicError, PublicTurnStatus, TurnErrorCode
+from vibe.app_server.protocol import (
+    AppServerResponseError,
+    InvalidParamsData,
+    InvalidParamsIssue,
+    ProtocolError,
+    ProtocolErrorCode,
+)
 from vibe.app_server.session import AppServerSession, AppServerTurnError
 from vibe.core.config import SessionLoggingConfig
 from vibe.core.types import FunctionCall, ScheduledLoop, ToolCall
 
 
-def _agent(backend: FakeBackend) -> tuple[VibeAcpAgent, FakeClient]:
+def _agent(
+    backend: FakeBackend, *, experimental_harness: bool = False
+) -> tuple[VibeAcpAgent, FakeClient]:
     async def start_session(options: LocalHarnessOptions) -> AppServerSession:
+        assert options.experimental_harness is experimental_harness
         loop = build_test_agent_loop(backend=backend, enable_streaming=True)
         return await AppServerSession.start(
             start_test_app_server(loop),
@@ -55,7 +69,11 @@ def _agent(backend: FakeBackend) -> tuple[VibeAcpAgent, FakeClient]:
             client_tool_handler=options.client_tool_handler,
         )
 
-    agent = VibeAcpAgent(session_starter=start_session)
+    agent = VibeAcpAgent(
+        session_starter=start_session,
+        experimental_harness=experimental_harness,
+        legacy_harness=not experimental_harness,
+    )
     client = FakeClient()
     agent.on_connect(client)
     client.on_connect(agent)
@@ -63,8 +81,13 @@ def _agent(backend: FakeBackend) -> tuple[VibeAcpAgent, FakeClient]:
 
 
 @pytest.mark.asyncio
-async def test_prompt_is_a_thin_translation_of_public_app_server_events() -> None:
-    agent, client = _agent(FakeBackend([mock_llm_chunk(content="Public response")]))
+async def test_prompt_is_a_thin_translation_of_public_app_server_events(
+    experimental_harness: bool,
+) -> None:
+    agent, client = _agent(
+        FakeBackend([mock_llm_chunk(content="Public response")]),
+        experimental_harness=experimental_harness,
+    )
     try:
         created = await agent.new_session(cwd=str(Path.cwd()), mcp_servers=[])
         response = await agent.prompt(
@@ -89,7 +112,9 @@ async def test_prompt_is_a_thin_translation_of_public_app_server_events() -> Non
 
 
 @pytest.mark.asyncio
-async def test_cancelled_prompt_uses_interrupted_app_server_turn_status() -> None:
+async def test_cancelled_prompt_uses_interrupted_app_server_turn_status(
+    experimental_harness: bool,
+) -> None:
     backend_started = asyncio.Event()
     release_backend = asyncio.Event()
 
@@ -100,7 +125,10 @@ async def test_cancelled_prompt_uses_interrupted_app_server_turn_status() -> Non
             async for chunk in super().complete_streaming(**kwargs):
                 yield chunk
 
-    agent, _ = _agent(GatedBackend([mock_llm_chunk(content="unused")]))
+    agent, _ = _agent(
+        GatedBackend([mock_llm_chunk(content="unused")]),
+        experimental_harness=experimental_harness,
+    )
     try:
         created = await agent.new_session(cwd=str(Path.cwd()), mcp_servers=[])
         prompt_task = asyncio.create_task(
@@ -129,9 +157,96 @@ async def test_cancelled_prompt_uses_interrupted_app_server_turn_status() -> Non
 
 
 @pytest.mark.asyncio
-async def test_reasoning_is_projected_from_public_app_server_events() -> None:
+async def test_new_session_without_a_key_is_unauthenticated(
+    experimental_harness: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: An ACP agent over a real backend, for a user with no key.
+    *Do*: Open a session.
+    *Assert*: ``UnauthenticatedError`` naming the provider.
+
+    The code is what an editor reads to offer a sign-in; the
+    ``ConfigurationError`` this used to be sends the user to edit
+    ``config.toml`` instead. Run over whichever backend
+    ``--experimental-harness`` selects: the two are indistinguishable here only
+    if the Unified one also answers ``UNAUTHORIZED`` with a provider.
+    """
+    # Prepare
+    monkeypatch.delenv("MISTRAL_API_KEY")
+    harness_host = LocalHarnessHost()
+
+    async def start_session(options: LocalHarnessOptions) -> AppServerSession:
+        return await harness_host.start(
+            replace(
+                options,
+                experimental_harness=experimental_harness,
+                legacy_harness=not experimental_harness,
+            )
+        )
+
+    agent = VibeAcpAgent(session_starter=start_session)
+    client = FakeClient()
+    agent.on_connect(client)
+    client.on_connect(agent)
+
+    try:
+        # Do
+        with pytest.raises(UnauthenticatedError) as exc_info:
+            await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+    finally:
+        await agent.close()
+        await harness_host.close()
+
+    # Assert
+    assert "mistral" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_new_session_error_surfaces_invalid_params_detail(tmp_path: Path) -> None:
+    """*Prepare*: An ACP agent whose app server rejects the session with a
+    field-level ``INVALID_PARAMS`` issue. *Do*: Open a session. *Assert*: The
+    ``ConfigurationError`` carries the rendered detail, not just the protocol
+    code name, so an editor shows what actually failed.
+    """
+    issue = InvalidParamsIssue(
+        path=["message", "content", 1, "resource", "resource"],
+        message="Unable to extract tag using discriminator 'kind'",
+    )
+
+    async def start_session(options: LocalHarnessOptions) -> AppServerSession:
+        raise AppServerResponseError(
+            ProtocolError(
+                code=ProtocolErrorCode.INVALID_PARAMS,
+                message="Invalid request parameters",
+                data=InvalidParamsData(error_count=1, issues=[issue]).model_dump(
+                    mode="json"
+                ),
+            )
+        )
+
+    agent = VibeAcpAgent(session_starter=start_session)
+    client = FakeClient()
+    agent.on_connect(client)
+    client.on_connect(agent)
+
+    try:
+        # Do
+        with pytest.raises(ConfigurationError) as exc_info:
+            await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+    finally:
+        await agent.close()
+
+    # Assert
+    assert "Invalid request parameters" in str(exc_info.value)
+    assert "Unable to extract tag using discriminator 'kind'" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_is_projected_from_public_app_server_events(
+    experimental_harness: bool,
+) -> None:
     agent, client = _agent(
-        FakeBackend([mock_llm_chunk(content="Answer", reasoning_content="Thinking")])
+        FakeBackend([mock_llm_chunk(content="Answer", reasoning_content="Thinking")]),
+        experimental_harness=experimental_harness,
     )
     try:
         created = await agent.new_session(cwd=str(Path.cwd()), mcp_servers=[])
@@ -154,11 +269,12 @@ async def test_reasoning_is_projected_from_public_app_server_events() -> None:
 
 @pytest.mark.asyncio
 async def test_acp_session_workspace_and_mcp_inputs_cross_the_app_server_boundary(
-    tmp_path: Path,
+    tmp_path: Path, experimental_harness: bool
 ) -> None:
     captured: list[LocalHarnessOptions] = []
 
     async def start_session(options: LocalHarnessOptions) -> AppServerSession:
+        assert options.experimental_harness is experimental_harness
         captured.append(options)
         loop = build_test_agent_loop(enable_streaming=True)
         return await AppServerSession.start(
@@ -169,7 +285,11 @@ async def test_acp_session_workspace_and_mcp_inputs_cross_the_app_server_boundar
             client_tool_handler=options.client_tool_handler,
         )
 
-    agent = VibeAcpAgent(session_starter=start_session)
+    agent = VibeAcpAgent(
+        session_starter=start_session,
+        experimental_harness=experimental_harness,
+        legacy_harness=not experimental_harness,
+    )
     client = FakeClient()
     agent.on_connect(client)
     client.on_connect(agent)
@@ -205,12 +325,15 @@ async def test_acp_session_workspace_and_mcp_inputs_cross_the_app_server_boundar
 
 
 @pytest.mark.asyncio
-async def test_unsolicited_scheduled_turn_is_forwarded_to_acp(tmp_path: Path) -> None:
+async def test_unsolicited_scheduled_turn_is_forwarded_to_acp(
+    tmp_path: Path, experimental_harness: bool
+) -> None:
     config = build_test_vibe_config(
         session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
     )
 
     async def start_session(options: LocalHarnessOptions) -> AppServerSession:
+        assert options.experimental_harness is experimental_harness
         loop = build_test_agent_loop(
             config=config,
             backend=FakeBackend([mock_llm_chunk(content="Scheduled response")]),
@@ -236,7 +359,11 @@ async def test_unsolicited_scheduled_turn_is_forwarded_to_acp(tmp_path: Path) ->
             client_tool_handler=options.client_tool_handler,
         )
 
-    agent = VibeAcpAgent(session_starter=start_session)
+    agent = VibeAcpAgent(
+        session_starter=start_session,
+        experimental_harness=experimental_harness,
+        legacy_harness=not experimental_harness,
+    )
     client = FakeClient()
     agent.on_connect(client)
     client.on_connect(agent)
@@ -260,9 +387,9 @@ async def test_unsolicited_scheduled_turn_is_forwarded_to_acp(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_retries_are_forwarded_as_an_ext_notification_not_a_session_update() -> (
-    None
-):
+async def test_retries_are_forwarded_as_an_ext_notification_not_a_session_update(
+    experimental_harness: bool,
+) -> None:
     """Retrying is transient, so it must not enter the session update stream.
 
     Every SessionUpdate variant renders as chat content and lands in history; a
@@ -273,6 +400,7 @@ async def test_retries_are_forwarded_as_an_ext_notification_not_a_session_update
     )
 
     async def start_session(options: LocalHarnessOptions) -> AppServerSession:
+        assert options.experimental_harness is experimental_harness
         loop = build_test_agent_loop(backend=backend, enable_streaming=True)
         backend.on_retry = loop.notice_retry
         return await AppServerSession.start(
@@ -283,7 +411,11 @@ async def test_retries_are_forwarded_as_an_ext_notification_not_a_session_update
             client_tool_handler=options.client_tool_handler,
         )
 
-    agent = VibeAcpAgent(session_starter=start_session)
+    agent = VibeAcpAgent(
+        session_starter=start_session,
+        experimental_harness=experimental_harness,
+        legacy_harness=not experimental_harness,
+    )
     client = FakeClient()
     agent.on_connect(client)
     client.on_connect(agent)
@@ -347,6 +479,100 @@ async def test_retry_notification_reaches_the_wire_underscore_prefixed() -> None
         peer_writer.close()
 
 
+@pytest.mark.asyncio
+async def test_autonomous_profile_change_re_pushes_config_options(
+    experimental_harness: bool,
+) -> None:
+    """An autonomous profile switch (e.g. exit_plan_mode) patches the
+    session's `agent` and arrives as a SessionUpdated AppServerEvent. The mode
+    is otherwise only carried on the load/new session response, so external
+    ACP clients would keep showing the stale mode. The agent must re-push
+    config options so the client's mode selector (and model/thinking) reflects
+    the new profile.
+
+    The client state's active agent is flipped before the SessionUpdated is
+    forwarded (see AppServerSession._handle_notification), so the re-pushed
+    config must read the *new* mode, not the stale one.
+    """
+    agent, client = _agent(
+        FakeBackend([mock_llm_chunk(content="ok")]),
+        experimental_harness=experimental_harness,
+    )
+    try:
+        created = await agent.new_session(cwd=str(Path.cwd()), mcp_servers=[])
+        session = agent.sessions[created.session_id]
+        # Resolve two distinct primary agents the app server advertised.
+        agents = session.app_server.resources.agents.all
+        assert {a.name for a in agents} >= {"ask", "accept-edits"}
+        before = next(a for a in agents if a.name == "ask")
+        after = next(a for a in agents if a.name == "accept-edits")
+
+        previous_session = session.app_server.state.session.model_copy(
+            update={"agent": before}
+        )
+        current_session = session.app_server.state.session.model_copy(
+            update={"agent": after}
+        )
+        # Mimic _handle_notification flipping the active agent before the event
+        # is forwarded to ACP clients.
+        session.app_server._state.active_agent = after
+
+        client._session_updates.clear()
+        await agent._forward_event(
+            session,
+            SessionUpdated(
+                previous=previous_session, session=current_session, patch=[]
+            ),
+        )
+
+        config_updates = [
+            update
+            for update in (n.update for n in client._session_updates)
+            if isinstance(update, ConfigOptionUpdate)
+        ]
+        assert len(config_updates) == 1
+        mode_option = next(
+            option
+            for option in config_updates[0].config_options
+            if getattr(option, "category", None) == "mode"
+        )
+        assert mode_option.current_value == "accept-edits"
+    finally:
+        await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_unchanged_agent_does_not_re_push_config_options(
+    experimental_harness: bool,
+) -> None:
+    """A SessionUpdated that did not change the agent (e.g. a title patch) must
+    not re-push config options — that would spam the client on every session
+    mutation.
+    """
+    agent, client = _agent(
+        FakeBackend([mock_llm_chunk(content="ok")]),
+        experimental_harness=experimental_harness,
+    )
+    try:
+        created = await agent.new_session(cwd=str(Path.cwd()), mcp_servers=[])
+        session = agent.sessions[created.session_id]
+        current = session.app_server.state.session
+
+        client._session_updates.clear()
+        await agent._forward_event(
+            session, SessionUpdated(previous=current, session=current, patch=[])
+        )
+
+        config_updates = [
+            update
+            for update in (n.update for n in client._session_updates)
+            if isinstance(update, ConfigOptionUpdate)
+        ]
+        assert config_updates == []
+    finally:
+        await agent.close()
+
+
 def test_acp_runtime_adapter_has_no_direct_core_dependency() -> None:
     root = Path(__file__).parents[2] / "vibe" / "acp"
     runtime_files = [
@@ -363,9 +589,9 @@ def test_acp_runtime_adapter_has_no_direct_core_dependency() -> None:
 
 @pytest.mark.asyncio
 async def test_response_too_long_returns_max_tokens_stop_reason(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, experimental_harness: bool
 ) -> None:
-    agent, _ = _agent(FakeBackend())
+    agent, _ = _agent(FakeBackend(), experimental_harness=experimental_harness)
     try:
         created = await agent.new_session(cwd=str(Path.cwd()), mcp_servers=[])
         session = agent.sessions[created.session_id]
@@ -394,8 +620,10 @@ async def test_response_too_long_returns_max_tokens_stop_reason(
 
 
 @pytest.mark.asyncio
-async def test_conversation_limit_returns_max_turn_requests_stop_reason() -> None:
-    agent, _ = _agent(FakeBackend())
+async def test_conversation_limit_returns_max_turn_requests_stop_reason(
+    experimental_harness: bool,
+) -> None:
+    agent, _ = _agent(FakeBackend(), experimental_harness=experimental_harness)
     try:
         created = await agent.new_session(cwd=str(Path.cwd()), mcp_servers=[])
         await agent.set_config_option("max_turns", created.session_id, "0")
@@ -412,7 +640,7 @@ async def test_conversation_limit_returns_max_turn_requests_stop_reason() -> Non
 
 @pytest.mark.asyncio
 async def test_acp_host_filesystem_flows_through_the_app_server(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, experimental_harness: bool
 ) -> None:
     file_path = Path.cwd() / "host.txt"
     file_path.touch()
@@ -427,7 +655,8 @@ async def test_acp_host_filesystem_flows_through_the_app_server(
         FakeBackend([
             [mock_llm_chunk(content="", tool_calls=[tool_call])],
             [mock_llm_chunk(content="done")],
-        ])
+        ]),
+        experimental_harness=experimental_harness,
     )
     read_text_file = AsyncMock(
         return_value=ReadTextFileResponse(content="from the ACP host")
@@ -458,7 +687,7 @@ async def test_acp_host_filesystem_flows_through_the_app_server(
 
 @pytest.mark.asyncio
 async def test_acp_host_write_only_filesystem_flows_through_the_app_server(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, experimental_harness: bool
 ) -> None:
     file_path = Path.cwd() / "host-write.txt"
     tool_call = ToolCall(
@@ -473,7 +702,8 @@ async def test_acp_host_write_only_filesystem_flows_through_the_app_server(
         FakeBackend([
             [mock_llm_chunk(content="", tool_calls=[tool_call])],
             [mock_llm_chunk(content="done")],
-        ])
+        ]),
+        experimental_harness=experimental_harness,
     )
     write_text_file = AsyncMock()
     monkeypatch.setattr(client, "write_text_file", write_text_file)
@@ -510,7 +740,7 @@ async def test_acp_host_write_only_filesystem_flows_through_the_app_server(
 
 @pytest.mark.asyncio
 async def test_acp_terminal_timeout_can_kill_while_wait_request_is_open(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, experimental_harness: bool
 ) -> None:
     tool_call = ToolCall(
         id="shell-1",
@@ -523,7 +753,8 @@ async def test_acp_terminal_timeout_can_kill_while_wait_request_is_open(
         FakeBackend([
             [mock_llm_chunk(content="", tool_calls=[tool_call])],
             [mock_llm_chunk(content="done")],
-        ])
+        ]),
+        experimental_harness=experimental_harness,
     )
     wait_started = asyncio.Event()
 

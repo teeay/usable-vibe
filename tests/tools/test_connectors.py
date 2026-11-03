@@ -5,6 +5,8 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from mcp.shared.exceptions import McpError
+from mcp.types import ErrorData
 import pytest
 import respx
 
@@ -23,9 +25,11 @@ from vibe.core.tools.connectors.connector_registry import (
     ConnectorAuthAction,
     ConnectorRegistry,
     RemoteTool,
+    _bootstrap_cache_key,
     _connector_error_message,
     _normalize_name,
     _unwrap_http_status_error,
+    builtin_connectors,
     create_connector_proxy_tool_class,
 )
 from vibe.core.tools.manager import ToolManager
@@ -255,6 +259,18 @@ class TestConnectorErrorMessage:
         msg = _connector_error_message(exc, "id-1", "myconn")
         assert "400" in msg
         assert "bad request detail" in msg
+
+    def test_nested_session_terminated_surfaces_gateway_404(self) -> None:
+        leaf = McpError(ErrorData(code=32600, message="Session terminated"))
+        exc = ExceptionGroup("g", [ExceptionGroup("g", [leaf])])
+        msg = _connector_error_message(exc, "id-1", "myconn")
+        assert "HTTP 404" in msg
+
+    def test_nested_connect_error_keeps_ssl_detail(self) -> None:
+        leaf = httpx.ConnectError("CERTIFICATE_VERIFY_FAILED")
+        exc = ExceptionGroup("g", [ExceptionGroup("g", [leaf])])
+        msg = _connector_error_message(exc, "id-1", "myconn")
+        assert "CERTIFICATE_VERIFY_FAILED" in msg
 
 
 class TestUnwrapHttpStatusError:
@@ -493,6 +509,7 @@ def _make_connector_payload(
     *,
     connector_id: str = "conn-1",
     name: str = "wiki",
+    protocol: str = "mcp",
     is_ready: bool = True,
     tools: list[dict[str, Any]] | None = None,
     bootstrap_errors: list[str] | None = None,
@@ -501,6 +518,7 @@ def _make_connector_payload(
     return {
         "id": connector_id,
         "name": name,
+        "protocol": protocol,
         "display_name": name,
         "description": name,
         "status": {"is_ready": is_ready},
@@ -558,6 +576,26 @@ class TestBootstrapDiscovery:
         assert not any("broken" in name for name in tools)
         assert not registry.is_connected("broken")
         assert registry.is_connected("healthy")
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_trusts_server_capability_filter(self) -> None:
+        payload = _make_bootstrap_response([
+            _make_connector_payload(
+                name="shared", protocol="http", tools=[_make_tool_payload("request")]
+            ),
+            _make_connector_payload(
+                name="shared", tools=[_make_tool_payload("search")]
+            ),
+        ])
+        respx.get(_BOOTSTRAP_URL).mock(return_value=httpx.Response(200, json=payload))
+
+        registry = ConnectorRegistry(api_key="test-key")
+        tools = await registry.get_tools_async()
+
+        assert "connector_shared_request" in tools
+        assert "connector_shared_2_search" in tools
+        assert registry.get_connector_names() == ["shared", "shared_2"]
 
     @respx.mock
     @pytest.mark.asyncio
@@ -715,6 +753,40 @@ class TestBootstrapDiscovery:
         assert not route.called
 
     @pytest.mark.asyncio
+    async def test_bootstrap_cache_without_protocol_uses_legacy_mcp(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("VIBE_HOME", str(tmp_path))
+        cached_payload = _make_bootstrap_response([
+            _make_connector_payload(tools=[_make_tool_payload("cached")])
+        ])
+        with (
+            patch.object(connector_registry_module.time, "time", return_value=1_000),
+            respx.mock,
+        ):
+            respx.get(_BOOTSTRAP_URL).mock(
+                return_value=httpx.Response(200, json=cached_payload)
+            )
+            await ConnectorRegistry(api_key="test-key").get_tools_async()
+
+        cache_path = tmp_path / _BOOTSTRAP_CACHE_FILE_NAME
+        cache = json.loads(cache_path.read_text())
+        next(iter(cache.values()))["payload"]["connectors"][0].pop("protocol")
+        cache_path.write_text(json.dumps(cache))
+
+        with (
+            patch.object(connector_registry_module.time, "time", return_value=1_100),
+            respx.mock,
+        ):
+            route = respx.get(_BOOTSTRAP_URL).mock(
+                return_value=httpx.Response(500, text="should not be called")
+            )
+            tools = await ConnectorRegistry(api_key="test-key").get_tools_async()
+
+        assert not route.called
+        assert "connector_wiki_cached" in tools
+
+    @pytest.mark.asyncio
     async def test_stale_bootstrap_cache_falls_back_to_http(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
@@ -862,6 +934,7 @@ class TestBootstrapDiscovery:
         assert set(connector) == {
             "id",
             "name",
+            "protocol",
             "status",
             "tools",
             "auth_action",
@@ -1118,12 +1191,60 @@ class TestAuthActionablediscovery:
             return_value=httpx.Response(200, json=payload)
         )
 
-        registry = ConnectorRegistry(api_key="test-key")
+        registry = ConnectorRegistry(
+            api_key="test-key",
+            builtins=builtin_connectors(enable_document_library_connector=True),
+        )
         await registry.get_tools_async()
 
         assert route.called
         called_url = str(route.calls.last.request.url)
         assert "include_auth_actionable_connectors=true" in called_url
+        # Repeated query param, not a comma-joined value.
+        assert "builtin_connectors=web_search" in called_url
+        assert "builtin_connectors=document_library" in called_url
+        assert "web_search%2Cdocument_library" not in called_url
+        assert "supports_mcp=true" in called_url
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_document_library_withheld_when_connector_disabled(self) -> None:
+        payload = _make_bootstrap_response([])
+        route = respx.get(_BOOTSTRAP_URL).mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+
+        registry = ConnectorRegistry(
+            api_key="test-key",
+            builtins=builtin_connectors(enable_document_library_connector=False),
+        )
+        await registry.get_tools_async()
+
+        assert route.called
+        called_url = str(route.calls.last.request.url)
+        assert "builtin_connectors=web_search" in called_url
+        assert "builtin_connectors=document_library" not in called_url
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_clone_configuration_preserves_builtins(self) -> None:
+        payload = _make_bootstrap_response([])
+        route = respx.get(_BOOTSTRAP_URL).mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+
+        registry = ConnectorRegistry(
+            api_key="test-key",
+            builtins=builtin_connectors(enable_document_library_connector=True),
+        )
+        # The clone must keep the opted-in builtins; otherwise a cloned registry
+        # would silently re-hide (or re-expose) document_library.
+        await registry.clone_configuration().get_tools_async()
+
+        assert route.called
+        called_url = str(route.calls.last.request.url)
+        assert "builtin_connectors=web_search" in called_url
+        assert "builtin_connectors=document_library" in called_url
 
     @respx.mock
     @pytest.mark.asyncio
@@ -1363,6 +1484,32 @@ class TestAuthActionablediscovery:
         assert "linear" in registry.get_connector_names()
         assert registry.get_auth_action("linear") == ConnectorAuthAction.OAUTH
         assert registry.get_connector_id("linear") == "c-1"
+
+
+def test_builtin_connectors_gates_document_library() -> None:
+    assert builtin_connectors(enable_document_library_connector=False) == (
+        "web_search",
+    )
+    assert builtin_connectors(enable_document_library_connector=True) == (
+        "web_search",
+        "document_library",
+    )
+
+
+def test_bootstrap_cache_key_folds_builtins() -> None:
+    # Different builtins must produce different cache keys so the two flag states
+    # never read each other's cached catalog from disk.
+    disabled = _bootstrap_cache_key(
+        "test-key", None, builtin_connectors(enable_document_library_connector=False)
+    )
+    enabled = _bootstrap_cache_key(
+        "test-key", None, builtin_connectors(enable_document_library_connector=True)
+    )
+    assert disabled != enabled
+    # Same builtins -> stable, reproducible key.
+    assert disabled == _bootstrap_cache_key(
+        "test-key", None, builtin_connectors(enable_document_library_connector=False)
+    )
 
 
 # ---------------------------------------------------------------------------

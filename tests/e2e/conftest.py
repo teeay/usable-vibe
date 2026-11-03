@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
+import importlib.util
 import io
 import os
 from pathlib import Path
+import sys
 from typing import cast
 
 import pexpect
@@ -13,6 +15,18 @@ import pytest
 from tests import TESTS_ROOT
 from tests.e2e.common import write_e2e_config
 from tests.e2e.mock_server import ChunkFactory, StreamingMockServer
+
+
+def restore_editable_native() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "vibe_combined_maturin_backend",
+        TESTS_ROOT.parent / "build_backend/maturin_backend.py",
+    )
+    if spec is None or spec.loader is None:
+        return
+    backend = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(backend)
+    backend.restore_editable_runtime_if_stripped()
 
 
 @pytest.fixture
@@ -41,6 +55,7 @@ def setup_e2e_env(
     monkeypatch.setenv("VIBE_HOME", str(vibe_home))
     monkeypatch.setenv("VIBE_TEST_DISABLE_KEYRING", "1")
     monkeypatch.setenv("VIBE_TEST_DISABLE_AUTO_TITLE", "1")
+    monkeypatch.setenv("VIBE_TEST_DISABLE_MODEL_PROBE", "1")
     monkeypatch.setenv("UVIBE_HOME", str(uvibe_home))
     monkeypatch.setenv("TERM", "xterm-256color")
 
@@ -62,7 +77,15 @@ type SpawnedVibeFactory = Callable[
 
 
 @pytest.fixture
-def spawned_vibe_process() -> SpawnedVibeFactory:
+def spawned_vibe_process(request: pytest.FixtureRequest) -> SpawnedVibeFactory:
+    pytest.importorskip("pty")
+    # Tests marked unified_default characterize the unflagged binary — the
+    # hard-default Unified Harness runtime — and spawn without any harness
+    # flag; the rest of this suite still characterizes the legacy runtime.
+    spawns_unified_default = (
+        request.node.get_closest_marker("unified_default") is not None
+    )
+
     @contextmanager
     def spawn(
         workdir: Path, extra_args: Sequence[str] | None = None
@@ -71,9 +94,33 @@ def spawned_vibe_process() -> SpawnedVibeFactory:
         env = os.environ.copy()
         env["VIBE_TEST_DISABLE_KEYRING"] = "1"
         env["VIBE_TEST_DISABLE_AUTO_TITLE"] = "1"
+        env["VIBE_TEST_DISABLE_MODEL_PROBE"] = "1"
+        arguments = ["--workdir", str(workdir), *(extra_args or [])]
+        if spawns_unified_default and any(
+            flag in arguments for flag in ("--experimental-harness", "--legacy-harness")
+        ):
+            # A unified_default test passing a harness flag would silently take
+            # the flag lane below and stop exercising the unflagged default —
+            # fail loudly instead of quietly losing the coverage.
+            raise ValueError(
+                "unified_default tests must not pass harness-selection flags: "
+                f"{arguments}"
+            )
+        restore_editable_native()
+        executable = "uv"
+        if "--experimental-harness" in arguments:
+            executable = str(Path(sys.executable).with_name("uvibe"))
+        elif spawns_unified_default:
+            arguments = ["run", "uvibe", *arguments]
+        else:
+            # This suite still characterizes the legacy runtime, while the
+            # unflagged default is the Unified Harness since VIBE-4903.
+            # VIBE-4712 migrates these spawns to the unified default and
+            # closes the gaps that migration surfaces.
+            arguments = ["run", "uvibe", "--legacy-harness", *arguments]
         child = pexpect.spawn(
-            "uv",
-            ["run", "uvibe", "--workdir", str(workdir), *(extra_args or [])],
+            executable,
+            arguments,
             cwd=str(TESTS_ROOT.parent),
             env=cast("os._Environ[str]", env),
             encoding="utf-8",

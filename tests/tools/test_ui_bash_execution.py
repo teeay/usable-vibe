@@ -9,19 +9,17 @@ from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from vibe.cli.textual_ui.app import VibeApp
 from vibe.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
-from vibe.cli.textual_ui.widgets.messages import BashOutputMessage, ErrorMessage
+from vibe.cli.textual_ui.widgets.messages import ErrorMessage
 from vibe.core.types import Role
 
 
 async def _wait_for_bash_commit(vibe_app: VibeApp, pilot, timeout: float = 2.0) -> str:
-    # Native mode: the live BashOutputMessage streams while running, then on
-    # finish its durable result commits to scrollback and the live widget is
-    # removed. Wait for that finalization and return the committed transcript.
+    # Native mode: only the loading widget is live while running, then on
+    # finish the durable result commits to scrollback. Wait for that
+    # finalization and return the committed transcript.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        finished = vibe_app._bash_task is None and not list(
-            vibe_app.query(BashOutputMessage)
-        )
+        finished = vibe_app._bash_task is None
         if finished and vibe_app._committer is not None:
             return "\n".join(vibe_app._committer.drain_lines())
         await pilot.pause(0.05)
@@ -199,10 +197,10 @@ async def test_ui_streams_output_incrementally(vibe_app: VibeApp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ui_queues_bash_submitted_while_command_running(
+async def test_ui_rejects_bash_submitted_while_command_running(
     vibe_app: VibeApp,
 ) -> None:
-    """Submitting new bash while a bang command is running should queue, not cancel."""
+    """Submitting new bash while a bang command is running preserves the input."""
     async with vibe_app.run_test() as pilot:
         chat_input = vibe_app.query_one(ChatInputContainer)
         chat_input.value = "!sleep 0.5"
@@ -219,14 +217,16 @@ async def test_ui_queues_bash_submitted_while_command_running(
         chat_input.value = "!echo done"
         await pilot.press("enter")
 
-        # The second command should be queued, not cancelled
-        assert len(vibe_app._input_queue) == 1
+        assert chat_input.value == "!echo done"
+        assert not vibe_app._queue
+        assert any(
+            "cannot be queued while a shell command is running" in notification.message
+            for notification in vibe_app._notifications
+        )
 
-        # Wait for both to complete (first runs, drain runs second). Both commit
-        # durable blocks to scrollback and their live widgets are removed.
+        # The rejected second command never runs: only the first commits a
+        # durable block to scrollback, and the queue stays empty.
         text = await _wait_for_bash_commit(vibe_app, pilot, timeout=5.0)
-        assert len(vibe_app._input_queue) == 0
+        assert len(vibe_app._queue) == 0
         assert "$ sleep 0.5" in text
-        assert "$ echo done" in text
-        assert text.index("$ sleep 0.5") < text.index("$ echo done")
-        assert "done" in text
+        assert "$ echo done" not in text

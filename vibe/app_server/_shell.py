@@ -5,7 +5,9 @@ import codecs
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from vibe.app_server._dispatch import RequestFailure
 from vibe.app_server.models import (
+    MANUAL_SHELL_TOOL_NAME,
     CancelledEffectState,
     CompletedEffectState,
     EffectCallDisplay,
@@ -17,21 +19,88 @@ from vibe.app_server.models import (
     ShellEffectDetail,
     ShellEffectInput,
 )
-from vibe.app_server.protocol import ShellRunParams, ShellRunResponse
+from vibe.app_server.protocol import ProtocolErrorCode, ShellRunParams, ShellRunResponse
+from vibe.core.config import VibeConfigSchema
 from vibe.core.types import ManualShellContext
 from vibe.core.utils import kill_async_subprocess
 from vibe.core.utils.shell import spawn_shell_command
 
 type ShellOutputObserver = Callable[[str], Awaitable[None]]
+type ShellStartObserver = Callable[[], Awaitable[None]]
+
+DEFAULT_MAX_OUTPUT_BYTES = 16_000
 
 
 class ShellConflictError(RuntimeError):
     pass
 
 
+def manual_shell_output_limit(config: VibeConfigSchema) -> int:
+    """How much of a manual `!` command's output the model may see.
+
+    The legacy backend reads the resolved ``bash`` tool config off its
+    ``AgentLoop``; the Unified Harness has no such loop, so it reads the same
+    setting straight off the layered config.
+    """
+    raw = config.tools.get("bash") or {}
+    limit = raw.get("max_output_bytes")
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        return limit
+    return DEFAULT_MAX_OUTPUT_BYTES
+
+
+def resolve_workspace_cwd(root: Path, requested_cwd: str | None) -> str:
+    """Confine a manual `!` command to the workspace it was launched in."""
+    root = root.resolve()
+    cwd = Path(requested_cwd).expanduser().resolve() if requested_cwd else root
+    if not cwd.is_dir():
+        raise RequestFailure(
+            ProtocolErrorCode.INVALID_PARAMS,
+            f"Shell working directory does not exist: {cwd}",
+        )
+    try:
+        cwd.relative_to(root)
+    except ValueError as exc:
+        raise RequestFailure(
+            ProtocolErrorCode.FORBIDDEN,
+            f"Shell working directory is outside the workspace: {cwd}",
+        ) from exc
+    return str(cwd)
+
+
+def manual_shell_context(result: ShellRunResponse, *, max_output_bytes: int) -> str:
+    """The context block the model reads after the user runs `!<command>`."""
+    stdout = _cap_output(result.stdout, max_output_bytes)
+    stderr = _cap_output(result.stderr, max_output_bytes)
+    sections = [
+        "Manual `!` command result from the user. Use this as context only.",
+        f"Command: `{result.command}`",
+        f"Working directory: `{result.cwd}`",
+    ]
+    if result.timed_out:
+        sections.append("Status: timed out")
+    elif result.interrupted:
+        sections.append("Status: interrupted by user")
+    else:
+        sections.append(f"Exit code: {result.exit_code}")
+    if stdout:
+        sections.append(f"Stdout:\n```text\n{stdout.rstrip()}\n```")
+    if stderr:
+        sections.append(f"Stderr:\n```text\n{stderr.rstrip()}\n```")
+    if not stdout and not stderr:
+        sections.append("Output:\n```text\n(no output)\n```")
+    return "\n\n".join(sections)
+
+
+def _cap_output(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n... [truncated]"
+
+
 def shell_effect_detail(command: str) -> EffectDetail:
     return ShellEffectDetail(
-        tool_name="shell",
+        tool_name=MANUAL_SHELL_TOOL_NAME,
         input=ShellEffectInput(command=command),
         display=EffectCallDisplay(
             summary=f"shell: {command}",
@@ -122,6 +191,44 @@ def restored_shell_effect_state(context: ManualShellContext) -> EffectState:
     )
 
 
+def capped_shell_effect_state(state: EffectState, limit: int) -> EffectState:
+    """Bound every output field of a terminal shell effect state.
+
+    A durable record must never hold more output than the model itself was
+    shown, so each field is capped with the same truncation marker the
+    model-visible text uses and the structured output reports that it was
+    truncated. States that were already within the limit come back unchanged.
+    """
+    if not isinstance(
+        state, CompletedEffectState | FailedEffectState | CancelledEffectState
+    ):
+        # Only terminal shell states carry output; a non-terminal state has
+        # nothing a durable record needs to bound.
+        return state
+    output_text = _cap_output(state.output_text, limit)
+    if isinstance(state, CompletedEffectState | FailedEffectState):
+        output = state.output
+        if isinstance(output, dict):
+            capped_output = {
+                key: _cap_output(value, limit) if isinstance(value, str) else value
+                for key, value in output.items()
+            }
+            truncated = output_text != state.output_text or capped_output != output
+        else:
+            capped_output = output
+            truncated = output_text != state.output_text
+        if not truncated:
+            return state
+        if isinstance(capped_output, dict):
+            capped_output = {**capped_output, "truncated": True}
+        return state.model_copy(
+            update={"output": capped_output, "output_text": output_text}
+        )
+    if output_text == state.output_text:
+        return state
+    return state.model_copy(update={"output_text": output_text})
+
+
 class ShellController:
     def __init__(self, cwd: Path) -> None:
         self._cwd = cwd
@@ -130,7 +237,10 @@ class ShellController:
         self._interrupted: set[str] = set()
 
     async def run(
-        self, params: ShellRunParams, observe_output: ShellOutputObserver | None = None
+        self,
+        params: ShellRunParams,
+        observe_output: ShellOutputObserver | None = None,
+        observe_start: ShellStartObserver | None = None,
     ) -> ShellRunResponse:
         if params.operation_id in self._operations:
             raise ShellConflictError(
@@ -146,6 +256,8 @@ class ShellController:
         timed_out = False
         interrupted = False
         try:
+            if observe_start is not None:
+                await observe_start()
             process = await spawn_shell_command(params.command, cwd=cwd)
             self._processes[params.operation_id] = process
             readers = [
@@ -194,6 +306,9 @@ class ShellController:
             timed_out=timed_out,
             interrupted=interrupted,
         )
+
+    def is_running(self, operation_id: str) -> bool:
+        return operation_id in self._operations
 
     async def interrupt(self, operation_id: str) -> bool:
         if operation_id not in self._operations:

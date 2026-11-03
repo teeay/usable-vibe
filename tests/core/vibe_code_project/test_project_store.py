@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import stat
 import tomllib
 
+import pytest
 import tomli_w
 
-from vibe.core.vibe_code_project import VibeCodeProjectLink, VibeProjectsStore
+from vibe.core.vibe_code_project import (
+    LocalProjectLink,
+    RemoteProjectLink,
+    VibeProjectsStore,
+)
 
 
 def _link(
@@ -13,10 +20,20 @@ def _link(
     repo_root: Path,
     project_id: str = "project-1",
     repo_url: str = "https://github.com/mistralai/mistral-vibe.git",
-) -> VibeCodeProjectLink:
-    return VibeCodeProjectLink(
+) -> RemoteProjectLink:
+    return RemoteProjectLink(
         repo_root=repo_root,
         repo_url=repo_url,
+        project_id=project_id,
+        project_name="Mistral Vibe",
+    )
+
+
+def _local_link(
+    *, directory_path: Path, project_id: str = "project-1"
+) -> LocalProjectLink:
+    return LocalProjectLink(
+        directory_path=directory_path,
         project_id=project_id,
         project_name="Mistral Vibe",
     )
@@ -44,6 +61,59 @@ def test_projects_store_upserts_and_reads_remote_project(tmp_path: Path) -> None
                 "kind": "remote",
                 "repo_root": str(repo_root.resolve()),
                 "repo_url": "https://github.com/mistralai/mistral-vibe.git",
+                "project_id": "project-1",
+                "project_name": "Mistral Vibe",
+            }
+        ],
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_projects_store_creates_owner_only_registry(tmp_path: Path) -> None:
+    """The project registry names every local project, so it lands owner-only."""
+    path = tmp_path / "projects.toml"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    store = VibeProjectsStore(path)
+
+    store.upsert_remote_project(_link(repo_root=repo_root))
+
+    assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_projects_store_keeps_existing_file_mode(tmp_path: Path) -> None:
+    path = tmp_path / "projects.toml"
+    path.write_text("version = 1\nprojects = []\n", encoding="utf-8")
+    path.chmod(0o644)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    store = VibeProjectsStore(path)
+
+    store.upsert_remote_project(_link(repo_root=repo_root))
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_projects_store_upserts_and_reads_local_project(tmp_path: Path) -> None:
+    path = tmp_path / "projects.toml"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    store = VibeProjectsStore(path)
+
+    store.upsert_remote_project(_link(repo_root=repo_root, project_id="remote"))
+    store.upsert_project_link(_local_link(directory_path=repo_root))
+
+    assert store.get_project_link(repo_root=repo_root) == _local_link(
+        directory_path=repo_root
+    )
+    assert store.get_remote_project(repo_root=repo_root) is None
+    assert _read_toml(path) == {
+        "version": 1,
+        "projects": [
+            {
+                "kind": "local",
+                "directory_path": str(repo_root.resolve()),
                 "project_id": "project-1",
                 "project_name": "Mistral Vibe",
             }

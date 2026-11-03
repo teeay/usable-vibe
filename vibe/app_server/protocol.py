@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from enum import StrEnum, auto
-from typing import Annotated, Any, Literal
+from functools import cache
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     Field,
@@ -9,6 +12,7 @@ from pydantic import (
     StrictInt,
     StrictStr,
     TypeAdapter,
+    field_validator,
     model_validator,
 )
 
@@ -46,22 +50,41 @@ from vibe.app_server.models import (
     JsonPatchOperation,
     MCPState,
     MentionStats,
+    MessageAnnotations as MessageAnnotations,
+    PluginCatalogComponent as PluginCatalogComponent,
+    PluginCatalogDropped as PluginCatalogDropped,
+    PluginCatalogEntry as PluginCatalogEntry,
+    PluginCatalogState,
     PluginComponent as PluginComponent,
     PluginComponentKind as PluginComponentKind,
     PluginInfo,
     PreparedPrompt,
     PublicCallbackEntry,
+    PublicChildSession,
     PublicError,
     PublicHistoryEntry,
     PublicRetryCategory,
     PublicSession,
     PublicSessionState,
     PublicTurn,
+    PublicTurnQueue,
     ScheduledLoop,
+    SessionContentBlock,
+    SessionEmbeddedResourceContentBlock as SessionEmbeddedResourceContentBlock,
+    SessionImageContentBlock as SessionImageContentBlock,
     SessionLogSummary,
+    SessionResourceLinkContentBlock as SessionResourceLinkContentBlock,
+    SessionTextContentBlock as SessionTextContentBlock,
+    SkillCatalogEntry,
+    SkillDetailView,
     SkillSummary,
+    SkillUpdateView,
+    SkillVersionView,
     TeleportEvent,
     ToolSummary,
+    TurnContextInputEntry as TurnContextInputEntry,
+    TurnInputEntry,
+    TurnUserInputEntry,
     UserDisplayContent,
     VibeCodePickerPurpose,
     VibeCodePickerView,
@@ -69,7 +92,9 @@ from vibe.app_server.models import (
     WorkspaceTrustDecision,
     WorkspaceTrustDetails,
     WorkspaceTrustStatus,
+    validate_turn_input_entries,
 )
+from vibe.app_server.provider_auth import ProviderAuthView
 from vibe.app_server.review import (
     ReviewFile,
     ReviewFileStatus,
@@ -86,9 +111,11 @@ SERVER_METHODS: tuple[str, ...] = (
     "agents/list",
     "agents/uninstall",
     "callback/result",
+    "config/effective/read",
     "config/fields/read",
     "config/proxy/read",
     "config/proxy/write",
+    "config/model/write",
     "config/read",
     "config/reload",
     "config/schema",
@@ -127,6 +154,9 @@ SERVER_METHODS: tuple[str, ...] = (
     "narration/summarize",
     "plugin/info",
     "plugin/reload",
+    "plugins/read",
+    "plugin_catalog/read",
+    "providerAuth/read",
     "projectLinks/create",
     "projectLinks/inspectRoot",
     "projectLinks/link",
@@ -144,6 +174,8 @@ SERVER_METHODS: tuple[str, ...] = (
     "review/turnDiff",
     "runtime/read",
     "session/agent/update",
+    "session/backgroundProcess/output",
+    "session/backgroundProcess/stop",
     "session/compact",
     "session/continue",
     "session/context/inject",
@@ -151,8 +183,12 @@ SERVER_METHODS: tuple[str, ...] = (
     "session/fork",
     "session/history/clear",
     "session/history/list",
+    "session/lease/subscribe",
     "session/list",
     "session/log/read",
+    "session/markAsSeen",
+    "session/pin",
+    "session/archive",
     "session/read",
     "session/ready/read",
     "session/ready/wait",
@@ -165,11 +201,35 @@ SERVER_METHODS: tuple[str, ...] = (
     "session/shellCommand",
     "session/start",
     "session/stop",
+    "session/title/update",
     "session/turns/list",
+    "setup/status",
+    "setup/store-credential",
+    "setup/submit-choices",
+    "shell/interrupt",
+    "shell/run",
+    "skills/catalog",
+    "skills/convertLocal",
+    "skills/detail",
+    "skills/import",
+    "skills/installed",
     "skills/list",
+    "skills/remove",
+    "skills/setAlias",
+    "skills/setEnabled",
+    "skills/setLatest",
+    "skills/setVersion",
+    "skills/updates",
+    "skills/versions",
     "stats/read",
     "telemetry/record",
     "tools/list",
+    "session/turn/enqueue",
+    "session/turn/queue/read",
+    "session/turn/queue/remove",
+    "session/turn/queue/replace",
+    "session/turn/queue/steer",
+    "session/turn/queue/resume",
     "turn/interrupt",
     "turn/start",
     "turn/steer",
@@ -184,7 +244,11 @@ SERVER_METHODS: tuple[str, ...] = (
     "vibeCode/teleport/push/respond",
     "vibeCode/teleport/start",
     "workspace/git/checkouts",
+    "workspace/git/worktrees/limit/update",
     "workspace/git/worktrees/list",
+    "workspace/git/worktrees/prune",
+    "workspace/git/worktrees/reap",
+    "workspace/git/worktrees/reap/cancel",
     "workspace/git/worktrees/remove",
     "workspace/prompt/prepare",
     "workspace/trust/decision",
@@ -310,6 +374,16 @@ class AgentConfig(ProtocolModel):
     trust_workspace: bool = False
     mcp_servers: list[SessionMCPServer] = Field(default_factory=list)
 
+    @field_validator("cwd", "workdir")
+    @classmethod
+    def _reject_empty_cwd(cls, value: str | None) -> str | None:
+        # An empty cwd would silently resolve to the server process cwd,
+        # making a directory the caller never named trustable. A client
+        # that wants the default omits the field instead.
+        if value == "":
+            raise ValueError("Session cwd must not be empty")
+        return value
+
 
 SessionOptions = AgentConfig
 
@@ -369,8 +443,26 @@ class SessionReadParams(ProtocolModel):
         return self.turns.limit if self.turns is not None else 1
 
 
+class SessionLeaseHolder(ProtocolModel):
+    process_id: int | None = None
+
+
 class SessionReadResponse(EventWatermarkResponse):
     state: PublicSessionState
+    lease_holder: SessionLeaseHolder | None = None
+
+
+class SessionLeaseUpdate(ProtocolModel):
+    session_id: str
+    lease_holder: SessionLeaseHolder | None = None
+
+
+class SessionLeaseSubscribeResponse(ProtocolModel):
+    held: list[SessionLeaseUpdate]
+
+
+class SessionLeaseEnded(ProtocolModel):
+    pass
 
 
 class SessionResumeParams(SessionOpenParams):
@@ -427,6 +519,12 @@ class SessionListParams(ProtocolModel):
     root_session_id: str | None = None
     parent_session_id: str | None = None
     cwd: str | None = None
+    # Union of `cwd` matching over several checkouts.
+    cwds: list[str] | None = None
+    # ``True`` keeps only pinned sessions, ``False`` only unpinned ones, and
+    # ``None`` asks for both.
+    pinned: bool | None = None
+    include_archived: bool = False
 
 
 class SessionListResponse(ProtocolModel):
@@ -447,6 +545,15 @@ class SessionDeleteParams(ProtocolModel):
     session_id: str
 
 
+class SessionArchiveParams(ProtocolModel):
+    session_id: str
+    archived: bool
+
+
+class SessionArchiveResponse(ProtocolModel):
+    archived_at: int | None = None
+
+
 class SessionTitleUpdateParams(ProtocolModel):
     session_id: str
     title: str
@@ -456,6 +563,22 @@ class SessionTitleUpdateResponse(ProtocolModel):
     title: str
     updated_at: str | None = None
     last_event_id: int | None = None
+
+
+class SessionPinParams(ProtocolModel):
+    session_id: str
+    pinned: bool
+
+
+class SessionPinResponse(ProtocolModel):
+    # Absent while the session is unpinned, so the response says both whether
+    # the session is pinned and, when it is, how it should sort against the
+    # rest of the shelf.
+    pinned_at: int | None = None
+
+
+class SessionMarkAsSeenParams(ProtocolModel):
+    session_id: str
 
 
 class SessionHistoryListParams(ProtocolModel):
@@ -552,6 +675,62 @@ class SessionShellCommandResponse(ProtocolModel):
     last_event_id: int
 
 
+class BackgroundProcessStopParams(ProtocolModel):
+    session_id: str
+    process_id: str
+
+
+class BackgroundProcessStopResponse(ProtocolModel):
+    process_id: str
+    status: Literal["running", "completed", "failed", "stopped", "orphaned"]
+    exit_code: int | None = None
+
+
+class BackgroundProcessOutputParams(ProtocolModel):
+    session_id: str
+    process_id: str
+    from_end: bool
+    cursor: int = Field(ge=0, strict=True)
+    wait_ms: int = Field(ge=0, le=5_000, strict=True)
+    max_bytes: int = Field(ge=1, le=64_000, strict=True)
+
+
+class BackgroundProcessOutputAvailableResponse(ProtocolModel):
+    availability: Literal["available"] = "available"
+    process_id: str
+    output_base64: str
+    output_start_cursor: int = Field(ge=0, strict=True)
+    next_cursor: int = Field(ge=0, strict=True)
+    bytes_available: int = Field(ge=0, strict=True)
+    has_more: bool
+    truncated_before: bool
+    is_final: bool
+
+    @model_validator(mode="after")
+    def validate_cursor_range(self) -> Self:
+        if not (self.output_start_cursor <= self.next_cursor <= self.bytes_available):
+            raise ValueError("process output cursors are not ordered")
+        try:
+            output = base64.b64decode(self.output_base64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("process output is not valid base64") from error
+        if len(output) > self.next_cursor - self.output_start_cursor:
+            raise ValueError("process output bytes exceed its cursor range")
+        return self
+
+
+class BackgroundProcessOutputUnavailableResponse(ProtocolModel):
+    availability: Literal["unavailable"] = "unavailable"
+    process_id: str
+
+
+BackgroundProcessOutputResponse = Annotated[
+    BackgroundProcessOutputAvailableResponse
+    | BackgroundProcessOutputUnavailableResponse,
+    Field(discriminator="availability"),
+]
+
+
 class SessionReadyWaitParams(ProtocolModel):
     session_id: str
 
@@ -583,6 +762,14 @@ class IdentityReadParams(ProtocolModel):
 
 class IdentityReadResponse(ProtocolModel):
     identity: IdentityView | None = None
+
+
+class ProviderAuthReadParams(ProtocolModel):
+    session_id: str
+
+
+class ProviderAuthReadResponse(ProtocolModel):
+    auth: ProviderAuthView
 
 
 class SessionRewindReadParams(ProtocolModel):
@@ -692,7 +879,7 @@ class ConfigProxyWriteParams(ProtocolModel):
 
 
 class AgentsListParams(ProtocolModel):
-    session_id: str
+    session_id: str | None = None
 
 
 class AgentsListResponse(ProtocolModel):
@@ -732,6 +919,8 @@ class RuntimeSnapshot(ProtocolModel):
     hooks_count: int
     connectors: ConnectorCounts
     mcp: MCPState
+    bypass_tool_permissions: bool = False
+    experimental_harness: bool = False
 
 
 class PluginInfoParams(ProtocolModel):
@@ -740,6 +929,22 @@ class PluginInfoParams(ProtocolModel):
 
 class PluginInfoResponse(ProtocolModel):
     info: PluginInfo
+
+
+class PluginReloadParams(ProtocolModel):
+    session_id: str
+
+
+class PluginReloadResponse(ProtocolModel):
+    """Empty: reload allocates no identity, and ``plugin/info`` reads the result."""
+
+
+class PluginCatalogReadParams(ProtocolModel):
+    session_id: str
+
+
+class PluginCatalogReadResponse(ProtocolModel):
+    plugins: PluginCatalogState
 
 
 class RuntimeReadParams(ProtocolModel):
@@ -752,8 +957,26 @@ class RuntimeReadResponse(ProtocolModel):
     ready: bool
 
 
+class RuntimeMutationStatus(StrEnum):
+    APPLIED = auto()
+    PENDING = auto()
+
+
 class RuntimeMutationResponse(ProtocolModel):
+    """What the mutation produced, and whether the session is running it yet.
+
+    ``runtime`` is always the configuration the mutation produced, so a client
+    can render what the user asked for. ``PENDING`` says the session is still
+    running the previous one until the turn it is in ends: the Core reads its
+    settings when a turn starts, so what it holds cannot be replaced under it.
+    """
+
     runtime: RuntimeSnapshot
+    status: RuntimeMutationStatus = RuntimeMutationStatus.APPLIED
+
+    @property
+    def applied(self) -> bool:
+        return self.status is RuntimeMutationStatus.APPLIED
 
 
 class RuntimeUpdatedParams(ProtocolModel):
@@ -802,14 +1025,27 @@ class ConfigFieldWire(ProtocolModel):
     path: str
     popular: bool = False
     enum_choices: list[str] = Field(default_factory=list)
-    # Display labels for specific raw values, e.g. {"": "default (currently …)"}.
-    # Used for the value column and choice picker; the stored value is unchanged.
     value_labels: dict[str, str] = Field(default_factory=dict)
     layer_values: list[ConfigLayerValueWire] = Field(default_factory=list)
 
     @property
     def origin(self) -> str:
         return self.layer_values[0].layer if self.layer_values else "default"
+
+
+class ConfigEffectiveReadParams(ProtocolModel):
+    session_id: str
+
+
+class ConfigEffectiveReadResponse(ProtocolModel):
+    """The whole config the session runs with, credentials redacted.
+
+    Resolved after the agent profile and the session's own options, with
+    approval bypass as the session applies it; for records such as a headless
+    run's export, not for editing.
+    """
+
+    config: dict[str, JsonValue]
 
 
 class ConfigFieldsReadParams(ProtocolModel):
@@ -822,10 +1058,25 @@ class ConfigFieldsReadResponse(ProtocolModel):
 
 
 class ConfigWriteOpWire(ProtocolModel):
+    """One config mutation in a ``config/write`` batch.
+
+    Version skew (ADR 0014): this model is strict (``extra="forbid"``), so an
+    older server answers a newer client's unknown field with ``invalidParams``
+    and writes nothing.
+    """
+
     op: Literal["set", "remove"]
     path: str
     value: JsonValue = None
     target_layer: str | None = None
+
+
+class ModelConfigWriteParams(ProtocolModel):
+    """A model pick: which model answers, and how hard it thinks."""
+
+    session_id: str
+    model_alias: str | None = None
+    reasoning_effort: str | None = None
 
 
 class ConfigWriteParams(ProtocolModel):
@@ -839,6 +1090,10 @@ class ConfigWriteResponse(ConfigMutationResponse):
     rejected: bool = False
     failures: list[str] = Field(default_factory=list)
 
+    @property
+    def applied(self) -> bool:
+        return super().applied and not self.rejected and not self.failures
+
 
 class ConfigReadParams(ProtocolModel):
     session_id: str | None = None
@@ -847,11 +1102,13 @@ class ConfigReadParams(ProtocolModel):
 
 class ConfigReadResponse(ProtocolModel):
     config: ConfigView
+    startup_issue: ConfigIssue | None = None
     stripped_history_images: int = 0
     skills_count: int = 0
     hooks_count: int = 0
     mcp_servers_total: int = 0
     mcp_servers_enabled: int = 0
+    harness_selection_source: str | None = None
 
 
 class AgentInstallParams(ProtocolModel):
@@ -865,6 +1122,107 @@ class SkillsListParams(ProtocolModel):
 
 class SkillsListResponse(ProtocolModel):
     skills: list[SkillSummary]
+
+
+SkillScopeArg = str
+
+
+class SkillsInstalledParams(ProtocolModel):
+    session_id: str
+
+
+class SkillsInstalledResponse(ProtocolModel):
+    skills: list[SkillSummary]
+
+
+class SkillsCatalogParams(ProtocolModel):
+    session_id: str
+
+
+class SkillsCatalogResponse(ProtocolModel):
+    skills: list[SkillCatalogEntry]
+    updates: dict[str, int] = Field(default_factory=dict)
+    loaded: bool = False
+    project_available: bool = False
+    authenticated: bool = True
+
+
+class SkillsVersionsParams(ProtocolModel):
+    session_id: str
+    skill_id: str
+
+
+class SkillsVersionsResponse(ProtocolModel):
+    versions: list[SkillVersionView]
+
+
+class SkillsUpdatesParams(ProtocolModel):
+    session_id: str
+
+
+class SkillsUpdatesResponse(ProtocolModel):
+    updates: list[SkillUpdateView]
+
+
+class SkillsDetailParams(ProtocolModel):
+    session_id: str
+    skill_id: str
+    version: int | None = None
+
+
+class SkillsDetailResponse(ProtocolModel):
+    detail: SkillDetailView | None = None
+    body: str | None = None
+
+
+class SkillsImportParams(ProtocolModel):
+    session_id: str
+    skill_id: str
+    version: int | None = None
+    alias: str | None = None
+    scope: SkillScopeArg = "global"
+
+
+class SkillsSetVersionParams(ProtocolModel):
+    session_id: str
+    name: str
+    version: int
+    scope: SkillScopeArg = "global"
+
+
+class SkillsSetLatestParams(ProtocolModel):
+    session_id: str
+    name: str
+    scope: SkillScopeArg = "global"
+
+
+class SkillsSetAliasParams(ProtocolModel):
+    session_id: str
+    name: str
+    alias: str
+    scope: SkillScopeArg = "global"
+
+
+class SkillsRemoveParams(ProtocolModel):
+    session_id: str
+    name: str
+    scope: SkillScopeArg = "global"
+
+
+class SkillsSetEnabledParams(ProtocolModel):
+    session_id: str
+    name: str
+    enabled: bool
+
+
+class SkillsConvertLocalParams(ProtocolModel):
+    session_id: str
+    name: str
+    scope: SkillScopeArg = "global"
+
+
+class SkillsConvertResponse(RuntimeMutationResponse):
+    converted: bool = False
 
 
 class ToolsListParams(ProtocolModel):
@@ -1059,6 +1417,7 @@ class ConnectorCatalogReadResponse(ProtocolModel):
     catalog: ConnectorCatalogView
     selections: list[ConnectorSelectionView] = Field(default_factory=list)
     session: SessionConnectorStateView | None = None
+    manage_url: str | None = None
 
 
 class ConnectorCatalogRefreshParams(ProtocolModel):
@@ -1164,6 +1523,7 @@ class MCPAddParams(ProtocolModel):
     name: str | None = None
     scopes: list[str] = Field(default_factory=list)
     transport: MCPAddTransport = "streamable-http"
+    allow_insecure_http: bool = False
 
 
 class MCPAddResponse(ProtocolModel):
@@ -1299,6 +1659,31 @@ class WorkspaceWorktreeListResponse(ProtocolModel):
     # must take this rather than joining the root itself, because a path this
     # omits is one a move would refuse.
     repository_cwd: str | None = None
+    # The same repository-relative position without requiring it to exist in
+    # the main checkout. Used to associate retained sessions with projects;
+    # unlike repository_cwd, it is not necessarily a valid move destination.
+    repository_mapped_cwd: str | None = None
+    # The repository the listing was taken from. Pair with
+    # repository_mapped_cwd so a nested repository is not treated as part of
+    # a parent project just because its path sits underneath it.
+    repository_root: str | None = None
+
+
+class WorkspaceWorktreePruneParams(ProtocolModel):
+    pass
+
+
+class WorkspaceWorktreePruneResponse(ProtocolModel):
+    removed: int
+
+
+class WorkspaceWorktreeLimitUpdateParams(ProtocolModel):
+    limit: int = Field(ge=0, le=100)
+
+
+class WorkspaceWorktreeLimitUpdateResponse(ProtocolModel):
+    limit: int
+    failures: list[str] = Field(default_factory=list)
 
 
 # No session_id on the wire: the caller is deleting a session that has already
@@ -1306,6 +1691,25 @@ class WorkspaceWorktreeListResponse(ProtocolModel):
 # arbitrary holder file to unlink.
 class WorkspaceWorktreeRemoveParams(ProtocolModel):
     cwd: str = Field(min_length=1)
+
+
+# The remove-only extension: `force`/`inspect` are confirm-flow params that
+# exist so a client can ask before it discards (ADR 0014). They live on a
+# subclass, not on the base, so `WorkspaceWorktreeReapParams` keeps inheriting
+# the original `{cwd}` shape and reap never accepts a flag it would ignore.
+class WorkspaceWorktreeRemoveConfirmParams(WorkspaceWorktreeRemoveParams):
+    # Explicit confirmation to discard uncommitted changes, untracked files,
+    # and new commits without saving a snapshot. Absent (the default) keeps the
+    # snapshot path, so old clients are unaffected.
+    force: bool = False
+    # None keeps the server default: delete the branch when Vibe created it.
+    delete_branch: bool | None = None
+    # Report the outcome a removal would have, without removing anything or
+    # releasing holders: the exit flow's "Removing worktree" line asks before
+    # it commits, like the CLI's own inspect before its remove. `outcome` is
+    # then the would-be outcome ("removed" means a removal now would succeed).
+    # Absent (the default) removes, so old clients are unaffected.
+    inspect: bool = False
 
 
 # Spelled out here rather than imported from vibe.core.git.worktree: the protocol
@@ -1320,6 +1724,7 @@ type WorktreeRemoveOutcome = Literal[
     "kept_error",
     "not_found",
 ]
+type WorktreeReapOutcome = WorktreeRemoveOutcome | Literal["kept_cancelled"]
 
 
 class WorkspaceWorktreeRemoveResponse(ProtocolModel):
@@ -1330,6 +1735,43 @@ class WorkspaceWorktreeRemoveResponse(ProtocolModel):
     branch: str | None = None
     branch_deleted: bool = False
     reasons: list[str] = Field(default_factory=list)
+    # Whether Vibe created the branch, so a caller can prompt before deleting
+    # one that existed before the session. Absent when no record was read.
+    branch_created: bool | None = None
+    # How many other sessions hold the worktree (the asking session's own
+    # holder discounted), so a caller can say "in use by N other session(s)".
+    # None when there was no claim to count.
+    holders: int | None = None
+
+
+class WorkspaceWorktreeReapParams(WorkspaceWorktreeRemoveParams):
+    requester_id: str | None = Field(default=None, min_length=1)
+    request_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_request_identity(self) -> Self:
+        if (self.requester_id is None) != (self.request_id is None):
+            raise ValueError("requesterId and requestId must be provided together")
+        return self
+
+
+class WorkspaceWorktreeReapResponse(ProtocolModel):
+    outcome: WorktreeReapOutcome
+    root: str | None = None
+    branch: str | None = None
+    branch_deleted: bool = False
+    reasons: list[str] = Field(default_factory=list)
+
+
+class WorkspaceWorktreeReapCancelParams(WorkspaceWorktreeRemoveParams):
+    requester_id: str | None = Field(default=None, min_length=1)
+    request_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_request_identity(self) -> Self:
+        if self.requester_id is None and self.request_id is not None:
+            raise ValueError("requestId requires requesterId")
+        return self
 
 
 class WorkspaceGitCheckoutsParams(ProtocolModel):
@@ -1380,13 +1822,97 @@ class WorkspaceUntrustedConfigResponse(ProtocolModel):
     settings_path: str = ""
 
 
+class SetupProviderView(ProtocolModel):
+    """The onboarding surface of a resolved provider.
+
+    The six fields are everything the wizard reads and mutates. The server
+    merges them back onto the full resolved provider on
+    ``setup/submit-choices``, so the rest of the provider's settings survive
+    the client round trip.
+    """
+
+    name: str
+    api_base: str
+    api_key_env_var: str = ""
+    browser_auth_base_url: str | None = None
+    browser_auth_api_base_url: str | None = None
+    browser_auth_allow_origin_rewrite: bool = False
+
+
+class SetupStatusParams(ProtocolModel):
+    # The provider a failed session's handshake named, so the wizard seeds
+    # for the provider that actually lacks a key; absent means the server's
+    # own active provider.
+    provider: str | None = None
+
+
+class SetupStatusResponse(ProtocolModel):
+    """The wizard seed: the server's fully-resolved view (ADR 0009 setup)."""
+
+    provider: SetupProviderView
+    console_base_url: str
+    vibe_base_url: str
+    active_model: str
+    theme: str
+    supports_browser_sign_in: bool
+    # The server's view of the key: process env (including the loaded dotenv)
+    # first, then the keyring — the ``resolve_api_key`` order.
+    has_api_key: bool
+    # The server-resolved TLS trust flag (ADR 0015): the fully-resolved
+    # effective config, not just the env var and user config.toml.
+    enable_system_trust_store: bool = False
+
+
+class SetupStoreCredentialParams(ProtocolModel):
+    # The provider name; the server resolves it against its own config so the
+    # client never carries credential-adjacent state it does not own.
+    provider: str
+    api_key: str
+    custom_domain: bool = False
+
+
+class SetupStoreCredentialResponse(ProtocolModel):
+    """The Python key-persist outcome contract — never silent.
+
+    ``completed`` — the key is stored. ``env_var_error`` — the derived env
+    var name is empty or invalid; nothing was saved. ``save_error`` — neither the
+    keyring nor the ``.env`` fallback could store it, so the key lives only in
+    the server process env for this run. ``detail`` carries the env var name
+    or the write error.
+    """
+
+    outcome: Literal["completed", "env_var_error", "save_error"]
+    detail: str | None = None
+
+
+class SetupSubmitChoicesParams(ProtocolModel):
+    """Fields the wizard may have drifted; absent means "keep the config"."""
+
+    provider: SetupProviderView | None = None
+    console_base_url: str | None = None
+    vibe_base_url: str | None = None
+    # Present only when a theme was selected; presence is the write signal
+    # (Python persists /theme on every completed onboarding that selected one).
+    theme: str | None = None
+
+
+class SetupSubmitChoicesResponse(ProtocolModel):
+    outcome: Literal["completed", "provider_config_error"]
+    failures: list[str] = Field(default_factory=list)
+
+
 class ProjectLinksListParams(ProtocolModel):
     pass
 
 
+class ProjectLinksLocalLink(ProtocolModel):
+    directory_path: str
+    has_commits: bool
+
+
 class ProjectLinksLinkedProject(ProtocolModel):
     project_id: str
-    repo_local_paths: list[str]
+    local_links: list[ProjectLinksLocalLink]
 
 
 class ProjectLinksListResponse(ProtocolModel):
@@ -1398,11 +1924,17 @@ type ProjectLinksResolveRootRejectReason = Literal[
 ]
 
 
-class ProjectLinksResolvedRoot(ProtocolModel):
-    repo_local_path: str
-    repo_name: str
+class ProjectLinksDirectoryGit(ProtocolModel):
     current_branch: str | None
     default_branch: str | None
+    github_repo_url: str | None
+    has_commits: bool
+
+
+class ProjectLinksInspectedDirectory(ProtocolModel):
+    directory_path: str
+    directory_name: str
+    git: ProjectLinksDirectoryGit | None
 
 
 class ProjectLinksResolveRootParams(ProtocolModel):
@@ -1412,15 +1944,11 @@ class ProjectLinksResolveRootParams(ProtocolModel):
 class ProjectLinksResolveRootResponse(ProtocolModel):
     eligible: bool
     reject_reason: ProjectLinksResolveRootRejectReason | None = None
-    root: ProjectLinksResolvedRoot | None = None
+    root: ProjectLinksInspectedDirectory | None = None
 
 
 class ProjectLinksInspectRootParams(ProtocolModel):
     root_path: str = Field(min_length=1)
-
-
-class ProjectLinksInspectedRoot(ProjectLinksResolvedRoot):
-    repo_url: str
 
 
 class ProjectLinksSavedLink(ProtocolModel):
@@ -1431,7 +1959,7 @@ class ProjectLinksSavedLink(ProtocolModel):
 class ProjectLinksInspectRootResponse(ProtocolModel):
     eligible: bool
     reject_reason: ProjectLinksResolveRootRejectReason | None = None
-    root: ProjectLinksInspectedRoot | None = None
+    root: ProjectLinksInspectedDirectory | None = None
     saved_link: ProjectLinksSavedLink | None = None
     stale_link_cleared: bool
     stale_link_clear_failed: bool = False
@@ -1440,7 +1968,6 @@ class ProjectLinksInspectRootResponse(ProtocolModel):
 class ProjectLinksPickerCandidate(ProtocolModel):
     project_id: str
     name: str
-    match_kind: Literal["exact_repo", "multi_repo"]
     recommended: bool
 
 
@@ -1454,7 +1981,7 @@ class ProjectLinksPickerLoadParams(ProtocolModel):
 
 
 class ProjectLinksPickerLoadResponse(ProtocolModel):
-    root: ProjectLinksResolvedRoot
+    root: ProjectLinksInspectedDirectory
     saved_link: ProjectLinksSavedLink | None = None
     stale_link_cleared: bool
     candidates: ProjectLinksPickerCandidates
@@ -1486,13 +2013,13 @@ class ProjectLinksSaveParams(ProtocolModel):
     root_path: str = Field(min_length=1)
     project_id: str = Field(min_length=1)
     project_name: str = Field(min_length=1)
-    expected_repo_url: str = Field(min_length=1)
+    expected_github_repo_url: str | None
 
 
 class ProjectLink(ProtocolModel):
     project_id: str
     project_name: str
-    repo_local_path: str
+    directory_path: str
 
 
 class ProjectLinkMutationResponse(ProtocolModel):
@@ -1568,11 +2095,97 @@ class FeedbackShouldShowParams(ProtocolModel):
 
 class FeedbackShouldShowResponse(ProtocolModel):
     show: bool
+    snooze_duration_seconds: int | None = None
 
 
 class FeedbackRecordParams(ProtocolModel):
     session_id: str
     action: Literal["asked", "given", "snoozed"]
+
+
+class _TurnQueueInputParams(ProtocolModel):
+    idempotency_key: str | None = None
+    session_id: str
+    entries: list[TurnInputEntry] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_entries(self) -> Self:
+        validate_turn_input_entries(self.entries)
+        return self
+
+    @property
+    def input(self) -> list[SessionContentBlock]:
+        return [block for entry in self.entries for block in entry.content]
+
+    @property
+    def user_entry(self) -> TurnUserInputEntry | None:
+        return next(
+            (entry for entry in reversed(self.entries) if entry.role == "user"), None
+        )
+
+    @property
+    def message_entry_id(self) -> str | None:
+        user_entry = self.user_entry
+        return user_entry.entry_id if user_entry is not None else None
+
+
+class TurnEnqueueParams(_TurnQueueInputParams):
+    pass
+
+
+class TurnEnqueueResponse(ProtocolModel):
+    queue_item_id: str
+
+
+class TurnQueueReplaceParams(_TurnQueueInputParams):
+    queue_item_id: str
+
+    def as_enqueue_params(self) -> TurnEnqueueParams:
+        return TurnEnqueueParams(
+            idempotency_key=self.idempotency_key,
+            session_id=self.session_id,
+            entries=self.entries,
+        )
+
+
+class TurnQueueReplaceResponse(ProtocolModel):
+    queue_item_id: str
+
+
+class TurnQueueSteerParams(ProtocolModel):
+    session_id: str
+    queue_item_id: str
+    expected_turn_id: str
+
+
+class TurnQueueSteerResponse(EventWatermarkResponse):
+    queue_item_id: str
+    turn_id: str
+
+
+class TurnQueueReadParams(ProtocolModel):
+    session_id: str
+
+
+class TurnQueueReadResponse(ProtocolModel):
+    queue: PublicTurnQueue
+
+
+class TurnQueueRemoveParams(ProtocolModel):
+    session_id: str
+    queue_item_id: str
+
+
+class TurnQueueRemoveResponse(ProtocolModel):
+    pass
+
+
+class TurnQueueResumeParams(ProtocolModel):
+    session_id: str
+
+
+class TurnQueueResumeResponse(ProtocolModel):
+    pass
 
 
 class TurnStartParams(ProtocolModel):
@@ -1600,6 +2213,7 @@ class TurnSteerParams(ProtocolModel):
     expected_turn_id: str
     message: list[ContentBlock]
     client_user_message_id: str | None = None
+    user_display_content: UserDisplayContent | None = None
     inject_invoked_skill: bool = True
     mention_stats: MentionStats | None = None
 
@@ -1737,6 +2351,10 @@ class SessionUpdatedParams(EventNotificationParams):
     patch: list[JsonPatchOperation]
 
 
+class TurnQueueUpdatedParams(EventNotificationParams):
+    queue: PublicTurnQueue
+
+
 class TurnStartedParams(EventNotificationParams):
     turn: PublicTurn
 
@@ -1748,6 +2366,10 @@ class TurnCompletedParams(EventNotificationParams):
 class StatsUpdatedParams(EventNotificationParams):
     stats: AgentStatsSnapshot
     context_window: int
+
+
+class ChildSessionUpdatedParams(EventNotificationParams):
+    child_session: PublicChildSession
 
 
 class Notification(ProtocolModel):
@@ -1797,10 +2419,47 @@ class ProtocolError(ProtocolModel):
     data: JsonValue = None
 
 
+def format_invalid_params_issues(data: JsonValue) -> str | None:
+    """Render the field-level detail carried by an INVALID_PARAMS error.
+
+    The useful part of a validation rejection — which field failed and why —
+    travels in ``ProtocolError.data`` as an :class:`InvalidParamsData` payload.
+    Returns a single-line summary like ``field.path: reason; ...`` or ``None``
+    when the data does not carry any issues.
+    """
+    if not isinstance(data, dict):
+        return None
+    issues = data.get("issues")
+    if not isinstance(issues, list) or not issues:
+        return None
+    parts: list[str] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        path = issue.get("path")
+        location = (
+            ".".join(str(segment) for segment in path)
+            if isinstance(path, list) and path
+            else "<root>"
+        )
+        message = issue.get("message")
+        parts.append(f"{location}: {message}" if message else location)
+    if not parts:
+        return None
+    return "; ".join(parts)
+
+
+def _render_protocol_error(error: ProtocolError) -> str:
+    detail = format_invalid_params_issues(error.data)
+    if detail is None:
+        return error.message
+    return f"{error.message} ({detail})"
+
+
 class AppServerResponseError(RuntimeError):
     def __init__(self, error: ProtocolError) -> None:
         self.error = error
-        super().__init__(error.message)
+        super().__init__(_render_protocol_error(error))
 
 
 class JsonRpcProtocolError(RuntimeError):
@@ -1823,11 +2482,14 @@ type JsonRpcEnvelope = (
     Notification | ServerRequest | JsonRpcSuccessResponse | JsonRpcErrorResponse
 )
 
-_JSON_RPC_ENVELOPE_ADAPTER = TypeAdapter(JsonRpcEnvelope)
+
+@cache
+def _json_rpc_envelope_adapter() -> TypeAdapter[JsonRpcEnvelope]:
+    return TypeAdapter(JsonRpcEnvelope)
 
 
 def validate_json_rpc_envelope(value: object) -> JsonRpcEnvelope:
-    return _JSON_RPC_ENVELOPE_ADAPTER.validate_python(
+    return _json_rpc_envelope_adapter().validate_python(
         value, by_alias=True, by_name=False
     )
 

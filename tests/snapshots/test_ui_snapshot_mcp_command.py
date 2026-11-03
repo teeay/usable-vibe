@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from textual.pilot import Pilot
+from textual.widgets import Input
 
 from tests.conftest import build_test_agent_loop
 from tests.snapshots.base_snapshot_test_app import BaseSnapshotTestApp, default_config
@@ -231,7 +232,7 @@ class SnapshotTestAppConnectorBootstrapError(BaseSnapshotTestApp):
         config = default_config(enable_connectors=True, mcp_servers=[])
         registry = FakeConnectorRegistry(
             bootstrap_error=(
-                "Failed to load workspace connectors (HTTP 502).\n"
+                "Failed to load connectors (HTTP 502).\n"
                 "Server response: Bad Gateway\n"
                 "This looks like a temporary server issue — "
                 "retry with `/reload` in a few minutes."
@@ -292,6 +293,21 @@ def test_snapshot_mcp_with_connectors_overview(snap_compare: SnapCompare) -> Non
 
     async def run_before(pilot: Pilot) -> None:
         await _run_mcp_command(pilot, "/mcp")
+
+    assert snap_compare(
+        "test_ui_snapshot_mcp_command.py:SnapshotTestAppWithConnectors",
+        terminal_size=(120, 36),
+        run_before=run_before,
+    )
+
+
+def test_snapshot_connectors_fuzzy_search(snap_compare: SnapCompare) -> None:
+    async def run_before(pilot: Pilot) -> None:
+        await _run_mcp_command(pilot, "/connectors")
+        await pilot.press("up", "s", "l")
+        # A slow runner can cross the 0.5s blink tick and hide the cursor.
+        pilot.app.query_one("#mcp-search", Input).cursor_blink = False
+        await pilot.pause(0.1)
 
     assert snap_compare(
         "test_ui_snapshot_mcp_command.py:SnapshotTestAppWithConnectors",

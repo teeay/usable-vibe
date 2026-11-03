@@ -15,4 +15,20 @@ DEFAULT_MISTRAL_BROWSER_AUTH_BASE_URL = DEFAULT_CONSOLE_BASE_URL
 DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL = f"{DEFAULT_CONSOLE_BASE_URL}/api"
 DEFAULT_API_TIMEOUT = 720.0
 DEFAULT_API_RETRY_MAX_ELAPSED_TIME = 300.0
+# Off by default: Mistral sends a tool call in one piece once it is fully
+# generated, so a large tool call is a silence no fixed limit can tell from a
+# stalled stream.
+DEFAULT_API_STREAM_IDLE_TIMEOUT = 0.0
+DEFAULT_API_CONNECT_TIMEOUT = 10.0
+DEFAULT_API_WRITE_TIMEOUT = 30.0
+DEFAULT_API_POOL_TIMEOUT = 10.0
 DEFAULT_AUTO_COMPACT_THRESHOLD = 200_000
+# Compaction is itself a model call carrying the conversation, so it needs room
+# to run: triggering at the true ceiling would fail exactly when it is needed.
+AUTO_COMPACT_WINDOW_RATIO = 0.8
+# "No layer set a threshold". The default layer materializes field defaults
+# into the merge, so unset-ness must survive it as a value; TOML cannot express
+# it, so only the default ever produces it. A -1 written by hand is therefore
+# indistinguishable from unset and resolves the same way; 0 stays the
+# documented way to disable compaction.
+UNSET_AUTO_COMPACT_THRESHOLD = -1

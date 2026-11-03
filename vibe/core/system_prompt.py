@@ -23,6 +23,7 @@ from vibe.core.utils import (
     resolve_windows_shell,
 )
 from vibe.utils.paths import is_dangerous_directory
+from vibe.utils.platform import resolve_git_executable
 
 if TYPE_CHECKING:
     from vibe.core.agents import AgentManager
@@ -31,6 +32,67 @@ if TYPE_CHECKING:
     from vibe.core.tools.manager import ToolManager
 
 _git_status_cache: dict[Path, str] = {}
+
+GIT_TIMEOUT_MESSAGE = "Git operations timed out (large repository)"
+GIT_UNAVAILABLE_MESSAGE = "Not a git repository or git not available"
+
+
+def git_metadata_args(num_commits: int) -> tuple[list[str], list[str], list[str]]:
+    """The read-only git commands behind the project context.
+
+    Current branch, remote branches and recent commits, in that order. Do not
+    add ``git status``: unlike these metadata-only commands, it may pass
+    working-tree contents through clean or process filters the repository
+    configures, and project context is collected outside the shell
+    permission boundary.
+    """
+    return (
+        ["branch", "--show-current"],
+        ["branch", "-r"],
+        ["log", "--oneline", f"-{num_commits}", "--decorate"],
+    )
+
+
+def parse_git_log(log_output: str) -> list[str]:
+    recent_commits: list[str] = []
+    for line in log_output.split("\n"):
+        if not (line := line.strip()):
+            continue
+        if " " in line:
+            commit_hash, commit_msg = line.split(" ", 1)
+            if (
+                "(" in commit_msg
+                and ")" in commit_msg
+                and (paren_index := commit_msg.rfind("(")) > 0
+            ):
+                commit_msg = commit_msg[:paren_index].strip()
+            recent_commits.append(f"{commit_hash} {commit_msg}")
+        else:
+            recent_commits.append(line)
+    return recent_commits
+
+
+def format_git_context(
+    current_branch: str, remote_branches: str | None, log_output: str
+) -> str:
+    """Render the git metadata section; ``remote_branches`` is None on failure."""
+    main_branch = "main"
+    if remote_branches is not None and "origin/master" in remote_branches:
+        main_branch = "master"
+    git_info_parts = [
+        f"Current branch: {current_branch}",
+        f"Main branch (you will usually use this for PRs): {main_branch}",
+    ]
+    recent_commits = parse_git_log(log_output.strip())
+    if recent_commits:
+        git_info_parts.append("Recent commits:")
+        git_info_parts.extend(recent_commits)
+    return "\n".join(git_info_parts)
+
+
+def render_project_context(abs_path: str, git_status: str) -> str:
+    template = UtilityPrompt.PROJECT_CONTEXT.read()
+    return Template(template).safe_substitute(abs_path=abs_path, git_status=git_status)
 
 
 class ProjectContextProvider:
@@ -51,6 +113,9 @@ class ProjectContextProvider:
     def _run_git(
         self, args: list[str], timeout: float
     ) -> subprocess.CompletedProcess[str]:
+        git = resolve_git_executable(cwd=self.root_path)
+        if git is None:
+            raise FileNotFoundError("No trusted Git executable is available")
         return subprocess.run(
             # -c core.fsmonitor= overrides (and disables) any fsmonitor hook a
             # repo's own .git/config declares, for this invocation only. This
@@ -61,7 +126,7 @@ class ProjectContextProvider:
             # privileges. -c on the command line takes precedence over the
             # repo's own config, so this can't be overridden by the repo being
             # inspected.
-            ["git", "-c", "core.fsmonitor=", "--no-optional-locks", *args],
+            [git, "-c", "core.fsmonitor=", "--no-optional-locks", *args],
             capture_output=True,
             check=True,
             cwd=self.root_path,
@@ -73,92 +138,43 @@ class ProjectContextProvider:
         )
 
     @staticmethod
-    def _format_git_status(status_output: str) -> str:
-        if not status_output:
-            return "(clean)"
-        status_lines = status_output.splitlines()
-        MAX_GIT_STATUS_SIZE = 50
-        if len(status_lines) > MAX_GIT_STATUS_SIZE:
-            return f"({len(status_lines)} changes - use 'git status' for details)"
-        return f"({len(status_lines)} changes)"
-
-    @staticmethod
     def _parse_git_log(log_output: str) -> list[str]:
-        recent_commits: list[str] = []
-        for line in log_output.split("\n"):
-            if not (line := line.strip()):
-                continue
-            if " " in line:
-                commit_hash, commit_msg = line.split(" ", 1)
-                if (
-                    "(" in commit_msg
-                    and ")" in commit_msg
-                    and (paren_index := commit_msg.rfind("(")) > 0
-                ):
-                    commit_msg = commit_msg[:paren_index].strip()
-                recent_commits.append(f"{commit_hash} {commit_msg}")
-            else:
-                recent_commits.append(line)
-        return recent_commits
+        return parse_git_log(log_output)
 
     def _fetch_git_status(self) -> str:
         try:
             timeout = min(self.config.timeout_seconds, 10.0)
-            num_commits = self.config.default_commit_count
+            branch_args, remote_args, log_args = git_metadata_args(
+                self.config.default_commit_count
+            )
 
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                branch_future = pool.submit(
-                    self._run_git, ["branch", "--show-current"], timeout
-                )
-                remote_future = pool.submit(self._run_git, ["branch", "-r"], timeout)
-                status_future = pool.submit(
-                    self._run_git, ["status", "--porcelain"], timeout
-                )
-                log_future = pool.submit(
-                    self._run_git,
-                    ["log", "--oneline", f"-{num_commits}", "--decorate"],
-                    timeout,
-                )
+            # See ``git_metadata_args`` for why there is no `git status` here.
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                branch_future = pool.submit(self._run_git, branch_args, timeout)
+                remote_future = pool.submit(self._run_git, remote_args, timeout)
+                log_future = pool.submit(self._run_git, log_args, timeout)
 
             current_branch = branch_future.result().stdout.strip()
 
-            main_branch = "main"
+            remote_branches: str | None = None
             try:
-                branches_output = remote_future.result().stdout
-                if "origin/master" in branches_output:
-                    main_branch = "master"
+                remote_branches = remote_future.result().stdout
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 pass
 
-            status = self._format_git_status(status_future.result().stdout.strip())
-            recent_commits = self._parse_git_log(log_future.result().stdout.strip())
-
-            git_info_parts = [
-                f"Current branch: {current_branch}",
-                f"Main branch (you will usually use this for PRs): {main_branch}",
-                f"Status: {status}",
-            ]
-
-            if recent_commits:
-                git_info_parts.append("Recent commits:")
-                git_info_parts.extend(recent_commits)
-
-            return "\n".join(git_info_parts)
+            return format_git_context(
+                current_branch, remote_branches, log_future.result().stdout
+            )
 
         except subprocess.TimeoutExpired:
-            return "Git operations timed out (large repository)"
+            return GIT_TIMEOUT_MESSAGE
         except subprocess.CalledProcessError:
-            return "Not a git repository or git not available"
+            return GIT_UNAVAILABLE_MESSAGE
         except Exception as e:
             return f"Error getting git status: {e}"
 
     def get_full_context(self) -> str:
-        git_status = self.get_git_status()
-
-        template = UtilityPrompt.PROJECT_CONTEXT.read()
-        return Template(template).safe_substitute(
-            abs_path=str(self.root_path), git_status=git_status
-        )
+        return render_project_context(str(self.root_path), self.get_git_status())
 
 
 def _get_os_system_prompt(
@@ -246,7 +262,7 @@ def _get_windows_system_prompt(shell_kind: WindowsShellKind) -> str:
     return _get_windows_cmd_system_prompt()
 
 
-def _add_commit_signature() -> str:
+def get_commit_signature_section() -> str:
     return (
         "When you want to commit changes, you will always use the 'git commit' bash command.\n"
         "It will always be suffixed with a line telling it was generated by Usable Vibe with the appropriate co-authoring information.\n"
@@ -260,36 +276,44 @@ def _add_commit_signature() -> str:
 
 
 def _get_available_skills_section(skill_manager: SkillManager) -> str:
-    skills = skill_manager.available_skills
-    if not skills:
+    available_skills = skill_manager.available_skills
+    model_invocable_skills = {
+        name: skill for name, skill in available_skills.items() if skill.model_invocable
+    }
+    has_user_invocable_skill = any(
+        skill.user_invocable for skill in available_skills.values()
+    )
+    if not model_invocable_skills and not has_user_invocable_skill:
         return ""
 
-    lines = [
-        "# Available Skills",
-        "",
-        "You have access to the following skills. When a task matches a skill's description,",
-        "use the `skill` tool if available to load the full skill instructions, if it is not available, read the files manually if they exist.",
-        "",
-        "When a user message is exactly `/skill-name` (optionally followed by extra",
-        "instructions), the user has explicitly invoked that skill. Its instructions are",
-        "loaded for you automatically: you will see a `skill` tool call and result",
-        "immediately after that message. Treat the loaded content as the active",
-        "instructions and act on it — you do not need to call the `skill` tool yourself.",
-        "",
-        "<available_skills>",
-    ]
-
-    for name, info in sorted(skills.items()):
-        lines.append("  <skill>")
-        lines.append(f"    <name>{html.escape(str(name))}</name>")
-        lines.append(
-            f"    <description>{html.escape(str(info.description))}</description>"
-        )
-        if info.skill_path is not None:
-            lines.append(f"    <path>{html.escape(str(info.skill_path))}</path>")
-        lines.append("  </skill>")
-
-    lines.append("</available_skills>")
+    lines = ["# Available Skills", ""]
+    if model_invocable_skills:
+        lines.extend([
+            "You have access to the following skills. When a task matches a skill's description,",
+            "use the `skill` tool if available to load the full skill instructions, if it is not available, read the files manually if they exist.",
+            "",
+        ])
+    if has_user_invocable_skill:
+        lines.extend([
+            "When a user message is exactly `/skill-name` (optionally followed by extra",
+            "instructions), the user has explicitly invoked that skill. Its instructions are",
+            "loaded for you automatically: you will see a `skill` tool call and result",
+            "immediately after that message. Treat the loaded content as the active",
+            "instructions and act on it — you do not need to call the `skill` tool yourself.",
+            "",
+        ])
+    if model_invocable_skills:
+        lines.append("<available_skills>")
+        for name, info in sorted(model_invocable_skills.items()):
+            lines.append("  <skill>")
+            lines.append(f"    <name>{html.escape(str(name))}</name>")
+            lines.append(
+                f"    <description>{html.escape(str(info.description))}</description>"
+            )
+            if info.skill_path is not None:
+                lines.append(f"    <path>{html.escape(str(info.skill_path))}</path>")
+            lines.append("  </skill>")
+        lines.append("</available_skills>")
 
     return "\n".join(lines)
 
@@ -349,6 +373,45 @@ def _get_tool_aware_os_system_prompt(tool_manager: ToolManager | None) -> str:
     )
 
 
+def get_agents_md_section(
+    user_doc: str,
+    project_docs: list[tuple[Path, str]],
+    *,
+    project_instructions: str | None = None,
+) -> str | None:
+    """Render user-level and project AGENTS.md docs as one prompt section.
+
+    ``user_doc`` is the user-level doc from ``$VIBE_HOME/AGENTS.md``;
+    ``project_docs`` are ``(directory, content)`` pairs ordered outermost-first
+    from each open project root up to its trust root. ``project_instructions``,
+    given by whoever started the session rather than read from a file, come
+    first among the project instructions, so a project doc outranks them as a
+    doc closer to the working directory outranks one further out. Returns
+    ``None`` when nothing has content, so callers can skip the section
+    entirely.
+    """
+    doc_sections: list[str] = []
+    if user_doc.strip():
+        doc_sections.append(
+            f"## User instructions\n\nContents of {VIBE_HOME.path}/AGENTS.md (user-level instructions):\n\n{user_doc.strip()}"
+        )
+    given = (project_instructions or "").strip()
+    if given:
+        doc_sections.append(
+            f"## Project instructions\n\nInstructions for this project:\n\n{given}"
+        )
+    elif project_docs:
+        doc_sections.append("## Project instructions (checked into the codebase)")
+    for doc_dir, doc_content in project_docs:
+        doc_sections.append(
+            f"Contents of {doc_dir}/AGENTS.md:\n\n{doc_content.strip()}"
+        )
+    if not doc_sections:
+        return None
+    template = UtilityPrompt.AGENTS_DOC.read()
+    return Template(template).safe_substitute(sections="\n\n".join(doc_sections))
+
+
 def get_universal_system_prompt(
     config: VibeConfigSchema,
     skill_manager: SkillManager,
@@ -368,7 +431,7 @@ def get_universal_system_prompt(
         sections.append(_get_headless_section())
 
     if config.include_commit_signature:
-        sections.append(_add_commit_signature())
+        sections.append(get_commit_signature_section())
 
     if config.include_model_info:
         sections.append(f"Your model name is: `{config.get_active_model().alias}`")
@@ -414,24 +477,10 @@ def get_universal_system_prompt(
                 + dirs_lines
             )
 
-        user_doc = harness_files.load_user_doc()
-        project_docs = harness_files.load_project_docs()
-
-        doc_sections: list[str] = []
-        if user_doc.strip():
-            doc_sections.append(
-                f"## User instructions\n\nContents of {VIBE_HOME.path}/AGENTS.md (user-level instructions):\n\n{user_doc.strip()}"
-            )
-        if project_docs:
-            doc_sections.append("## Project instructions (checked into the codebase)")
-        for doc_dir, doc_content in project_docs:
-            doc_sections.append(
-                f"Contents of {doc_dir}/AGENTS.md:\n\n{doc_content.strip()}"
-            )
-        if doc_sections:
-            template = UtilityPrompt.AGENTS_DOC.read()
-            sections.append(
-                Template(template).safe_substitute(sections="\n\n".join(doc_sections))
-            )
+        agents_md_section = get_agents_md_section(
+            harness_files.load_user_doc(), harness_files.load_project_docs()
+        )
+        if agents_md_section:
+            sections.append(agents_md_section)
 
     return "\n\n".join(sections)

@@ -42,6 +42,8 @@ class FileSystemUpdateCacheRepository(UpdateCacheRepository):
             payload["seen_whats_new_version"] = update_cache.seen_whats_new_version
         if update_cache.dismissed_version is not None:
             payload["dismissed_version"] = update_cache.dismissed_version
+        if update_cache.source_stored_at is not None:
+            payload["source_stored_at"] = update_cache.source_stored_at
         await asyncio.to_thread(
             self._cache_store.write_section, _CACHE_SECTION, payload
         )

@@ -57,12 +57,16 @@ async def build_gateway(
     origin: str = AUTH_ORIGIN,
     browser_base_url: str = AUTH_BROWSER_BASE_URL,
     api_base_url: str = AUTH_API_BASE_URL,
+    allow_origin_rewrite: bool = False,
 ):
     async with VibeAsyncHTTPClient(
         transport=httpx.MockTransport(handler), base_url=origin
     ) as client:
         yield HttpBrowserSignInGateway(
-            browser_base_url=browser_base_url, api_base_url=api_base_url, client=client
+            browser_base_url=browser_base_url,
+            api_base_url=api_base_url,
+            allow_origin_rewrite=allow_origin_rewrite,
+            client=client,
         )
 
 
@@ -163,6 +167,39 @@ async def test_http_api_logs_exchange_failure_status_and_detail_without_secrets(
     assert "response_detail=Invalid exchange token." in caplog.text
     assert exchange_token not in caplog.text
     assert code_verifier not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_http_api_explains_workspace_api_key_creation_denied_on_exchange() -> (
+    None
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403, json={"error_code": 9004, "detail": "forbidden upstream"}
+        )
+
+    async with build_gateway(handler) as gateway:
+        with pytest.raises(BrowserSignInError, match="select another workspace") as err:
+            await gateway.exchange("process-1", "exchange-1", "verifier-1")
+
+    assert err.value.code == BrowserSignInErrorCode.EXCHANGE_FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(403, json={"detail": "forbidden"}),
+        httpx.Response(403, json={"error_code": 9015, "detail": "forbidden"}),
+        httpx.Response(500, json={"error_code": 9004, "detail": "boom"}),
+    ],
+)
+async def test_http_api_keeps_generic_exchange_error_for_other_failures(
+    response: httpx.Response,
+) -> None:
+    async with build_gateway(lambda _request: response) as gateway:
+        with pytest.raises(BrowserSignInError, match="exchange browser sign-in"):
+            await gateway.exchange("process-1", "exchange-1", "verifier-1")
 
 
 @pytest.mark.asyncio
@@ -653,6 +690,156 @@ async def test_http_api_does_not_log_sign_in_or_poll_secrets_on_start_validation
     assert complete_token not in caplog.text
     assert state not in caplog.text
     assert poll_token not in caplog.text
+
+
+# Split-horizon deployment (e.g. a reverse proxy / connector): the browser
+# reaches the console directly while the CLI can only reach a connector host.
+SPLIT_CONSOLE = "https://console.example.com"
+SPLIT_CONNECTOR = "https://connector.example:443"
+SPLIT_CONNECTOR_API = "https://connector.example:443/api"
+
+
+@pytest.mark.asyncio
+async def test_http_api_rewrites_poll_url_origin_to_api_base_when_enabled() -> None:
+    now = datetime(2026, 3, 16, tzinfo=UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "process_id": TEST_PROCESS_ID,
+                "sign_in_url": build_sign_in_url(base_url=SPLIT_CONSOLE),
+                "poll_url": build_poll_url(api_base_url=f"{SPLIT_CONSOLE}/api"),
+                "expires_at": _iso(now + timedelta(minutes=5)),
+            },
+        )
+
+    async with build_gateway(
+        handler,
+        origin=SPLIT_CONNECTOR,
+        browser_base_url=SPLIT_CONSOLE,
+        api_base_url=SPLIT_CONNECTOR_API,
+        allow_origin_rewrite=True,
+    ) as gateway:
+        process = await gateway.create_process("challenge-123")
+
+    # Browser keeps the console URL; CLI polls via the connector host.
+    assert process.sign_in_url == build_sign_in_url(base_url=SPLIT_CONSOLE)
+    assert process.poll_url == build_poll_url(api_base_url=SPLIT_CONNECTOR_API)
+
+
+@pytest.mark.asyncio
+async def test_http_api_rewrites_sign_in_url_origin_to_browser_base_when_enabled() -> (
+    None
+):
+    now = datetime(2026, 3, 16, tzinfo=UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "process_id": TEST_PROCESS_ID,
+                "sign_in_url": build_sign_in_url(base_url="https://internal.private"),
+                "poll_url": build_poll_url(api_base_url="https://internal.private/api"),
+                "expires_at": _iso(now + timedelta(minutes=5)),
+            },
+        )
+
+    async with build_gateway(
+        handler,
+        origin=SPLIT_CONNECTOR,
+        browser_base_url=SPLIT_CONSOLE,
+        api_base_url=SPLIT_CONNECTOR_API,
+        allow_origin_rewrite=True,
+    ) as gateway:
+        process = await gateway.create_process("challenge-123")
+
+    assert process.sign_in_url == build_sign_in_url(base_url=SPLIT_CONSOLE)
+    assert process.poll_url == build_poll_url(api_base_url=SPLIT_CONNECTOR_API)
+
+
+@pytest.mark.asyncio
+async def test_http_api_poll_rewrites_origin_to_api_base_when_enabled() -> None:
+    seen_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host)
+        assert request.url.path == "/api/vibe/sign-in/poll/poll-token-1"
+        return httpx.Response(
+            200, json={"status": "completed", "exchange_token": "exchange-1"}
+        )
+
+    async with build_gateway(
+        handler,
+        origin=SPLIT_CONNECTOR,
+        browser_base_url=SPLIT_CONSOLE,
+        api_base_url=SPLIT_CONNECTOR_API,
+        allow_origin_rewrite=True,
+    ) as gateway:
+        result = await gateway.poll(build_poll_url(api_base_url=f"{SPLIT_CONSOLE}/api"))
+
+    assert result.status == "completed"
+    assert seen_hosts == ["connector.example"]
+
+
+@pytest.mark.asyncio
+async def test_http_api_rejects_path_traversal_even_when_origin_rewrite_enabled() -> (
+    None
+):
+    now = datetime(2026, 3, 16, tzinfo=UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "process_id": TEST_PROCESS_ID,
+                "sign_in_url": build_sign_in_url(base_url=SPLIT_CONSOLE),
+                "poll_url": build_poll_url(api_base_url=f"{SPLIT_CONSOLE}/api/.."),
+                "expires_at": _iso(now + timedelta(minutes=5)),
+            },
+        )
+
+    async with build_gateway(
+        handler,
+        origin=SPLIT_CONNECTOR,
+        browser_base_url=SPLIT_CONSOLE,
+        api_base_url=SPLIT_CONNECTOR_API,
+        allow_origin_rewrite=True,
+    ) as gateway:
+        with pytest.raises(BrowserSignInError, match="start browser sign-in") as err:
+            await gateway.create_process("challenge-123")
+
+    assert err.value.code is BrowserSignInErrorCode.START_FAILED
+
+
+@pytest.mark.asyncio
+async def test_http_api_rejects_invalid_returned_poll_url_port_even_when_rewrite_enabled() -> (
+    None
+):
+    now = datetime(2026, 3, 16, tzinfo=UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "process_id": TEST_PROCESS_ID,
+                "sign_in_url": build_sign_in_url(base_url=SPLIT_CONSOLE),
+                "poll_url": f"{SPLIT_CONSOLE}:99999/api/vibe/sign-in/poll/poll-token-1",
+                "expires_at": _iso(now + timedelta(minutes=5)),
+            },
+        )
+
+    async with build_gateway(
+        handler,
+        origin=SPLIT_CONNECTOR,
+        browser_base_url=SPLIT_CONSOLE,
+        api_base_url=SPLIT_CONNECTOR_API,
+        allow_origin_rewrite=True,
+    ) as gateway:
+        with pytest.raises(BrowserSignInError, match="start browser sign-in") as err:
+            await gateway.create_process("challenge-123")
+
+    assert err.value.code is BrowserSignInErrorCode.START_FAILED
 
 
 @pytest.mark.asyncio

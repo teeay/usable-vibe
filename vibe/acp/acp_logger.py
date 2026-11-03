@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import re
 from typing import TYPE_CHECKING
@@ -11,6 +10,7 @@ from typing import TYPE_CHECKING
 from cachetools import TTLCache
 
 from vibe.core.paths import ACP_LOG_DIR, ACP_LOG_FILE
+from vibe.observability.logging import OwnerOnlyRotatingFileHandler
 
 if TYPE_CHECKING:
     from acp.connection import StreamEvent
@@ -39,13 +39,15 @@ def _get_logger() -> logging.Logger:
     if _logger is not None:
         return _logger
 
-    ACP_LOG_DIR.path.mkdir(parents=True, exist_ok=True)
+    # ACP transcripts hold full session messages, so the directory and file
+    # are created owner-only.
+    ACP_LOG_DIR.path.mkdir(parents=True, mode=0o700, exist_ok=True)
 
     logger = logging.getLogger("acp_messages")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    handler = RotatingFileHandler(
+    handler = OwnerOnlyRotatingFileHandler(
         ACP_LOG_FILE.path,
         maxBytes=MAX_LOG_SIZE_BYTES,
         backupCount=BACKUP_COUNT,

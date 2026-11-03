@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import timedelta
 import os
 from pathlib import Path
 import shutil
 import subprocess
+from threading import Event, Lock
 from typing import Any, cast
 
-from git import Repo
+from git import Git, Repo
 from git.exc import GitCommandError
 import pytest
 
 from vibe.core.git.errors import GitError
 import vibe.core.git.repo as git_repo_module
 from vibe.core.git.worktree import (
+    SNAPSHOT_REF_PREFIX,
     LinkedWorktree,
     ManagedWorktree,
     PreparedWorktree,
@@ -29,6 +34,22 @@ from vibe.core.git.worktree.record import (
 )
 import vibe.core.git.worktree.repository as worktree_module
 
+_OPEN_REPOS: list[Repo] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_git_repos() -> Iterator[None]:
+    yield
+    for repo in _OPEN_REPOS:
+        repo.close()
+    _OPEN_REPOS.clear()
+
+
+def _track_repo(repo: Repo) -> Repo:
+    _OPEN_REPOS.append(repo)
+    return repo
+
+
 # The API is scoped to a repository or to one managed worktree, so these keep a
 # test that only cares about the outcome down to a single call.
 
@@ -43,6 +64,19 @@ def _prepare_auto(
 ) -> PreparedWorktree:
     with WorktreeRepository.open(base) as repository:
         return repository.prepare_auto(prompt=prompt, suggested_name=suggested_name)
+
+
+def _prepare_fork(base: Path, *, suggested_name: str) -> PreparedWorktree:
+    with WorktreeRepository.open(base) as repository:
+        return repository.prepare_fork(suggested_name=suggested_name)
+
+
+def _finish_starts(*worktrees: PreparedWorktree) -> None:
+    for worktree in worktrees:
+        _hold(worktree.root, "test-session")
+        managed = ManagedWorktree.at(worktree.root)
+        assert managed is not None
+        managed.release_holder("test-session")
 
 
 def _linked(base: Path) -> tuple[LinkedWorktree, ...]:
@@ -67,12 +101,56 @@ def _release(cwd: Path, session_id: str | None = None) -> WorktreeRelease:
     return managed.release(session_id)
 
 
+def _write_hook(repo: Repo, marker: Path, name: str) -> None:
+    # The marker has to be absolute: hooks run with the new worktree (or
+    # wherever git runs them) as their cwd, so a relative marker would be
+    # written somewhere else and the test would pass even when the hook
+    # runs.
+    hooks = Path(repo.git_dir) / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / name
+    hook.write_text(f'#!/bin/sh\necho ran > "{marker}"\n')
+    hook.chmod(0o755)
+
+
+def _skip_unless_control_fires(
+    root: Path, marker: Path, *control: tuple[str, ...]
+) -> None:
+    # Control: every command here is one that would execute the thing under
+    # test, so confirm this environment runs it at all. Without it the
+    # assertions below could pass on a machine where it never runs.
+    fired = False
+    for args in control:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+        if marker.exists():
+            fired = True
+            marker.unlink()
+    if not fired:
+        pytest.skip("git did not execute the control command in this environment")
+
+
+# Creating and then deleting a branch is the smallest pair of commands that
+# both update a ref, which is what fires reference-transaction.
+_REF_UPDATE_CONTROL = (
+    ("branch", "ref-hook-control"),
+    ("branch", "-D", "ref-hook-control"),
+)
+
+
+def _commit_on_head(repo: Repo, message: str) -> None:
+    (Path(repo.working_dir) / "file.txt").write_text(f"{message}\n")
+    repo.index.add(["file.txt"])
+    repo.index.commit(message)
+
+
 def _init_repo(root: Path, *, separate_git_dir: Path | None = None) -> Repo:
-    repo = Repo.init(
-        root,
-        initial_branch="main",
-        separate_git_dir=separate_git_dir,
-        allow_unsafe_options=True,
+    repo = _track_repo(
+        Repo.init(
+            root,
+            initial_branch="main",
+            separate_git_dir=separate_git_dir,
+            allow_unsafe_options=True,
+        )
     )
     repo.config_writer().set_value("user", "name", "Tester").release()
     repo.config_writer().set_value("user", "email", "t@example.com").release()
@@ -107,6 +185,146 @@ def _claim(repo: Repo, name: str) -> WorktreeClaim:
     return WorktreeClaim(bucket=bucket, name=name)
 
 
+def test_worktree_creation_does_not_run_repository_hooks(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    marker = tmp_path / "hook-ran"
+    _write_hook(repo, marker, "post-checkout")
+    _skip_unless_control_fires(
+        tmp_path,
+        marker,
+        ("worktree", "add", str(tmp_path / "control"), "-b", "control"),
+    )
+
+    worktree = _prepare("hooked-worktree", tmp_path, branch="feat/hooked")
+
+    assert not marker.exists()
+    assert Path(worktree.root).is_dir()
+
+
+def test_worktree_reuse_of_existing_branch_does_not_run_repository_hooks(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path)
+    repo.create_head("feat/existing")
+    marker = tmp_path / "hook-ran"
+    _write_hook(repo, marker, "post-checkout")
+    _skip_unless_control_fires(
+        tmp_path,
+        marker,
+        ("worktree", "add", str(tmp_path / "control"), "-b", "control"),
+    )
+
+    worktree = _prepare("existing-worktree", tmp_path, branch="feat/existing")
+
+    assert not marker.exists()
+    assert Path(worktree.root).is_dir()
+
+
+def test_fetching_a_base_ref_does_not_run_repository_hooks(tmp_path: Path) -> None:
+    origin = _init_repo(tmp_path / "origin")
+    clone = _track_repo(Repo.clone_from(origin.working_dir, tmp_path / "clone"))
+    marker = tmp_path / "hook-ran"
+    _write_hook(clone, marker, "reference-transaction")
+    _skip_unless_control_fires(Path(clone.working_dir), marker, *_REF_UPDATE_CONTROL)
+
+    _commit_on_head(origin, "second")
+    git_repo_module.GitRepo(clone).fetch_branch("origin", "main")
+
+    assert not marker.exists()
+    # The fetch really moved the ref; without a ref update no hook could
+    # have fired anyway.
+    assert clone.rev_parse("origin/main").hexsha == origin.head.commit.hexsha
+
+
+@pytest.mark.parametrize("force", [True, False])
+def test_branch_deletion_does_not_run_repository_hooks(
+    tmp_path: Path, force: bool
+) -> None:
+    repo = _init_repo(tmp_path)
+    marker = tmp_path / "hook-ran"
+    _write_hook(repo, marker, "reference-transaction")
+    _skip_unless_control_fires(tmp_path, marker, *_REF_UPDATE_CONTROL)
+
+    # Points at HEAD, so the safe `-d` delete accepts it too.
+    repo.create_head("feat/deleted")
+    git_repo_module.GitRepo(repo).delete_branch("feat/deleted", force=force)
+
+    assert not marker.exists()
+    assert not git_repo_module.GitRepo(repo).branch_exists("feat/deleted")
+
+
+def test_managed_worktree_removal_does_not_run_repository_hooks(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    marker = tmp_path / "hook-ran"
+    _write_hook(repo, marker, "reference-transaction")
+    _skip_unless_control_fires(tmp_path, marker, *_REF_UPDATE_CONTROL)
+
+    worktree = _prepare("removed-worktree", tmp_path, branch="feat/removed")
+    worktree.remove()
+
+    assert not marker.exists()
+    assert not git_repo_module.GitRepo(repo).branch_exists("feat/removed")
+
+
+def test_snapshotting_a_worktree_does_not_run_repository_hooks(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="snapshotted")
+    marker = tmp_path / "hook-ran"
+    _write_hook(repo, marker, "reference-transaction")
+    _skip_unless_control_fires(Path(repo.working_dir), marker, *_REF_UPDATE_CONTROL)
+
+    ref = worktree.snapshot()
+
+    assert not marker.exists()
+    # The snapshot really wrote the ref; without a ref update no hook could
+    # have fired anyway.
+    assert repo.rev_parse(ref).hexsha
+
+
+def test_discarding_a_retained_snapshot_does_not_run_repository_hooks(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="discarded")
+    _finish_starts(worktree)
+    claim = _claim(repo, worktree.name)
+    assert ManagedWorktree.prune(limit=0) == 1
+    recovery = claim.read_recovery()
+    assert recovery is not None
+    marker = tmp_path / "hook-ran"
+    _write_hook(repo, marker, "reference-transaction")
+    _skip_unless_control_fires(Path(repo.working_dir), marker, *_REF_UPDATE_CONTROL)
+
+    assert _release(worktree.root).outcome is WorktreeReleaseOutcome.REMOVED
+
+    assert not marker.exists()
+    # The discard really deleted the ref; without a ref update no hook could
+    # have fired anyway.
+    with pytest.raises(GitCommandError):
+        repo.git.show_ref("--verify", recovery.snapshot_ref)
+
+
+def test_worktree_creation_does_not_run_the_repository_fsmonitor_command(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path)
+    marker = tmp_path / "fsmonitor-ran"
+    fsmonitor = tmp_path / "fsmonitor"
+    fsmonitor.write_text(f'#!/bin/sh\necho ran > "{marker}"\n')
+    fsmonitor.chmod(0o755)
+    repo.config_writer().set_value("core", "fsmonitor", str(fsmonitor)).release()
+    _skip_unless_control_fires(
+        tmp_path,
+        marker,
+        ("worktree", "add", str(tmp_path / "control"), "-b", "control"),
+    )
+
+    worktree = _prepare("fsmonitor-worktree", tmp_path, branch="feat/fsmonitor")
+
+    assert not marker.exists()
+    assert Path(worktree.root).is_dir()
+
+
 def test_creates_named_worktree_for_separate_branch(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
 
@@ -114,7 +332,7 @@ def test_creates_named_worktree_for_separate_branch(tmp_path: Path) -> None:
 
     assert worktree.name == "feature-worktree"
     assert worktree.branch == "feat/feature"
-    assert Repo(worktree.root).active_branch.name == "feat/feature"
+    assert _track_repo(Repo(worktree.root)).active_branch.name == "feat/feature"
     assert "feat/feature" in (head.name for head in repo.heads)
 
 
@@ -123,7 +341,7 @@ def test_prepare_worktree_forwards_branch(tmp_path: Path) -> None:
 
     path = _prepare("feature-worktree", tmp_path, branch="feat/feature").path
 
-    assert Repo(path).active_branch.name == "feat/feature"
+    assert _track_repo(Repo(path)).active_branch.name == "feat/feature"
     assert "feat/feature" in (head.name for head in repo.heads)
 
 
@@ -240,7 +458,7 @@ def test_root_level_system_alias_is_not_an_unstable_path_component(
 def test_cleanup_and_remove_use_separate_branch(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     worktree = _prepare("feature-worktree", tmp_path, branch="feat/feature")
-    worktree_repo = Repo(worktree.root)
+    worktree_repo = _track_repo(Repo(worktree.root))
     (worktree.root / "file.txt").write_text("changed\n")
     worktree_repo.index.add(["file.txt"])
     worktree_repo.index.commit("change")
@@ -264,6 +482,17 @@ def test_auto_worktree_records_ownership(tmp_path: Path) -> None:
     assert record.base_commit == worktree.base_commit
     assert record.branch_created is True
     assert record.repo_root == worktree.repo_root
+    assert _claim(repo, worktree.name).is_starting() is True
+
+
+def test_auto_worktree_stops_starting_when_held(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path)
+    claim = _claim(repo, worktree.name)
+
+    _hold(worktree.root, "session-a")
+
+    assert claim.is_starting() is False
 
 
 def test_auto_worktree_records_the_claim_before_creating_the_worktree(
@@ -274,8 +503,8 @@ def test_auto_worktree_records_the_claim_before_creating_the_worktree(
     seen: list[Any] = []
 
     def record_then_create(*args: Any, **kwargs: Any) -> None:
-        # The reservation must already be on disk here: a crash during the add
-        # is exactly what the sweep needs a breadcrumb for.
+        # The reservation must already be on disk here so a concurrent creator
+        # cannot claim the same managed worktree name while git is adding it.
         seen.append(_claim(repo, args[1].name).read())
         add_worktree(*args, **kwargs)
 
@@ -361,7 +590,11 @@ def test_release_removes_a_clean_worktree_and_its_branch(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("dirt", ["uncommitted", "untracked", "commit"])
-def test_release_keeps_a_worktree_holding_work(tmp_path: Path, dirt: str) -> None:
+def test_release_saves_the_work_before_removing_a_worktree(
+    tmp_path: Path, dirt: str
+) -> None:
+    # Work left behind is a reason to save it, not to keep the directory: the
+    # old rule kept the worktree and nothing ever collected it.
     repo = _init_repo(tmp_path)
     worktree = _prepare_auto(tmp_path)
     _hold(worktree.root, "session-a")
@@ -371,10 +604,44 @@ def test_release_keeps_a_worktree_holding_work(tmp_path: Path, dirt: str) -> Non
         case "untracked":
             (worktree.root / "new.txt").write_text("new\n")
         case "commit":
-            worktree_repo = Repo(worktree.root)
+            worktree_repo = _track_repo(Repo(worktree.root))
             (worktree.root / "file.txt").write_text("changed\n")
             worktree_repo.index.add(["file.txt"])
             worktree_repo.index.commit("change")
+
+    release = _release(worktree.root, "session-a")
+
+    assert release.outcome is WorktreeReleaseOutcome.REMOVED
+    assert not worktree.root.exists()
+    assert _claim(repo, worktree.name).read() is None
+
+    # The whole point of removing it anyway: the work is still reachable.
+    assert release.snapshot_ref is not None
+    saved = repo.commit(release.snapshot_ref)
+    match dirt:
+        case "uncommitted":
+            assert saved.tree["file.txt"].data_stream.read() == b"changed\n"
+        case "untracked":
+            assert saved.tree["new.txt"].data_stream.read() == b"new\n"
+        case "commit":
+            # `git branch -D` orphaned it; the ref is what keeps it reachable.
+            assert saved.parents[0].message.strip() == "change"
+
+
+def test_release_keeps_a_worktree_whose_work_could_not_be_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A failed snapshot is the one remaining reason to keep: removing then
+    # would be the data loss the snapshot exists to prevent.
+    repo = _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path)
+    _hold(worktree.root, "session-a")
+    (worktree.root / "new.txt").write_text("new\n")
+
+    def _fail(self: PreparedWorktree) -> str:
+        raise WorktreeError("no room on device")
+
+    monkeypatch.setattr(PreparedWorktree, "snapshot", _fail)
 
     release = _release(worktree.root, "session-a")
 
@@ -383,6 +650,21 @@ def test_release_keeps_a_worktree_holding_work(tmp_path: Path, dirt: str) -> Non
     assert worktree.root.is_dir()
     assert worktree.branch in (head.name for head in repo.heads)
     assert _claim(repo, worktree.name).read() is not None
+
+
+def test_release_leaves_no_snapshot_for_a_worktree_nothing_happened_in(
+    tmp_path: Path,
+) -> None:
+    # None rather than a ref, so a caller can tell "nothing to recover" from
+    # "recover here" without reading the commit.
+    _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path)
+    _hold(worktree.root, "session-a")
+
+    release = _release(worktree.root, "session-a")
+
+    assert release.outcome is WorktreeReleaseOutcome.REMOVED
+    assert release.snapshot_ref is None
 
 
 def test_release_keeps_a_worktree_another_session_still_holds(tmp_path: Path) -> None:
@@ -401,6 +683,29 @@ def test_release_keeps_a_worktree_another_session_still_holds(tmp_path: Path) ->
         _release(worktree.root, "session-b").outcome is WorktreeReleaseOutcome.REMOVED
     )
     assert not worktree.root.exists()
+
+
+def test_force_release_forgets_a_stale_claim_whose_root_is_gone(tmp_path: Path) -> None:
+    # A crashed start can leave the starting marker behind with the root
+    # already gone: the claim is forgotten, not kept in use forever.
+    repo = _init_repo(tmp_path)
+    target = _managed_worktree_root(repo) / "stale"
+    target.mkdir(parents=True)
+    claim = _claim(repo, "stale")
+    claim.mark_starting()
+    claim.write(
+        WorktreeRecord.new(
+            name="stale", branch="vibe/stale", repo_root=tmp_path, branch_created=True
+        )
+    )
+    shutil.rmtree(target)
+
+    stale = ManagedWorktree.at(target)
+    assert stale is not None
+    release = stale.force_release("session-a")
+
+    assert release.outcome is WorktreeReleaseOutcome.NOT_FOUND
+    assert claim.read() is None
 
 
 def test_release_ignores_a_worktree_vibe_did_not_create(tmp_path: Path) -> None:
@@ -469,124 +774,750 @@ def _age_claim(claim: WorktreeClaim, minutes: int) -> None:
     )
 
 
-def test_sweep_keeps_an_abandoned_clean_worktree(tmp_path: Path) -> None:
+def test_prune_snapshots_and_removes_the_oldest_worktree(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    oldest = _prepare_auto(Path(repo.working_dir), suggested_name="oldest")
+    newest = _prepare_auto(Path(repo.working_dir), suggested_name="newest")
+    _finish_starts(oldest, newest)
+    _age_claim(_claim(repo, oldest.name), 30)
+
+    removed = ManagedWorktree.prune(limit=1)
+
+    assert removed == 1
+    assert not oldest.root.exists()
+    assert newest.root.is_dir()
+    recovery = _claim(repo, oldest.name).read_recovery()
+    assert recovery is not None
+    saved = repo.commit(recovery.snapshot_ref)
+    assert saved.parents[0].hexsha == oldest.base_commit
+
+
+def test_prune_with_zero_removes_all_unheld_worktrees(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    first = _prepare_auto(Path(repo.working_dir), suggested_name="first")
+    second = _prepare_auto(Path(repo.working_dir), suggested_name="second")
+    _finish_starts(first, second)
+
+    removed = ManagedWorktree.prune(limit=0)
+
+    assert removed == 2
+    assert not first.root.exists()
+    assert not second.root.exists()
+
+
+def test_explicit_release_discards_a_retained_snapshot(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="retained")
+    _finish_starts(worktree)
+    (worktree.root / "saved.txt").write_text("recover me\n")
+    claim = _claim(repo, worktree.name)
+
+    assert ManagedWorktree.prune(limit=0) == 1
+    recovery = claim.read_recovery()
+    assert recovery is not None
+    assert repo.commit(recovery.snapshot_ref).hexsha
+
+    assert (
+        _release(worktree.root, "closed-session").outcome
+        is WorktreeReleaseOutcome.KEPT_UNMANAGED
+    )
+    assert claim.read_recovery() is not None
+    assert _release(worktree.root).outcome is WorktreeReleaseOutcome.REMOVED
+
+    assert claim.read_recovery() is None
+    assert not claim.directory.exists()
+    with pytest.raises(GitCommandError):
+        repo.git.show_ref("--verify", recovery.snapshot_ref)
+
+
+def test_prune_keeps_a_worktree_that_has_not_been_held_yet(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    starting = _prepare_auto(Path(repo.working_dir), suggested_name="starting")
+    removable = _prepare_auto(Path(repo.working_dir), suggested_name="removable")
+    _finish_starts(removable)
+
+    removed = ManagedWorktree.prune(limit=0)
+
+    assert removed == 1
+    assert starting.root.is_dir()
+    assert not removable.root.exists()
+
+
+def test_prune_keeps_a_worktree_held_while_a_session_attaches(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="reserved")
+    _finish_starts(worktree)
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    pending_hold = managed.hold_for_attachment()
+    assert pending_hold is not None
+
+    assert ManagedWorktree.prune(limit=0) == 0
+
+    managed.hold("session-a", pending_hold)
+    assert managed.holders() == frozenset({"session-a"})
+    managed.release_holder("session-a")
+
+
+def test_prune_keeps_an_incomplete_worktree_held_while_a_session_attaches(
+    tmp_path: Path,
+) -> None:
     repo = _init_repo(tmp_path)
-    worktree = _prepare_auto(tmp_path)
-    _age_claim(_claim(repo, worktree.name), 30)
+    target = _managed_worktree_root(repo) / "reserved"
+    target.mkdir(parents=True)
+    repo.create_head("vibe/reserved")
+    claim = _claim(repo, "reserved")
+    claim.write(
+        WorktreeRecord.new(
+            name="reserved",
+            branch="vibe/reserved",
+            repo_root=tmp_path,
+            branch_created=True,
+        )
+    )
+    managed = ManagedWorktree(claim=claim)
+    pending_hold = managed.hold_for_attachment()
+    assert pending_hold is not None
 
-    WorktreeRepository.sweep_claims(tmp_path)
+    assert ManagedWorktree.prune(limit=0) == 0
 
-    # An app-server that died leaves no way to know the session was finished
-    # with, and its session is still on disk and resumable. Only the user
-    # deleting the session removes a worktree that exists.
-    assert worktree.root.is_dir()
-    assert worktree.branch in (head.name for head in repo.heads)
-    assert _claim(repo, worktree.name).read() is not None
-
-
-def test_sweep_spares_a_claim_inside_the_grace_period(tmp_path: Path) -> None:
-    repo = _init_repo(tmp_path)
-    worktree = _prepare_auto(tmp_path)
-
-    WorktreeRepository.sweep_claims(tmp_path)
-
-    # A session that finished `git worktree add` has no holder until it
-    # attaches; sweeping here would delete the worktree it is starting in.
-    assert worktree.root.is_dir()
-    assert _claim(repo, worktree.name).read() is not None
-
-
-def test_sweep_spares_a_held_worktree(tmp_path: Path) -> None:
-    repo = _init_repo(tmp_path)
-    worktree = _prepare_auto(tmp_path)
-    _hold(worktree.root, "session-a")
-    _age_claim(_claim(repo, worktree.name), 30)
-
-    WorktreeRepository.sweep_claims(tmp_path)
-
-    assert worktree.root.is_dir()
+    assert target.is_dir()
+    assert claim.read() is not None
+    assert "vibe/reserved" in (head.name for head in repo.heads)
+    pending_hold.release()
 
 
-def test_sweep_spares_an_abandoned_worktree_holding_work(tmp_path: Path) -> None:
-    repo = _init_repo(tmp_path)
-    worktree = _prepare_auto(tmp_path)
-    (worktree.root / "unsaved.txt").write_text("work\n")
-    _age_claim(_claim(repo, worktree.name), 30)
-
-    WorktreeRepository.sweep_claims(tmp_path)
-
-    assert worktree.root.is_dir()
-    assert worktree.branch in (head.name for head in repo.heads)
-
-
-def test_sweep_never_touches_a_directory_without_a_claim(tmp_path: Path) -> None:
-    repo = _init_repo(tmp_path)
-    worktree = _prepare_auto(tmp_path)
-    shutil.rmtree(worktree_module.WORKTREES_DIR.path / ".claims")
-
-    WorktreeRepository.sweep_claims(tmp_path)
-
-    # This is the live mkdir reservation case too: no claim means not ours.
-    assert worktree.root.is_dir()
-    assert worktree.branch in (head.name for head in repo.heads)
-
-
-def test_sweep_discards_a_reservation_that_never_became_a_worktree(
+def test_hold_preserves_a_record_completed_during_attachment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="attaching")
+    claim = _claim(repo, worktree.name)
+    incomplete = claim.read()
+    assert incomplete is not None
+    claim.write(incomplete.model_copy(update={"base_commit": None}))
+    managed = ManagedWorktree(claim=claim)
+    pending_hold = managed.hold_for_attachment()
+    assert pending_hold is not None
+    add_holder = WorktreeClaim.add_holder
 
-    def fail_create(*args: Any, **kwargs: Any) -> None:
-        raise WorktreeError("crashed before the add finished")
+    def complete_during_add(current: WorktreeClaim, session_id: str) -> None:
+        add_holder(current, session_id)
+        if current == claim and session_id == "session-a":
+            current.write(incomplete)
 
-    monkeypatch.setattr(git_repo_module.GitRepo, "add_worktree", fail_create)
-    with pytest.raises(WorktreeError):
-        _prepare_auto(tmp_path)
-    # Rebuild the reservation the crash would have stranded. Not undoing the
-    # patch first: monkeypatch.undo() reverts what the fixtures set too, and
-    # the redirected VIBE_HOME is one of them, so everything written after it
-    # lands in the developer's real home.
-    reservation = _managed_worktree_root(repo) / "stranded"
-    reservation.mkdir(parents=True)
-    _claim(repo, "stranded").write(
+    monkeypatch.setattr(WorktreeClaim, "add_holder", complete_during_add)
+
+    managed.hold("session-a", pending_hold)
+
+    record = claim.read()
+    assert record is not None
+    assert record.base_commit == worktree.base_commit
+    managed.release_holder("session-a")
+
+
+def test_concurrent_prunes_do_not_remove_below_the_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    oldest = _prepare_auto(Path(repo.working_dir), suggested_name="oldest")
+    newest = _prepare_auto(Path(repo.working_dir), suggested_name="newest")
+    _finish_starts(oldest, newest)
+    _age_claim(_claim(repo, oldest.name), 30)
+    inspection_started = Event()
+    release_inspection = Event()
+    snapshot = PreparedWorktree.snapshot
+
+    def pause_snapshot(prepared: PreparedWorktree) -> str:
+        if prepared.name == oldest.name:
+            inspection_started.set()
+            assert release_inspection.wait(timeout=5)
+        return snapshot(prepared)
+
+    real_prune_lock = worktree_module.worktree_prune_lock
+    lock_attempts = 0
+    attempts_lock = Lock()
+    second_started = Event()
+
+    @contextmanager
+    def observe_prune_lock() -> Iterator[None]:
+        nonlocal lock_attempts
+        with attempts_lock:
+            lock_attempts += 1
+            if lock_attempts == 2:
+                second_started.set()
+        with real_prune_lock():
+            yield
+
+    monkeypatch.setattr(PreparedWorktree, "snapshot", pause_snapshot)
+    monkeypatch.setattr(worktree_module, "worktree_prune_lock", observe_prune_lock)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(ManagedWorktree.prune, 1)
+        assert inspection_started.wait(timeout=5)
+        second = executor.submit(ManagedWorktree.prune, 1)
+        assert second_started.wait(timeout=5)
+        release_inspection.set()
+        assert sorted((first.result(timeout=10), second.result(timeout=10))) == [0, 1]
+
+    assert not oldest.root.exists()
+    assert newest.root.is_dir()
+
+
+def test_prune_discards_an_abandoned_empty_reservation(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    target = _managed_worktree_root(repo) / "stranded"
+    target.mkdir(parents=True)
+    repo.create_head("vibe/stranded")
+    claim = _claim(repo, "stranded")
+    claim.write(
         WorktreeRecord.new(
             name="stranded",
             branch="vibe/stranded",
             repo_root=tmp_path,
-            branch_created=False,
+            branch_created=True,
         )
     )
-    _age_claim(_claim(repo, "stranded"), 30)
+    marker = claim.directory / "holders" / ".starting"
+    marker.parent.mkdir()
+    marker.touch()
 
-    WorktreeRepository.sweep_claims(tmp_path)
+    removed = ManagedWorktree.prune(limit=15)
 
-    assert not reservation.exists()
-    assert _claim(repo, "stranded").read() is None
+    assert removed == 0
+    assert not target.exists()
+    assert claim.read() is None
+    assert "vibe/stranded" not in (head.name for head in repo.heads)
+    assert _prepare_auto(tmp_path, suggested_name="stranded").name == "stranded"
 
 
-def test_sweep_keeps_a_populated_worktree_whose_claim_has_no_base_commit(
+def test_prune_keeps_an_active_empty_reservation(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    target = _managed_worktree_root(repo) / "starting"
+    target.mkdir(parents=True)
+    claim = _claim(repo, "starting")
+    claim.mark_starting()
+    claim.write(
+        WorktreeRecord.new(
+            name="starting",
+            branch="vibe/starting",
+            repo_root=tmp_path,
+            branch_created=True,
+        )
+    )
+
+    ManagedWorktree.prune(limit=0)
+
+    assert target.is_dir()
+    assert claim.read() is not None
+    claim.delete()
+    target.rmdir()
+
+
+def test_prune_snapshots_a_populated_incomplete_reservation(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="interrupted")
+    claim = _claim(repo, worktree.name)
+    record = claim.read()
+    assert record is not None
+    claim.write(record.model_copy(update={"base_commit": None}))
+    claim.finish_starting()
+
+    ManagedWorktree.prune(limit=0)
+
+    assert not worktree.root.exists()
+    assert claim.read() is None
+    recovery = claim.read_recovery()
+    assert recovery is not None
+    assert repo.commit(recovery.snapshot_ref).hexsha
+
+
+def test_prune_keeps_a_populated_incomplete_reservation_without_gitlink(
     tmp_path: Path,
 ) -> None:
     repo = _init_repo(tmp_path)
-    worktree = _prepare_auto(tmp_path)
-    record = _claim(repo, worktree.name).read()
-    assert record is not None
-    # A process killed between `git worktree add` and the second record write.
-    _claim(repo, worktree.name).write(
-        record.model_copy(
-            update={
-                "base_commit": None,
-                "claimed_at": record.claimed_at - timedelta(minutes=30),
-            }
+    target = _managed_worktree_root(repo) / "interrupted"
+    target.mkdir(parents=True)
+    (target / "partial.txt").write_text("partial\n")
+    repo.create_head("vibe/interrupted")
+    claim = _claim(repo, "interrupted")
+    claim.write(
+        WorktreeRecord.new(
+            name="interrupted",
+            branch="vibe/interrupted",
+            repo_root=tmp_path,
+            branch_created=True,
         )
     )
 
-    WorktreeRepository.sweep_claims(tmp_path)
+    ManagedWorktree.prune(limit=0)
 
-    # Discarding here would rmdir-fail on the populated directory and drop the
-    # record, orphaning the worktree for good.
+    assert target.is_dir()
+    assert (target / "partial.txt").read_text() == "partial\n"
+    assert claim.read() is not None
+    assert "vibe/interrupted" in (head.name for head in repo.heads)
+
+
+def test_prune_snapshots_worktrees_with_unpushed_commits(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    unpushed = _prepare_auto(Path(repo.working_dir), suggested_name="unpushed")
+    newest = _prepare_auto(Path(repo.working_dir), suggested_name="newest")
+    _finish_starts(unpushed, newest)
+    unpushed_repo = _track_repo(Repo(unpushed.root))
+    (unpushed.root / "local.txt").write_text("local\n")
+    unpushed_repo.index.add(["local.txt"])
+    unpushed_repo.index.commit("local only")
+    _age_claim(_claim(repo, unpushed.name), 30)
+
+    removed = ManagedWorktree.prune(limit=1)
+
+    assert removed == 1
+    assert not unpushed.root.exists()
+    assert newest.root.is_dir()
+    recovery = _claim(repo, unpushed.name).read_recovery()
+    assert recovery is not None
+    saved = repo.commit(recovery.snapshot_ref)
+    assert saved.tree["local.txt"].data_stream.read() == b"local\n"
+    assert saved.parents[0].message.strip() == "local only"
+
+
+def test_prune_snapshots_dirty_and_untracked_but_keeps_held_worktrees(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    dirty = _prepare_auto(Path(repo.working_dir), suggested_name="dirty")
+    untracked = _prepare_auto(Path(repo.working_dir), suggested_name="untracked")
+    held = _prepare_auto(Path(repo.working_dir), suggested_name="held")
+    removable = _prepare_auto(Path(repo.working_dir), suggested_name="removable")
+    newest = _prepare_auto(Path(repo.working_dir), suggested_name="newest")
+    _finish_starts(dirty, untracked, held, removable, newest)
+    (dirty.root / "file.txt").write_text("changed\n")
+    (untracked.root / "untracked.txt").write_text("local\n")
+    _hold(held.root, "session-a")
+    _age_claim(_claim(repo, dirty.name), 50)
+    _age_claim(_claim(repo, untracked.name), 40)
+    _age_claim(_claim(repo, held.name), 30)
+    _age_claim(_claim(repo, removable.name), 20)
+
+    removed = ManagedWorktree.prune(limit=3)
+
+    assert removed == 2
+    assert not dirty.root.exists()
+    assert not untracked.root.exists()
+    assert held.root.is_dir()
+    assert removable.root.is_dir()
+    assert newest.root.is_dir()
+    dirty_recovery = _claim(repo, dirty.name).read_recovery()
+    untracked_recovery = _claim(repo, untracked.name).read_recovery()
+    assert dirty_recovery is not None
+    assert untracked_recovery is not None
+    assert (
+        repo.commit(dirty_recovery.snapshot_ref).tree["file.txt"].data_stream.read()
+        == b"changed\n"
+    )
+    untracked_snapshot = repo.commit(untracked_recovery.snapshot_ref)
+    assert untracked_snapshot.tree["untracked.txt"].data_stream.read() == b"local\n"
+
+
+def test_prune_keeps_a_worktree_when_snapshot_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    kept = _prepare_auto(Path(repo.working_dir), suggested_name="kept")
+    removed = _prepare_auto(Path(repo.working_dir), suggested_name="removed")
+    _finish_starts(kept, removed)
+    _age_claim(_claim(repo, kept.name), 30)
+    _age_claim(_claim(repo, removed.name), 20)
+    snapshot = PreparedWorktree.snapshot
+
+    def fail_oldest(prepared: PreparedWorktree) -> str:
+        if prepared.name == kept.name:
+            raise WorktreeError("no room on device")
+        return snapshot(prepared)
+
+    monkeypatch.setattr(PreparedWorktree, "snapshot", fail_oldest)
+
+    removed_count = ManagedWorktree.prune(limit=1)
+
+    assert removed_count == 1
+    assert kept.root.is_dir()
+    assert _claim(repo, kept.name).read_recovery() is None
+    assert not removed.root.exists()
+
+
+def test_restore_recreates_a_pruned_worktree_from_its_snapshot(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    nested = worktree.root / "packages" / "app"
+    nested.mkdir(parents=True)
+    (nested / "saved.txt").write_text("recover me\n")
+
+    assert ManagedWorktree.prune(limit=0) == 1
+    assert not worktree.root.exists()
+
+    managed = ManagedWorktree.at(nested)
+    assert managed is not None
+    assert managed.restore(nested) is True
+
+    assert (nested / "saved.txt").read_text() == "recover me\n"
+    assert _claim(repo, worktree.name).read_recovery() is None
+    restored_record = _claim(repo, worktree.name).read()
+    assert restored_record is not None
+    assert restored_record.branch == worktree.branch
+
+
+def test_restore_recreates_a_missing_empty_nested_cwd(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    nested = worktree.root / "packages" / "app"
+    nested.mkdir(parents=True)
+
+    assert ManagedWorktree.prune(limit=0) == 1
+    assert not worktree.root.exists()
+
+    managed = ManagedWorktree.at(nested)
+    assert managed is not None
+    assert managed.restore(nested) is True
+
+    assert nested.is_dir()
+    assert _claim(repo, worktree.name).read_recovery() is None
+
+
+def test_restore_keeps_recovery_when_the_saved_directory_cannot_be_recreated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    nested = (worktree.root / "packages" / "app").resolve()
+    nested.mkdir(parents=True)
+
+    assert ManagedWorktree.prune(limit=0) == 1
+    mkdir = Path.mkdir
+
+    def fail_saved_directory(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path == nested:
+            raise OSError("cannot recreate saved directory")
+        mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_saved_directory)
+    managed = ManagedWorktree.at(nested)
+    assert managed is not None
+    with pytest.raises(WorktreeError, match="does not contain the saved directory"):
+        managed.restore(nested)
+
     assert worktree.root.is_dir()
-    assert _claim(repo, worktree.name).read() is not None
+    assert _claim(repo, worktree.name).read_recovery() is not None
+    assert _claim(repo, worktree.name).is_starting() is False
+
+
+def test_restore_replaces_an_empty_leftover_when_cwd_is_nested(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    nested = worktree.root / "packages" / "app"
+    nested.mkdir(parents=True)
+    (nested / "saved.txt").write_text("recover me\n")
+
+    assert ManagedWorktree.prune(limit=0) == 1
+    worktree.root.mkdir(parents=True)
+
+    managed = ManagedWorktree.at(nested)
+    assert managed is not None
+    assert managed.restore(nested) is True
+
+    assert (nested / "saved.txt").read_text() == "recover me\n"
+    assert _claim(repo, worktree.name).read_recovery() is None
+
+
+def test_restore_rejects_an_occupied_leftover_checkout_directory(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    (worktree.root / "saved.txt").write_text("recover me\n")
+
+    assert ManagedWorktree.prune(limit=0) == 1
+    worktree.root.mkdir(parents=True)
+    occupied = worktree.root / "unrelated.txt"
+    occupied.write_text("do not replace\n")
+
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    with pytest.raises(WorktreeError, match="occupied worktree path"):
+        managed.restore(worktree.root)
+
+    assert occupied.read_text() == "do not replace\n"
+    assert _claim(repo, worktree.name).read_recovery() is not None
+
+
+def test_restore_keeps_an_active_empty_reservation(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    (worktree.root / "saved.txt").write_text("recover me\n")
+
+    assert ManagedWorktree.prune(limit=0) == 1
+    claim = _claim(repo, worktree.name)
+    claim.mark_starting()
+    worktree.root.mkdir(parents=True)
+
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    with pytest.raises(WorktreeError, match="already in progress"):
+        managed.restore(worktree.root)
+
+    assert worktree.root.is_dir()
+    assert claim.read_recovery() is not None
+    claim.finish_starting()
+    worktree.root.rmdir()
+
+
+def test_concurrent_restore_keeps_the_completed_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    (worktree.root / "saved.txt").write_text("recover me\n")
+    assert ManagedWorktree.prune(limit=0) == 1
+
+    reserved = Event()
+    release = Event()
+    pause_lock = Lock()
+    paused = False
+    mkdir = Path.mkdir
+
+    def pause_first_reservation(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal paused
+        mkdir(path, *args, **kwargs)
+        if path != worktree.root:
+            return
+        with pause_lock:
+            first = not paused
+            paused = True
+        if first:
+            reserved.set()
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(Path, "mkdir", pause_first_reservation)
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(managed.restore, worktree.root)
+        assert reserved.wait(timeout=5)
+        second = executor.submit(managed.restore, worktree.root)
+        release.set()
+        assert first.result(timeout=10) is True
+        assert second.result(timeout=10) is False
+
+    record = _claim(repo, worktree.name).read()
+    assert record is not None
+    assert record.base_commit is not None
+    assert (worktree.root / "saved.txt").read_text() == "recover me\n"
+    _claim(repo, worktree.name).finish_starting()
+
+
+def test_prune_keeps_a_worktree_when_restore_starts_during_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="busy")
+    _finish_starts(worktree)
+    claim = _claim(repo, worktree.name)
+    snapshot = PreparedWorktree.snapshot
+
+    def start_restore_during_snapshot(prepared: PreparedWorktree) -> str:
+        claim.mark_starting()
+        return snapshot(prepared)
+
+    monkeypatch.setattr(PreparedWorktree, "snapshot", start_restore_during_snapshot)
+
+    assert ManagedWorktree.prune(limit=0) == 0
+    assert worktree.root.is_dir()
+    assert claim.read() is not None
+    assert claim.read_recovery() is None
+    claim.finish_starting()
+
+
+def test_restore_waits_for_in_flight_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    (worktree.root / "saved.txt").write_text("recover me\n")
+    snapshot_started = Event()
+    finish_snapshot = Event()
+    restore_started = Event()
+    restore_entered = Event()
+    snapshot = PreparedWorktree.snapshot
+    restore_locked = ManagedWorktree._restore_locked
+
+    def pause_snapshot(prepared: PreparedWorktree) -> str:
+        snapshot_started.set()
+        assert finish_snapshot.wait(timeout=5)
+        return snapshot(prepared)
+
+    def observe_restore(managed: ManagedWorktree, requested: Path, root: Path) -> bool:
+        restore_entered.set()
+        return restore_locked(managed, requested, root)
+
+    monkeypatch.setattr(PreparedWorktree, "snapshot", pause_snapshot)
+    monkeypatch.setattr(ManagedWorktree, "_restore_locked", observe_restore)
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+
+    def run_restore() -> bool:
+        restore_started.set()
+        return managed.restore(worktree.root)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        prune = executor.submit(ManagedWorktree.prune, 0)
+        assert snapshot_started.wait(timeout=5)
+        restore = executor.submit(run_restore)
+        assert restore_started.wait(timeout=5)
+        assert not restore_entered.is_set()
+        finish_snapshot.set()
+        assert prune.result(timeout=10) == 1
+        assert restore.result(timeout=10) is True
+
+    assert restore_entered.is_set()
+    assert (worktree.root / "saved.txt").read_text() == "recover me\n"
+    assert _claim(repo, worktree.name).read_recovery() is None
+    _claim(repo, worktree.name).finish_starting()
+
+
+def test_restore_does_not_drop_a_completed_claim_when_the_path_is_occupied(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    (worktree.root / "saved.txt").write_text("recover me\n")
+
+    assert ManagedWorktree.prune(limit=0) == 1
+    claim = _claim(repo, worktree.name)
+    recovery = claim.read_recovery()
+    assert recovery is not None
+    with WorktreeRepository.open(Path(repo.working_dir)) as repository:
+        repository.restore(claim, recovery)
+        claim.finish_starting()
+        claim.write_recovery(recovery)
+        with pytest.raises(WorktreeError, match="occupied worktree path"):
+            repository.restore(claim, recovery)
+
+    restored = claim.read()
+    assert restored is not None
+    assert restored.base_commit is not None
+    _hold(worktree.root, "session-a")
+    assert _holders(worktree.root) == frozenset({"session-a"})
+    assert (worktree.root / "saved.txt").read_text() == "recover me\n"
+
+
+def test_restore_discards_stale_recovery_for_a_completed_checkout(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    (worktree.root / "saved.txt").write_text("recover me\n")
+
+    assert ManagedWorktree.prune(limit=0) == 1
+    claim = _claim(repo, worktree.name)
+    recovery = claim.read_recovery()
+    assert recovery is not None
+    with WorktreeRepository.open(Path(repo.working_dir)) as repository:
+        repository.restore(claim, recovery)
+    claim.write_recovery(recovery)
+    claim.finish_starting()
+
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    assert managed.restore(worktree.root) is False
+
+    assert (worktree.root / "saved.txt").read_text() == "recover me\n"
+    assert claim.read_recovery() is None
+
+
+def test_restore_does_not_leave_a_directory_when_the_branch_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    (worktree.root / "saved.txt").write_text("recover me\n")
+    assert ManagedWorktree.prune(limit=0) == 1
+
+    def fail_branch(_repository: WorktreeRepository, preferred: str) -> str:
+        raise WorktreeError(
+            f"Unable to find an unused recovery branch for {preferred!r}."
+        )
+
+    monkeypatch.setattr(WorktreeRepository, "_available_recovery_branch", fail_branch)
+
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    with pytest.raises(WorktreeError, match="unused recovery branch"):
+        managed.restore(worktree.root)
+
+    assert not worktree.root.exists()
+    assert _claim(repo, worktree.name).read_recovery() is not None
+
+
+def test_restore_releases_starting_marker_when_recovery_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="restore-me")
+    _finish_starts(worktree)
+    assert ManagedWorktree.prune(limit=0) == 1
+    claim = _claim(repo, worktree.name)
+
+    delete_recovery = WorktreeClaim.delete_recovery
+
+    def fail_delete_recovery(candidate: WorktreeClaim) -> None:
+        if candidate == claim:
+            raise OSError("disk full")
+        delete_recovery(candidate)
+
+    monkeypatch.setattr(WorktreeClaim, "delete_recovery", fail_delete_recovery)
+    managed = ManagedWorktree(claim=claim)
+
+    with pytest.raises(OSError, match="disk full"):
+        managed.restore(worktree.root)
+
+    assert claim.is_starting() is False
+
+
+def test_auto_name_does_not_reuse_a_retained_snapshot(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = _prepare_auto(Path(repo.working_dir), suggested_name="reserved")
+    _finish_starts(worktree)
+    assert ManagedWorktree.prune(limit=0) == 1
+
+    replacement = _prepare_auto(Path(repo.working_dir), suggested_name=worktree.name)
+
+    assert replacement.name == "reserved-2"
+
+
+def test_prune_applies_the_limit_across_repositories(tmp_path: Path) -> None:
+    first_repo = _init_repo(tmp_path / "first")
+    second_repo = _init_repo(tmp_path / "second")
+    oldest = _prepare_auto(Path(first_repo.working_dir), suggested_name="oldest")
+    newest = _prepare_auto(Path(second_repo.working_dir), suggested_name="newest")
+    _finish_starts(oldest, newest)
+    _age_claim(_claim(first_repo, oldest.name), 30)
+
+    removed = ManagedWorktree.prune(limit=1)
+
+    assert removed == 1
+    assert not oldest.root.exists()
+    assert newest.root.is_dir()
 
 
 def test_release_keeps_a_worktree_claimed_while_it_was_inspected(
@@ -612,8 +1543,207 @@ def test_release_keeps_a_worktree_claimed_while_it_was_inspected(
     assert worktree.branch in (head.name for head in repo.heads)
 
 
-def test_sweep_ignores_a_non_git_path(tmp_path: Path) -> None:
-    WorktreeRepository.sweep_claims(tmp_path)
+def test_reap_snapshots_a_clean_worktree_before_removal(tmp_path: Path) -> None:
+    """*Prepare*: A finished, clean managed worktree.
+    *Do*: Reap that exact worktree.
+    *Assert*: Its complete Git state remains reachable from the hidden snapshot ref.
+    """
+    # Prepare
+    repo = _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="archived-session")
+    _finish_starts(worktree)
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+
+    # Do
+    release = managed.reap()
+
+    # Assert
+    assert release.outcome is WorktreeReleaseOutcome.REMOVED
+    assert release.snapshot_ref == f"{SNAPSHOT_REF_PREFIX}/{worktree.name}"
+    assert not worktree.root.exists()
+    saved = repo.commit(release.snapshot_ref)
+    assert saved.tree["file.txt"].data_stream.read() == b"hello\n"
+
+
+def test_reap_keeps_a_held_worktree(tmp_path: Path) -> None:
+    """*Prepare*: A managed worktree held by a running session.
+    *Do*: Request targeted reaping.
+    *Assert*: The worktree remains until its holder is released.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="running-session")
+    _hold(worktree.root, "session-a")
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+
+    # Do
+    release = managed.reap()
+
+    # Assert
+    assert release.outcome is WorktreeReleaseOutcome.KEPT_IN_USE
+    assert worktree.root.is_dir()
+
+    # Do
+    managed.release_holder("session-a")
+    completed = managed.reap_if_requested()
+
+    # Assert
+    assert completed is not None
+    assert completed.outcome is WorktreeReleaseOutcome.REMOVED
+    assert not worktree.root.exists()
+
+
+def test_cancel_reap_keeps_the_worktree_after_its_holder_exits(tmp_path: Path) -> None:
+    """*Prepare*: A held worktree with a pending reap request.
+    *Do*: Cancel the request before releasing its holder.
+    *Assert*: Holder release does not snapshot or remove the worktree.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="restored-session")
+    _hold(worktree.root, "session-a")
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    assert managed.reap().outcome is WorktreeReleaseOutcome.KEPT_IN_USE
+
+    # Do
+    managed.cancel_reap()
+    managed.release_holder("session-a")
+
+    # Assert
+    assert managed.reap_if_requested() is None
+    assert worktree.root.is_dir()
+
+
+def test_cancelled_reap_request_cannot_be_reactivated_by_delayed_work(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: An unarchive cancels an identified reap before it starts.
+    *Do*: The delayed archive request reaches the worktree afterwards.
+    *Assert*: The cancelled request cannot restore the pending reap or remove it.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="cancelled-before-reap")
+    _finish_starts(worktree)
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    managed.cancel_reap(requester_id="session-a", request_id="request-a")
+
+    # Do
+    release = managed.reap(requester_id="session-a", request_id="request-a")
+
+    # Assert
+    assert release.outcome is WorktreeReleaseOutcome.KEPT_CANCELLED
+    record = managed.claim.read()
+    assert record is not None
+    assert record.reap_requested is False
+    assert worktree.root.is_dir()
+
+
+def test_cancel_reap_without_a_persisted_request_is_a_noop(tmp_path: Path) -> None:
+    """An unarchive can predate cleanup and therefore have no reap to cancel."""
+    _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="archived-before-cleanup")
+    _finish_starts(worktree)
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    before = managed.claim.read()
+
+    managed.cancel_reap(requester_id="session-a")
+
+    assert managed.claim.read() == before
+    assert worktree.root.is_dir()
+
+
+def test_cancel_reap_preserves_another_sessions_request(tmp_path: Path) -> None:
+    """*Prepare*: Two archived sessions request one held worktree's removal.
+    *Do*: Restore one session and cancel only its request.
+    *Assert*: The other archived session keeps the persisted reap active.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="shared-archive")
+    _hold(worktree.root, "holder")
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    assert (
+        managed.reap(requester_id="session-a", request_id="request-a").outcome
+        is WorktreeReleaseOutcome.KEPT_IN_USE
+    )
+    assert (
+        managed.reap(requester_id="session-b", request_id="request-b").outcome
+        is WorktreeReleaseOutcome.KEPT_IN_USE
+    )
+
+    # Do
+    managed.cancel_reap(requester_id="session-a", request_id="request-a")
+
+    # Assert
+    record = managed.claim.read()
+    assert record is not None
+    assert record.reap_requested is True
+    assert record.reap_requests == {"session-b": "request-b"}
+
+
+def test_cancel_during_reap_snapshot_keeps_the_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """*Prepare*: A reap is snapshotting an unheld managed worktree.
+    *Do*: Unarchive cancels that request before removal.
+    *Assert*: The final persisted-state check keeps the restored worktree.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="cancel-during-snapshot")
+    _finish_starts(worktree)
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    snapshot = PreparedWorktree.snapshot
+
+    def cancel_after_snapshot(prepared: PreparedWorktree) -> str:
+        snapshot_ref = snapshot(prepared)
+        managed.cancel_reap(requester_id="session-a", request_id="request-a")
+        return snapshot_ref
+
+    monkeypatch.setattr(PreparedWorktree, "snapshot", cancel_after_snapshot)
+
+    # Do
+    release = managed.reap(requester_id="session-a", request_id="request-a")
+
+    # Assert
+    assert release.outcome is WorktreeReleaseOutcome.KEPT_CANCELLED
+    record = managed.claim.read()
+    assert record is not None
+    assert record.reap_requested is False
+    assert worktree.root.is_dir()
+
+
+def test_prune_completes_a_pending_reap_below_the_retention_limit(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: An unheld worktree whose reap request survived a process restart.
+    *Do*: Run retention cleanup while the worktree count is below the limit.
+    *Assert*: The explicit reap still snapshots and removes the worktree.
+    """
+    # Prepare
+    repo = _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, suggested_name="pending-reap")
+    _hold(worktree.root, "session-a")
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+    assert managed.reap().outcome is WorktreeReleaseOutcome.KEPT_IN_USE
+    managed.release_holder("session-a")
+
+    # Do
+    removed = ManagedWorktree.prune(limit=10)
+
+    # Assert
+    assert removed == 1
+    assert not worktree.root.exists()
+    assert repo.commit(f"{SNAPSHOT_REF_PREFIX}/{worktree.name}")
 
 
 def test_remove_worktree_does_not_change_the_process_directory(
@@ -685,7 +1815,7 @@ def test_cleanup_detects_untracked_files_when_git_config_hides_them(
 def test_cleanup_detects_detached_head_commit(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     worktree = _prepare("feature", tmp_path)
-    worktree_repo = Repo(worktree.root)
+    worktree_repo = _track_repo(Repo(worktree.root))
     worktree_repo.git.checkout("--detach")
     (worktree.root / "file.txt").write_text("detached change\n")
     worktree_repo.index.add(["file.txt"])
@@ -826,7 +1956,7 @@ def test_skips_worktree_when_project_path_is_foreign_repository(tmp_path: Path) 
     repo.index.add(["packages/app/app.py"])
     repo.index.commit("add project")
     worktree = _prepare("foreign", project, branch="feat/foreign")
-    Repo.init(worktree.path)
+    _track_repo(Repo.init(worktree.path))
 
     assert _linked(project) == ()
 
@@ -929,6 +2059,117 @@ def test_create_error_identifies_worktree_and_branch(tmp_path: Path) -> None:
         _prepare("second", tmp_path, branch="feat/shared")
 
 
+def _record_checkout_config(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    extra: list[str] = []
+    sanitized = git_repo_module.sanitized_git
+
+    def record(repo: Repo, *extra_config: str, cwd: Path | None = None) -> Git:
+        extra.extend(extra_config)
+        return sanitized(repo, *extra_config, cwd=cwd)
+
+    monkeypatch.setattr(git_repo_module, "sanitized_git", record)
+    return extra
+
+
+def test_worktree_creation_checks_out_in_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_repo(tmp_path)
+    monkeypatch.setattr(git_repo_module, "_CHECKOUT_WORKERS", 3)
+    extra = _record_checkout_config(monkeypatch)
+
+    worktree = _prepare("feature", tmp_path)
+
+    assert extra == ["checkout.workers=3"]
+    assert (worktree.root / "file.txt").read_text() == "hello\n"
+
+
+def test_worktree_creation_reports_checkout_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Git holds progress back for its first two seconds, which a checkout this
+    # small never reaches.
+    monkeypatch.setenv("GIT_PROGRESS_DELAY", "0")
+    repo = _init_repo(tmp_path)
+    for index in range(150):
+        (tmp_path / f"extra-{index}.txt").write_text(f"{index}\n")
+    repo.index.add([f"extra-{index}.txt" for index in range(150)])
+    repo.index.commit("more files")
+    reported: list[tuple[int, int]] = []
+    target = tmp_path.parent / f"{tmp_path.name}-progress"
+
+    with git_repo_module.GitRepo.open(tmp_path) as git:
+        git.add_worktree(
+            target,
+            "feat/progress",
+            branch_created=True,
+            on_checkout_progress=lambda done, total: reported.append((done, total)),
+        )
+
+    assert reported
+    assert reported[-1] == (151, 151)
+    assert all(total == 151 for _, total in reported)
+    assert _track_repo(Repo(target)).active_branch.name == "feat/progress"
+    assert _track_repo(Repo(target)).is_dirty(untracked_files=True) is False
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            GitError("disk full"),
+            "Failed to create worktree 'feature' for branch 'feature'",
+        ),
+        (RuntimeError("progress report failed"), "progress report failed"),
+    ],
+)
+def test_worktree_creation_unregisters_a_worktree_whose_checkout_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, expected: str
+) -> None:
+    repo = _init_repo(tmp_path)
+
+    def fail_checkout(*_args: Any, **_kwargs: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(git_repo_module.GitRepo, "_check_out", fail_checkout)
+
+    with pytest.raises(type(error), match=expected):
+        _prepare("feature", tmp_path)
+
+    assert _linked(tmp_path) == ()
+    assert "feature" not in (head.name for head in repo.heads)
+
+
+def test_worktree_creation_keeps_the_users_checkout_worker_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path)
+    repo.config_writer().set_value("checkout", "workers", "2").release()
+    extra = _record_checkout_config(monkeypatch)
+
+    _prepare("feature", tmp_path)
+
+    assert extra == []
+
+
+def test_worktree_creation_logs_its_phase_timings(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _init_repo(tmp_path)
+
+    with caplog.at_level("INFO", logger="vibe"):
+        _prepare("feature", tmp_path)
+
+    [message] = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Worktree created")
+    ]
+    assert message.startswith("Worktree created name=feature total_ms=")
+    assert "base_ref_ms=" in message
+    assert "checkout_ms=" in message
+
+
 def test_named_worktree_reserves_its_claim_before_creating(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -947,8 +2188,8 @@ def test_named_worktree_reserves_its_claim_before_creating(
     _prepare("feature", tmp_path)
 
     # What a crash mid-add would leave behind. Recorded only afterwards, the
-    # worktree would exist with no claim naming it, and neither the sweep nor
-    # release would ever recognise it as ours.
+    # worktree would exist with no claim naming it and automatic cleanup would
+    # have to treat it as unmanaged.
     assert reserved is not None
     assert reserved.base_commit is None
 
@@ -1026,30 +2267,6 @@ def test_preparing_a_name_already_taken_keeps_its_claim(tmp_path: Path) -> None:
     assert _claim(repo, "feature").read() == record
 
 
-def test_sweep_reclaims_a_named_reservation_whose_add_never_landed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo = _init_repo(tmp_path)
-
-    def die_mid_add(*_args: Any, **_kwargs: Any) -> None:
-        # Not an Exception: _create discards the claim on those, and what is
-        # under test is the claim a killed process leaves behind.
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(git_repo_module.GitRepo, "add_worktree", die_mid_add)
-    with pytest.raises(KeyboardInterrupt):
-        _prepare("feature", tmp_path)
-    _age_claim(_claim(repo, "feature"), 30)
-
-    WorktreeRepository.sweep_claims(tmp_path)
-
-    # The sweep judges a reservation by whether its path is an empty directory,
-    # so a claim naming a path that was never created reads as populated, and
-    # is kept forever.
-    assert _claim(repo, "feature").read() is None
-    assert not (_managed_worktree_root(repo) / "feature").exists()
-
-
 def test_the_bucket_tells_two_repositories_apart(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -1075,7 +2292,9 @@ def test_auto_worktree_derives_name_and_branch_from_prompt(tmp_path: Path) -> No
     assert worktree.branch == "vibe/fix-the-login-bug"
     assert worktree.created is True
     assert worktree.branch_created is True
-    assert Repo(worktree.root).active_branch.name == "vibe/fix-the-login-bug"
+    assert (
+        _track_repo(Repo(worktree.root)).active_branch.name == "vibe/fix-the-login-bug"
+    )
     assert "vibe/fix-the-login-bug" in (head.name for head in repo.heads)
 
 
@@ -1133,6 +2352,73 @@ def test_auto_worktree_still_dedupes_a_suggested_name(tmp_path: Path) -> None:
     assert first.name == "repair-oauth"
     assert second.name == "repair-oauth-2"
     assert first.root != second.root
+
+
+def test_fork_worktree_starts_from_source_head_in_an_independent_checkout(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A managed worktree with a commit absent from the primary checkout.
+    *Do*: Fork that worktree through the repository lifecycle.
+    *Assert*: The fork has that commit on a distinct branch and filesystem path.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    source = _prepare("source", tmp_path, branch="vibe/source")
+    source_project = source.path / "project"
+    source_project.mkdir()
+    source_file = source_project / "source-only.txt"
+    source_file.write_text("committed in source\n")
+    source_repo = _track_repo(Repo(source.root))
+    source_repo.index.add([str(source_file.relative_to(source.root))])
+    source_repo.index.commit("source change")
+
+    # Do
+    forked = _prepare_fork(source_project, suggested_name="source-fork")
+
+    # Assert
+    assert forked.path == forked.root / "project"
+    assert forked.path != source_project
+    assert forked.branch == "vibe/source-fork"
+    assert (forked.path / source_file.name).read_text() == "committed in source\n"
+    assert forked.source_had_uncommitted_changes is False
+    (forked.path / "fork-only.txt").write_text("fork\n")
+    assert not (source_project / "fork-only.txt").exists()
+
+
+def test_fork_worktree_reports_changes_left_in_the_source(tmp_path: Path) -> None:
+    """*Prepare*: A managed source with an untracked file after its latest commit.
+    *Do*: Fork the source from its committed HEAD.
+    *Assert*: The fork records that source-only work was not copied.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    source = _prepare("source", tmp_path, branch="vibe/source")
+    (source.path / "untracked.txt").write_text("source only\n")
+
+    # Do
+    forked = _prepare_fork(source.path, suggested_name="source-fork")
+
+    # Assert
+    assert forked.source_had_uncommitted_changes is True
+    assert not (forked.path / "untracked.txt").exists()
+
+
+def test_fork_dirty_check_ignores_the_primary_checkout(tmp_path: Path) -> None:
+    """*Prepare*: A clean source worktree and dirty primary checkout.
+    *Do*: Fork the source from its committed HEAD.
+    *Assert*: Only source-local changes control the omitted-work warning.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    source = _prepare("source", tmp_path, branch="vibe/source")
+    (tmp_path / "primary-untracked.txt").write_text("primary only\n")
+
+    # Do
+    forked = _prepare_fork(source.path, suggested_name="source-fork")
+
+    # Assert
+    assert forked.source_had_uncommitted_changes is False
+    assert not (forked.path / "primary-untracked.txt").exists()
 
 
 def test_auto_worktree_uses_random_slug_without_prompt(
@@ -1339,13 +2625,13 @@ def _clone_behind_origin(tmp_path: Path) -> tuple[Repo, str]:
     a new worktree branch should start from.
     """
     upstream = tmp_path / "upstream.git"
-    Repo.init(upstream, bare=True, initial_branch="main")
+    _track_repo(Repo.init(upstream, bare=True, initial_branch="main"))
 
     seed = _init_repo(tmp_path / "seed")
     seed.create_remote("origin", str(upstream))
     seed.git.push("origin", "main")
 
-    clone = Repo.clone_from(str(upstream), str(tmp_path / "clone"))
+    clone = _track_repo(Repo.clone_from(str(upstream), str(tmp_path / "clone")))
 
     (Path(seed.working_dir) / "ahead.txt").write_text("ahead\n")
     seed.index.add(["ahead.txt"])
@@ -1424,39 +2710,118 @@ class _RecordingGit:
     def __init__(self, *, hangs: bool = False) -> None:
         self.process = _StubProcess(hangs=hangs)
         self.fetch_kwargs: dict[str, Any] = {}
+        # What the next command will run with, and what __call__ last
+        # applied; they come apart because fetch() consumes the overrides.
+        self.config_kwargs: dict[str, Any] = {}
+        self.applied_config: dict[str, Any] = {}
+        self.GIT_PYTHON_GIT_EXECUTABLE = Git.GIT_PYTHON_GIT_EXECUTABLE
+
+    def __call__(self, **config: Any) -> _RecordingGit:
+        # GitPython's Git is callable: git(c=...) returns a git with that
+        # config applied. Stand in for the returned handle.
+        self.config_kwargs = config
+        self.applied_config = config
+        return self
 
     def fetch(self, *_args: Any, **kwargs: Any) -> Any:
+        # GitPython consumes the -c overrides after one command; model that,
+        # so a stored handle cannot keep reporting itself sanitized.
+        self.config_kwargs = {}
         self.fetch_kwargs = kwargs
         return type("_AutoInterrupt", (), {"proc": self.process})()
 
 
-def _fetch_with(git: _RecordingGit) -> None:
-    repo = cast(Any, type("_Repo", (), {"git": git})())
+def _fetch_with(git: _RecordingGit, git_dir: Path) -> None:
+    # The secure fetch preflight inspects repository-scoped HTTP configuration
+    # with the real Git executable before handing execution to this test double.
+    Repo.init(git_dir, bare=True).close()
+    config = type(
+        "_Config",
+        (),
+        {
+            "__enter__": lambda self: self,
+            "__exit__": lambda self, *_args: None,
+            "get": lambda self, _key: "https://example.invalid/repo.git",
+            "sections": lambda self: [],
+        },
+    )()
+    remote = type("_Remote", (), {"config_reader": config})()
+    repo = cast(
+        Any,
+        type(
+            "_Repo",
+            (),
+            {
+                "common_dir": git_dir,
+                "git_dir": git_dir,
+                "git": git,
+                "remote": lambda self, _name: remote,
+                "config_reader": lambda self, _level: config,
+            },
+        )(),
+    )
     git_repo_module.GitRepo(repo).fetch_branch("origin", "main")
 
 
-def test_fetch_kills_a_remote_that_never_answers() -> None:
+def test_fetch_kills_a_remote_that_never_answers(tmp_path: Path) -> None:
     git = _RecordingGit(hangs=True)
 
     with pytest.raises(GitError, match="Timed out"):
-        _fetch_with(git)
+        _fetch_with(git, tmp_path)
 
     assert git.process.killed
 
 
-def test_fetch_refuses_to_stop_and_ask_for_credentials() -> None:
+def test_fetch_refuses_to_stop_and_ask_for_credentials(tmp_path: Path) -> None:
     # A credential helper would block the fetch behind a prompt the user may
     # never see, and this refresh is optional enough to fail instead.
     git = _RecordingGit()
 
-    _fetch_with(git)
+    _fetch_with(git, tmp_path)
 
     assert git.fetch_kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    env = git.fetch_kwargs["env"]
+    config = {
+        env[f"GIT_CONFIG_KEY_{index}"]: env[f"GIT_CONFIG_VALUE_{index}"]
+        for index in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert config["core.fsmonitor"] == ""
+    assert (
+        config["core.hooksPath"] == git_repo_module._NO_HOOKS_CONFIG.partition("=")[2]
+    )
+    assert git.config_kwargs == {}
 
 
-def test_fetch_does_not_use_the_timeout_windows_rejects() -> None:
+def test_fetch_does_not_use_the_timeout_windows_rejects(tmp_path: Path) -> None:
     git = _RecordingGit()
 
-    _fetch_with(git)
+    _fetch_with(git, tmp_path)
 
     assert "kill_after_timeout" not in git.fetch_kwargs
+
+
+def test_inspecting_a_worktree_does_not_execute_a_malicious_fsmonitor_hook(
+    tmp_path: Path,
+) -> None:
+    """The same RCE `vibe.core.system_prompt` already guards against, here.
+
+    `core.fsmonitor` is a command git runs to ask what changed, and a
+    repository's own config can name any command. Reading a worktree is
+    reading somebody else's repository, so without `-c core.fsmonitor=` the
+    hook runs with the user's privileges.
+
+    It matters more for automatic retention than for explicit deletion: the
+    read is no longer something the user asked for.
+    """
+    repo = _init_repo(tmp_path)
+    worktree = _prepare_auto(tmp_path, prompt="inspect me")
+    payload = tmp_path / "PWNED"
+    # On the repository, not the worktree: a linked worktree shares its
+    # config, which is exactly why one repository can poison every checkout.
+    with repo.config_writer() as config:
+        config.set_value("core", "fsmonitor", f"touch {payload}")
+
+    worktree.inspect_for_cleanup()
+
+    assert not payload.exists(), "the worktree's fsmonitor hook was executed"
+    assert repo.working_dir is not None

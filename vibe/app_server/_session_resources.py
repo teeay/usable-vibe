@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
 from typing import Literal
 from uuid import uuid4
@@ -63,7 +63,6 @@ from vibe.app_server.protocol import (
     SessionReadResponse,
     SessionRelocateParams,
     SessionRelocateResponse,
-    SessionResumeParams,
     SessionResumeResponse,
     SessionRewindParams,
     SessionRewindReadParams,
@@ -96,7 +95,7 @@ class ShellResource:
         self._events: dict[str, asyncio.Queue[ShellTimelineEvent]] = {}
 
     async def run(
-        self, command: str, *, timeout_seconds: float = 30.0
+        self, command: str, *, timeout_seconds: float | None = None
     ) -> AsyncGenerator[ShellTimelineEvent, None]:
         client = await self._connection.connect()
         operation_id = str(uuid4())
@@ -245,17 +244,29 @@ class SessionResource:
         self._state.session_log = response.log
         return response.log
 
-    async def resume(self, session_id: str) -> None:
+    async def resume(
+        self, session_id: str, *, on_adopt: Callable[[], None] | None = None
+    ) -> None:
         client = await self._connection.connect()
-        response = validate_wire(
-            SessionResumeResponse,
-            await client.request(
-                "session/resume", SessionResumeParams(session_id=session_id)
-            ),
+        adopted: SessionResumeResponse | None = None
+
+        def _adopt(raw_response: dict[str, object]) -> None:
+            nonlocal adopted
+            response = validate_wire(SessionResumeResponse, raw_response)
+            self._state.projection = ClientProjection(response.state)
+            self._state.reset_usage_baseline()
+            self._connection.mark_session_attached()
+            if on_adopt is not None:
+                on_adopt()
+            adopted = response
+
+        await client.request(
+            "session/resume",
+            self._connection.resume_params(session_id),
+            response_boundary=_adopt,
         )
-        self._state.projection = ClientProjection(response.state)
-        self._state.reset_usage_baseline()
-        self._connection.mark_session_attached()
+        if adopted is None:
+            raise RuntimeError("Session resume response was not adopted")
 
     async def get_session_history(
         self, session_id: str, history_limit: int = 200
@@ -314,6 +325,7 @@ class SessionResource:
     async def _fetch_history_page(
         self,
         *,
+        session_id: str | None = None,
         turn_id: str | None = None,
         cursor: str | None = None,
         limit: int,
@@ -325,7 +337,7 @@ class SessionResource:
             await client.request(
                 "session/history/list",
                 SessionHistoryListParams(
-                    session_id=self._state.session_id,
+                    session_id=session_id or self._state.session_id,
                     turn_id=turn_id,
                     page=PageRequest(
                         cursor=cursor, limit=limit, direction=sort_direction
@@ -348,12 +360,14 @@ class SessionResource:
     async def list_history(
         self,
         *,
+        session_id: str | None = None,
         turn_id: str | None = None,
         before: str | None = None,
         after: str | None = None,
         limit: int = 200,
     ) -> SessionHistoryListResponse:
         return await self._fetch_history_page(
+            session_id=session_id,
             turn_id=turn_id,
             cursor=before or after,
             limit=limit,

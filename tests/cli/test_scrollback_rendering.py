@@ -372,3 +372,72 @@ async def test_active_tool_call_and_stream_stay_live() -> None:
         )
         assert _committer(app).has_pending is False
         assert committed_scrollback(app) == ""
+
+
+@pytest.mark.asyncio
+async def test_branch_created_message_reaches_scrollback() -> None:
+    from vibe.cli.textual_ui.widgets.branch_created_message import BranchCreatedMessage
+
+    app = build_test_vibe_app()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        message = BranchCreatedMessage(
+            old_session_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            new_session_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        assert _committer(app).render_widget(message) is True
+        text = committed_scrollback(app)
+        assert "Branched to a new session." in text
+        assert "--resume" in text
+
+
+@pytest.mark.asyncio
+async def test_model_change_message_reaches_scrollback() -> None:
+    from vibe.cli.textual_ui.widgets.model_change import ModelChangeMessage
+
+    app = build_test_vibe_app()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert _committer(app).render_widget(ModelChangeMessage("sonnet")) is True
+        assert "Model changed to sonnet" in committed_scrollback(app)
+
+
+@pytest.mark.asyncio
+async def test_fired_loop_prompt_keeps_its_loop_label() -> None:
+    from vibe.cli.textual_ui.widgets.fired_loop import FiredLoop
+
+    app = build_test_vibe_app()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        message = UserMessage("nightly sync", fired_loop=FiredLoop("abc"))
+        assert _committer(app).render_widget(message) is True
+        text = committed_scrollback(app)
+        assert "nightly sync" in text
+        assert "loop abc" in text
+
+
+@pytest.mark.asyncio
+async def test_model_change_checkpoint_reaches_scrollback() -> None:
+    from vibe.app_server.events import HistoryEntryAdded
+    from vibe.app_server.models import (
+        PublicCheckpointEntry,
+        PublicEntryGenerationStatus,
+    )
+
+    app = build_test_vibe_app()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        _committer(app).handle_app_server_event(
+            HistoryEntryAdded(
+                PublicCheckpointEntry(
+                    id="c1",
+                    session_id="s",
+                    created_at=1,
+                    updated_at=1,
+                    generation_status=PublicEntryGenerationStatus.COMPLETED,
+                    kind="model_change",
+                    details={"model": "opus"},
+                )
+            )
+        )
+        assert "Model changed to opus" in committed_scrollback(app)

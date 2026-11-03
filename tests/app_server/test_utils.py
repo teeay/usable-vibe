@@ -1,9 +1,24 @@
 from __future__ import annotations
 
-from vibe.app_server._utils import public_error
+import pytest
+
+from vibe.app_server._utils import optional_time_ms, public_error, time_ms
 from vibe.app_server.models import TurnErrorCode
 from vibe.core.compaction import CompactionFailedError
 from vibe.core.llm.exceptions import BackendError, IncompleteStreamError, PayloadSummary
+
+
+def test_time_ms_parses_iso_timestamp() -> None:
+    assert time_ms("2026-09-10T12:00:00+00:00") == 1_789_041_600_000
+
+
+def test_time_ms_uses_fallback_for_malformed_timestamp() -> None:
+    assert time_ms("not-a-timestamp", fallback=lambda: 123_456) == 123_456
+
+
+def test_optional_time_ms_returns_none_for_missing_or_malformed_timestamp() -> None:
+    assert optional_time_ms(None) is None
+    assert optional_time_ms("not-a-timestamp") is None
 
 
 def _make_invalid_model_backend_error() -> BackendError:
@@ -18,6 +33,27 @@ def _make_invalid_model_backend_error() -> BackendError:
         model="bad-model",
         payload_summary=PayloadSummary(
             model="bad-model",
+            message_count=1,
+            approx_chars=10,
+            temperature=0.0,
+            has_tools=False,
+            tool_choice=None,
+        ),
+    )
+
+
+def _make_refused_credential_backend_error(status: int = 401) -> BackendError:
+    return BackendError(
+        provider="test-provider",
+        endpoint="/v1/chat/completions",
+        status=status,
+        reason="Unauthorized",
+        headers={},
+        body_text="",
+        parsed_error=None,
+        model="a-model",
+        payload_summary=PayloadSummary(
+            model="a-model",
             message_count=1,
             approx_chars=10,
             temperature=0.0,
@@ -56,3 +92,25 @@ def test_public_error_invalid_model_wrapped_runtime_error() -> None:
     error = public_error(wrapped)
 
     assert error.code == TurnErrorCode.INVALID_MODEL
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_public_error_invalid_api_key_direct_backend_error(status: int) -> None:
+    """A refused credential is not a backend failure: retrying cannot succeed.
+
+    Both statuses, because the Harness rejects the credential on either one and
+    the two backends must not disagree on whether ``/retry`` is worth offering.
+    """
+    error = public_error(_make_refused_credential_backend_error(status))
+
+    assert error.code == TurnErrorCode.INVALID_API_KEY
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_public_error_invalid_api_key_wrapped_runtime_error(status: int) -> None:
+    wrapped = RuntimeError("API error: ...")
+    wrapped.__cause__ = _make_refused_credential_backend_error(status)
+    error = public_error(wrapped)
+
+    assert error.code == TurnErrorCode.INVALID_API_KEY
+    assert error.details == {"provider": "test-provider", "model": "a-model"}

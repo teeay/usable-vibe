@@ -72,6 +72,17 @@ This section is for developers who want to set up the repository for local devel
 
    Pre-commit hooks will automatically run checks before each commit.
 
+### Building distributions
+
+`uv build --wheel` produces one platform-specific wheel containing the Python
+CLI, the Rust terminal, and the Unified Harness runtime. The build requires a
+working Rust toolchain and fails if either native component cannot be built.
+On Linux, set `CARGO_BUILD_FLAGS=--no-default-features` to build without ALSA.
+
+`VIBE_SKIP_RUST_TUI=1` may be used by development-only checks that do not need
+the terminal binary. Public releases always build both native components. The
+source distribution bundles both Rust sources, so building from it needs Rust.
+
 ### Logging Configuration
 
 Logs are written to `~/.vibe/logs/vibe.log` by default. Control logging via environment variables:
@@ -80,7 +91,7 @@ Logs are written to `~/.vibe/logs/vibe.log` by default. Control logging via envi
 |----------|-------------|---------|
 | `LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) | `WARNING` |
 | `LOG_MAX_BYTES` | Max log file size in bytes before rotation | `10485760` (10 MB) |
-| `DEBUG_MODE` | When `true`, forces `DEBUG` logging (and attaches `debugpy` on `localhost:5678` under `vibe-acp`) | - |
+| `DEBUG_MODE` | When `true`, forces `DEBUG` logging | - |
 
 Example:
 
@@ -129,9 +140,12 @@ Run all tests:
 uv run pytest
 ```
 
-By default, pytest uses `max(1, ceil(available CPUs / 2) - 1)` workers to leave
-resources available for the rest of the machine. Set
-`PYTEST_XDIST_AUTO_NUM_WORKERS` to a positive integer to override that limit:
+By default, local runs use `max(1, ceil(available CPUs / 2) - 1)` workers to
+leave resources available for the rest of the machine. CI runners (detected via
+`BUILDKITE` or `GITHUB_ACTIONS`) use every available CPU so the full suite stays
+fast; the generic `CI` variable is deliberately ignored because it is often set
+in developer shells. Set `PYTEST_XDIST_AUTO_NUM_WORKERS` to a positive integer
+to override either default:
 
 ```bash
 PYTEST_XDIST_AUTO_NUM_WORKERS=4 uv run pytest

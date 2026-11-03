@@ -48,7 +48,7 @@ async def test_whoami_command_reports_missing_identity() -> None:
         text = committed_scrollback(app)
 
     assert handled is True
-    assert "No identity information" in text
+    assert "No Mistral account information" in text
     assert not list(app.query(LoadingWidget))
 
 

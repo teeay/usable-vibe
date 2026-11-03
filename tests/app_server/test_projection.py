@@ -10,10 +10,12 @@ from tests.stubs.fake_connector_registry import FakeConnectorRegistry
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 from vibe.app_server._projection import (
     project_config,
+    project_config_view,
     project_history,
     project_mcp,
     project_session_log,
     project_stats,
+    project_unified_agent_summaries,
 )
 from vibe.app_server.models import (
     AgentStatsSnapshot,
@@ -99,12 +101,60 @@ def test_persisted_known_tool_output_is_not_treated_as_typed_result() -> None:
     assert effect.state.output_text.startswith("response: done")
 
 
+def test_unified_agent_projection_hides_plan_from_the_picker() -> None:
+    from vibe.core.agents.models import ACCEPT_EDITS, ASK, PLAN
+
+    active, available = project_unified_agent_summaries(
+        ACCEPT_EDITS, [ASK, PLAN, ACCEPT_EDITS]
+    )
+
+    names = [agent.name for agent in available]
+    assert "plan" not in names
+    assert names == ["ask", "accept-edits"]
+    assert active.name == "accept-edits"
+
+
+def test_unified_agent_projection_still_reports_plan_when_active() -> None:
+    """A session already running plan reports it as active, even though it is hidden."""
+    from vibe.core.agents.models import ACCEPT_EDITS, ASK, PLAN
+
+    active, available = project_unified_agent_summaries(PLAN, [ASK, PLAN, ACCEPT_EDITS])
+
+    assert active.name == "plan"
+    assert "plan" not in [agent.name for agent in available]
+
+
 def test_config_view_redacts_persistence_paths() -> None:
     agent_loop = build_test_agent_loop()
 
     config = project_config(agent_loop)
 
     assert "sessionLogging" not in config.model_dump(mode="json", by_alias=True)
+
+
+def test_config_view_reports_the_configured_default_agent() -> None:
+    config = project_config_view(build_test_vibe_config(default_agent="plan"))
+
+    assert config.default_agent == "plan"
+    assert config.model_dump(mode="json", by_alias=True)["defaultAgent"] == "plan"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_cursor_blink(enabled: bool) -> None:
+    config = project_config_view(build_test_vibe_config(cursor_blink=enabled))
+
+    assert config.model_dump(mode="json", by_alias=True)["cursorBlink"] is enabled
+    legacy_payload = config.model_dump(mode="json", by_alias=True)
+    del legacy_payload["cursorBlink"]
+    assert type(config).model_validate(legacy_payload).cursor_blink is True
+
+
+def test_config_view_projects_the_tls_trust_policy() -> None:
+    config = project_config_view(build_test_vibe_config(enable_system_trust_store=True))
+
+    assert (
+        config.model_dump(mode="json", by_alias=True)["enableSystemTrustStore"] is True
+    )
 
 
 def test_stats_projection_includes_cached_token_counts() -> None:
@@ -174,6 +224,42 @@ def test_config_view_flags_pinned_active_model() -> None:
     assert config.active_model.alias == "beta"
 
 
+def test_config_view_carries_the_active_model_thinking_levels() -> None:
+    from vibe.core.config import ModelConfig
+
+    models = [
+        ModelConfig(
+            name="model-a",
+            provider="mistral",
+            alias="alpha",
+            thinking_levels=["off", "high"],
+        )
+    ]
+    agent_loop = build_test_agent_loop(
+        config=build_test_vibe_config(models=models, active_model="alpha")
+    )
+
+    config = project_config(agent_loop)
+
+    assert list(config.active_model.thinking_levels) == ["off", "high"]
+
+
+def test_model_config_view_defaults_thinking_levels_for_older_clients() -> None:
+    # A payload from an older server lacks thinkingLevels; the view's default
+    # keeps such clients rendering the five (ADR 0014).
+    from vibe.app_server.config import THINKING_LEVELS, ModelConfigView
+
+    view = ModelConfigView.model_validate({
+        "name": "model-a",
+        "alias": "alpha",
+        "thinking": "off",
+        "supportsImages": False,
+        "displayName": "alpha",
+    })
+
+    assert list(view.thinking_levels) == list(THINKING_LEVELS)
+
+
 def test_config_view_reports_unpinned_default_model() -> None:
     from vibe.core.config import ModelConfig
 
@@ -191,6 +277,128 @@ def test_config_view_reports_unpinned_default_model() -> None:
     # The unpinned state resolves to the first configured model for display.
     assert config.default_model_alias == "alpha"
     assert config.active_model.alias == "alpha"
+
+
+def test_config_view_default_alias_never_follows_the_active_model() -> None:
+    """``default_model_alias`` names the configured default, never the pin.
+
+    It used to be read off the active model unless the caller passed
+    ``active_model_pinned``, so any projection that omitted the flag -- every
+    unified-harness runtime snapshot -- advertised the user's own pinned model
+    as the "Default (currently ...)" hint.
+    """
+    from vibe.core.config import ModelConfig
+
+    models = [
+        ModelConfig(name="model-a", provider="mistral", alias="alpha"),
+        ModelConfig(name="model-b", provider="mistral", alias="beta"),
+    ]
+    pinned_config = build_test_vibe_config(models=models, active_model="beta")
+
+    pinned = project_config_view(pinned_config, active_model_pinned=True)
+    # A caller that forgets the flag still must not echo the pin back as the
+    # default; only ``active_model_pinned`` itself may differ.
+    unflagged = project_config_view(pinned_config)
+    unpinned = project_config_view(
+        build_test_vibe_config(models=models, active_model="")
+    )
+
+    assert pinned.active_model.alias == "beta"
+    assert pinned.default_model_alias == "alpha"
+    assert pinned.default_model_display_name == "alpha"
+    assert unflagged.default_model_alias == "alpha"
+    assert unpinned.active_model.alias == "alpha"
+    assert unpinned.default_model_alias == "alpha"
+
+
+@pytest.mark.parametrize("active_model", ["text", "vision"])
+def test_config_view_reports_file_image_delivery_per_model(active_model: str) -> None:
+    from vibe.core.config import ModelConfig
+
+    config = build_test_vibe_config(
+        models=[
+            ModelConfig(
+                name="text-model",
+                provider="mistral",
+                alias="text",
+                supports_images=False,
+            ),
+            ModelConfig(
+                name="vision-model",
+                provider="mistral",
+                alias="vision",
+                supports_images=True,
+            ),
+        ],
+        active_model=active_model,
+    )
+
+    view = project_config_view(config, image_fallback=True)
+    delivery_by_alias = {model.alias: model.image_delivery for model in view.models}
+
+    assert delivery_by_alias == {"text": "resource_link", "vision": "native"}
+    assert view.active_model.image_delivery == delivery_by_alias[active_model]
+    serialized = view.model_dump(mode="json", by_alias=True)
+    assert serialized["activeModel"]["imageDelivery"] == delivery_by_alias[active_model]
+    assert [model["imageDelivery"] for model in serialized["models"]] == [
+        "resource_link",
+        "native",
+    ]
+
+
+def test_config_view_does_not_advertise_file_delivery_without_runtime_support() -> None:
+    from vibe.core.config import ModelConfig
+
+    config = build_test_vibe_config(
+        models=[ModelConfig(name="text-model", provider="mistral", alias="text")],
+        active_model="text",
+    )
+
+    view = project_config_view(config)
+
+    assert view.active_model.image_delivery is None
+    assert view.models[0].image_delivery is None
+
+
+def test_config_view_image_support_widens_for_a_backend_that_can_fall_back() -> None:
+    """``images_supported`` gates the send; it is not the model's own vision.
+
+    The unified backend describes an image for a blind model, so it accepts an
+    attachment ``active_model.supports_images`` would reject -- but only when a
+    describer is actually reachable. Core's resource-link projection alone is
+    not enough: it only exists for a file-backed image, so promising on its
+    strength would let a pasted one through to a model that cannot read it.
+    """
+    from vibe.core.config import ModelConfig
+
+    blind = build_test_vibe_config(
+        models=[ModelConfig(name="model-a", provider="mistral", alias="blind")],
+        active_model="blind",
+    )
+    describable = build_test_vibe_config(
+        models=[
+            ModelConfig(name="model-a", provider="mistral", alias="blind"),
+            ModelConfig(
+                name="model-b", provider="mistral", alias="sees", supports_images=True
+            ),
+        ],
+        active_model="blind",
+    )
+    sees = build_test_vibe_config(
+        models=[
+            ModelConfig(
+                name="model-b", provider="mistral", alias="sees", supports_images=True
+            )
+        ],
+        active_model="sees",
+    )
+
+    assert project_config_view(blind).images_supported is False
+    assert project_config_view(blind, image_fallback=True).images_supported is False
+    assert (
+        project_config_view(describable, image_fallback=True).images_supported is True
+    )
+    assert project_config_view(sees).images_supported is True
 
 
 def test_config_view_hydrates_display_name_from_alias() -> None:
@@ -423,13 +631,13 @@ def test_persisted_compaction_boundary_projects_completed_checkpoint() -> None:
 def test_project_mcp_surfaces_connector_bootstrap_error() -> None:
     agent_loop = build_test_agent_loop()
     registry = FakeConnectorRegistry(
-        bootstrap_error="Failed to load workspace connectors (HTTP 502)."
+        bootstrap_error="Failed to load connectors (HTTP 502)."
     )
     agent_loop.connector_registry = registry
 
     state = project_mcp(agent_loop)
 
-    assert state.connector_error == "Failed to load workspace connectors (HTTP 502)."
+    assert state.connector_error == "Failed to load connectors (HTTP 502)."
 
 
 def test_project_mcp_no_connector_error_when_healthy() -> None:

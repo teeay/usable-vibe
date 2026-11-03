@@ -17,6 +17,7 @@ from vibe.core.plugins._compatibility import (
     DetectedPluginFormat,
     PluginAdapterDiagnostic,
     PluginAdapterResult,
+    author_display_name,
     resolve_declared_path,
     typescript_identifier,
 )
@@ -137,6 +138,7 @@ class ClaudePluginAdapter:
                 mcp_servers=mcp_servers,
                 tool_overrides=MappingProxyType({}),
                 private_metadata=MappingProxyType({"claudeManifest": raw_manifest}),
+                author=author_display_name(manifest.author),
                 adapted_skills=(*skills, *commands),
                 adapted_hooks=hooks,
             ),
@@ -199,6 +201,7 @@ class ClaudePluginAdapter:
             if (
                 skill := adapt_skill_file(
                     path=path,
+                    root=root,
                     source_format="claude_code",
                     diagnostics=diagnostics,
                     normalize_vendor_fields=False,

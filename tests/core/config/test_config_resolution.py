@@ -6,23 +6,27 @@ import json
 from pathlib import Path
 import ssl
 import tomllib
-from typing import Literal, TypedDict, Unpack
+from typing import Any, Literal, TypedDict, Unpack
 from unittest.mock import MagicMock, patch
 
+from pydantic import ValidationError
 import pytest
 import tomli_w
 
 from tests.conftest import ConfigBuilder, build_test_vibe_config
+from tests.stubs.fake_raw_layer import FakeRawLayer
 from vibe.core.config import (
     DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL,
     DEFAULT_MISTRAL_BROWSER_AUTH_BASE_URL,
     DEFAULT_PROVIDERS,
     ConnectorConfig,
+    MissingAPIKeyError,
     ModelConfig,
     ProviderConfig,
     VibeConfigSchema,
 )
 from vibe.core.config._migration import BASH_READ_ONLY_MIGRATION, migrate_config_layers
+from vibe.core.config.builder import ConfigBuilder as _LayeredConfigBuilder
 from vibe.core.config.harness_files import (
     HarnessFilesManager,
     init_harness_files_manager,
@@ -282,6 +286,32 @@ class TestSystemTrustStoreConfig:
             configure_ssl_context(enable_system_trust_store=False)
             build_ssl_context.cache_clear()
 
+    @pytest.mark.asyncio
+    async def test_build_configures_ssl_context_when_the_api_key_is_missing(
+        self,
+        config_dir: Path,
+        make_orchestrator: Callable[
+            [], Awaitable[ConfigOrchestrator[VibeConfigSchema]]
+        ],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        config_file = config_dir / "config.toml"
+        with config_file.open("rb") as f:
+            data = tomllib.load(f)
+        data["enable_system_trust_store"] = True
+        with config_file.open("wb") as f:
+            tomli_w.dump(data, f)
+
+        with patch(
+            "vibe.core.config.default_orchestrator.configure_ssl_context"
+        ) as configure:
+            orchestrator = await make_orchestrator()
+
+        configure.assert_called_once_with(enable_system_trust_store=True)
+        with pytest.raises(MissingAPIKeyError):
+            orchestrator.config.require_active_provider_api_key()
+
 
 class TestModelThinkingFieldUpdate:
     @pytest.mark.asyncio
@@ -383,17 +413,85 @@ class TestModelThinkingFieldUpdate:
             tomli_w.dump(data, f)
 
         orch = await make_orchestrator()
-        await orch.set_field("/models/mistral-medium-3.5/thinking", "low")
+        await orch.set_field("/models/mistral-medium-3.5/thinking", "off")
 
         with config_file.open("rb") as f:
             result = tomllib.load(f)
-        assert result["models"] == [{"alias": "mistral-medium-3.5", "thinking": "low"}]
+        assert result["models"] == [{"alias": "mistral-medium-3.5", "thinking": "off"}]
 
         await orch.reload()
 
         model = orch.config.models["mistral-medium-3.5"]
-        assert model.thinking == "low"
+        assert model.thinking == "off"
         assert model.supports_images is True
+
+
+class TestThinkingLevelsResetThroughLayers:
+    @pytest.mark.asyncio
+    async def test_reset_applies_in_memory_and_never_rewrites_the_file(
+        self,
+        config_dir: Path,
+        make_orchestrator: Callable[
+            [], Awaitable[ConfigOrchestrator[VibeConfigSchema]]
+        ],
+    ) -> None:
+        config_file = config_dir / "config.toml"
+        data = {
+            "active_model": "my-model",
+            "models": [
+                {
+                    "name": "my-model",
+                    "provider": "mistral",
+                    "alias": "my-model",
+                    "thinking": "medium",
+                    "thinking_levels": ["off", "high"],
+                }
+            ],
+        }
+        with config_file.open("wb") as f:
+            tomli_w.dump(data, f)
+
+        orch = await make_orchestrator()
+
+        # The reset applies to the loaded config; the file keeps the stored
+        # level so a wider set can revive it on a later load.
+        assert orch.config.get_active_model().thinking == "high"
+        with config_file.open("rb") as f:
+            result = tomllib.load(f)
+        entry = next(m for m in result["models"] if m["alias"] == "my-model")
+        assert entry["thinking"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_reset_fires_on_the_merged_model_not_per_layer(self) -> None:
+        # The set can arrive from a lower layer and the stored level from a
+        # higher one; the reset must see the merged entry (ADR 0005).
+        builder = _LayeredConfigBuilder(VibeConfigSchema)
+        builder.add_layer(
+            FakeRawLayer(
+                name="project",
+                data={
+                    "active_model": "my-model",
+                    "models": [
+                        {
+                            "name": "my-model",
+                            "provider": "mistral",
+                            "alias": "my-model",
+                            "thinking_levels": ["off", "high"],
+                        }
+                    ],
+                },
+            )
+        )
+        builder.add_layer(
+            FakeRawLayer(
+                name="user",
+                data={"models": [{"alias": "my-model", "thinking": "medium"}]},
+            )
+        )
+
+        config = await builder.build()
+
+        assert config.get_active_model().thinking == "high"
 
 
 class TestMigrateLeavesFindInBashAllowlist:
@@ -932,123 +1030,6 @@ class TestMigrateMistralVibeCliLatestDefaults:
         assert result["models"][0]["supports_images"] is False
 
 
-class TestMigrateDevstralSmallThinking:
-    def test_forces_thinking_off_when_set_to_non_off(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        run_migration: Callable[[], None],
-    ) -> None:
-        monkeypatch.setenv("VIBE_HOME", str(tmp_path))
-        config_file = tmp_path / "config.toml"
-        data = {
-            "models": [
-                {
-                    "name": "devstral-small-latest",
-                    "provider": "mistral",
-                    "alias": "devstral-small",
-                    "thinking": "high",
-                }
-            ]
-        }
-        with config_file.open("wb") as f:
-            tomli_w.dump(data, f)
-
-        reset_harness_files_manager()
-        init_harness_files_manager("user")
-        run_migration()
-
-        with config_file.open("rb") as f:
-            result = tomllib.load(f)
-        assert result["models"][0]["thinking"] == "off"
-
-    def test_adds_thinking_off_when_missing(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        run_migration: Callable[[], None],
-    ) -> None:
-        monkeypatch.setenv("VIBE_HOME", str(tmp_path))
-        config_file = tmp_path / "config.toml"
-        data = {
-            "models": [
-                {
-                    "name": "devstral-small-latest",
-                    "provider": "mistral",
-                    "alias": "devstral-small",
-                }
-            ]
-        }
-        with config_file.open("wb") as f:
-            tomli_w.dump(data, f)
-
-        reset_harness_files_manager()
-        init_harness_files_manager("user")
-        run_migration()
-
-        with config_file.open("rb") as f:
-            result = tomllib.load(f)
-        assert result["models"][0]["thinking"] == "off"
-
-    def test_noop_when_already_off(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        run_migration: Callable[[], None],
-    ) -> None:
-        monkeypatch.setenv("VIBE_HOME", str(tmp_path))
-        config_file = tmp_path / "config.toml"
-        data = {
-            "models": [
-                {
-                    "name": "devstral-small-latest",
-                    "provider": "mistral",
-                    "alias": "devstral-small",
-                    "thinking": "off",
-                }
-            ]
-        }
-        with config_file.open("wb") as f:
-            tomli_w.dump(data, f)
-
-        reset_harness_files_manager()
-        init_harness_files_manager("user")
-        run_migration()
-
-        with config_file.open("rb") as f:
-            result = tomllib.load(f)
-        assert result["models"][0]["thinking"] == "off"
-
-    def test_does_not_touch_other_models(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        run_migration: Callable[[], None],
-    ) -> None:
-        monkeypatch.setenv("VIBE_HOME", str(tmp_path))
-        config_file = tmp_path / "config.toml"
-        data = {
-            "models": [
-                {
-                    "name": "mistral-vibe-cli-latest",
-                    "provider": "mistral",
-                    "alias": "mistral-medium-3.5",
-                    "thinking": "high",
-                }
-            ]
-        }
-        with config_file.open("wb") as f:
-            tomli_w.dump(data, f)
-
-        reset_harness_files_manager()
-        init_harness_files_manager("user")
-        run_migration()
-
-        with config_file.open("rb") as f:
-            result = tomllib.load(f)
-        assert result["models"][0]["thinking"] == "high"
-
-
 class TestAutoCompactThresholdFallback:
     def test_model_without_explicit_threshold_inherits_global(
         self, make_config: Callable[..., VibeConfigSchema]
@@ -1076,6 +1057,105 @@ class TestAutoCompactThresholdFallback:
         model = ModelConfig(name="m", provider="p", alias="m")
         cfg = make_config(models=[model], active_model="m")
         assert cfg.get_active_model().auto_compact_threshold == 200_000
+
+    @pytest.mark.parametrize(
+        ("window", "explicit", "expected"),
+        [
+            # An explicit per-model threshold is a deliberate cap and wins while
+            # it can actually fire; 0 keeps meaning "never compact".
+            (None, None, 42_000),
+            (262_144, None, 42_000),
+            (None, 20_000, 20_000),
+            (262_144, 20_000, 20_000),
+            (262_144, 0, 0),
+            # Both the per-model cap and the explicit global sit above the
+            # window, so neither can fire and the window derives.
+            (40_000, 200_000, 32_000),
+        ],
+        ids=[
+            "neither",
+            "window-vs-explicit-global",
+            "cap-only",
+            "both",
+            "zero-disables",
+            "caps-above-window",
+        ],
+    )
+    def test_window_and_explicit_cap_resolve_in_order(
+        self,
+        make_config: Callable[..., VibeConfigSchema],
+        window: int | None,
+        explicit: int | None,
+        expected: int,
+    ) -> None:
+        overrides: dict[str, Any] = {}
+        if window is not None:
+            overrides["max_context_length"] = window
+        if explicit is not None:
+            overrides["auto_compact_threshold"] = explicit
+        model = ModelConfig(name="m", provider="p", alias="m", **overrides)
+
+        cfg = make_config(
+            auto_compact_threshold=42_000, models=[model], active_model="m"
+        )
+
+        active = cfg.get_active_model()
+        assert active.auto_compact_threshold == expected
+        # The window is recorded as sent whatever the threshold resolves to.
+        assert active.max_context_length == window
+
+    def test_default_global_does_not_count_as_a_cap(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        # The global left at its default is no preference: the window derives.
+        model = ModelConfig(
+            name="m", provider="p", alias="m", max_context_length=262_144
+        )
+        cfg = make_config(models=[model], active_model="m")
+        assert cfg.get_active_model().auto_compact_threshold == 209_715
+
+    def test_unreachable_global_cap_derives_from_the_window(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        model = ModelConfig(
+            name="m", provider="p", alias="m", max_context_length=262_144
+        )
+        cfg = make_config(
+            auto_compact_threshold=400_000, models=[model], active_model="m"
+        )
+        assert cfg.get_active_model().auto_compact_threshold == 209_715
+
+    def test_reachable_global_wins_over_an_unreachable_model_cap(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        # The model cap sits above its own window and can never fire, so the
+        # reachable global takes over.
+        model = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            max_context_length=128_000,
+            auto_compact_threshold=200_000,
+        )
+        cfg = make_config(
+            auto_compact_threshold=42_000, models=[model], active_model="m"
+        )
+        assert cfg.get_active_model().auto_compact_threshold == 42_000
+
+    def test_cap_equal_to_the_window_is_discarded(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        # A cap exactly at the window leaves no room for the compaction call
+        # itself, so it counts as unreachable and the window derives.
+        model = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            max_context_length=100_000,
+            auto_compact_threshold=100_000,
+        )
+        cfg = make_config(models=[model], active_model="m")
+        assert cfg.get_active_model().auto_compact_threshold == 80_000
 
     def test_changed_global_threshold_propagates_on_reload(
         self, make_config: Callable[..., VibeConfigSchema]
@@ -1565,6 +1645,36 @@ class TestOnboardingContextResolution:
 
         assert context.provider.name == "mistral"
 
+    def test_from_config_falls_back_when_active_provider_is_missing(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        config = make_config(
+            models=[ModelConfig(name="orphan", provider="ghost", alias="orphan")],
+            active_model="orphan",
+        )
+
+        context = OnboardingContext.from_config(config)
+
+        assert context.provider.name == DEFAULT_PROVIDERS[0].name
+
+    def test_from_config_preserves_merged_urls_when_falling_back(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        config = make_config(
+            models=[ModelConfig(name="orphan", provider="ghost", alias="orphan")],
+            active_model="orphan",
+            vibe_base_url="https://merged-vibe.example.com",
+            console_base_url="https://merged-console.example.com",
+            theme="merged-theme",
+        )
+
+        context = OnboardingContext.from_config(config)
+
+        assert context.provider.name == DEFAULT_PROVIDERS[0].name
+        assert context.vibe_base_url == "https://merged-vibe.example.com"
+        assert context.console_base_url == "https://merged-console.example.com"
+        assert context.theme == "merged-theme"
+
 
 class TestCompactionModel:
     def test_get_compaction_model_returns_active_when_unset(
@@ -1582,7 +1692,7 @@ class TestCompactionModel:
         cfg = make_config(compaction_model=compaction)
         assert cfg.get_compaction_model().name == "compact-model"
 
-    def test_compaction_model_provider_must_match_active(
+    def test_compaction_model_on_another_provider_falls_back_to_active(
         self, make_config: Callable[..., VibeConfigSchema]
     ) -> None:
         from vibe.core.config import ProviderConfig
@@ -1602,8 +1712,8 @@ class TestCompactionModel:
                 api_key_env_var="MISTRAL_API_KEY",
             ),
         ]
-        with pytest.raises(ValueError, match="must share the same provider"):
-            make_config(compaction_model=compaction, providers=providers)
+        cfg = make_config(compaction_model=compaction, providers=providers)
+        assert cfg.get_compaction_model() == cfg.get_active_model()
 
     def test_compaction_model_provider_must_exist(
         self, make_config: Callable[..., VibeConfigSchema]
@@ -1624,15 +1734,14 @@ class TestCompactionModel:
 
 
 class TestActiveModelValidation:
-    def test_unknown_active_model_falls_back_to_first(
+    def test_unknown_active_model_falls_back_to_default(
         self, build_config: ConfigBuilder, caplog: pytest.LogCaptureFixture
     ) -> None:
         with caplog.at_level("WARNING"):
             cfg = build_config(active_model="does-not-exist")
 
-        first_alias = next(iter(cfg.models))
-        assert cfg.active_model == first_alias
-        assert cfg.get_active_model().alias == first_alias
+        assert cfg.active_model == ""
+        assert cfg.get_active_model().alias == cfg.resolve_default_model_alias()
         assert (
             "Active model 'does-not-exist' is not in your configured models"
             in caplog.text
@@ -1818,6 +1927,32 @@ class TestAddToolAllowlistPatterns:
             result = tomllib.load(f)
         assert result["tools"]["bash"]["allowlist"] == ["ls"]
 
+    @pytest.mark.parametrize("shell", ["git_bash", "powershell"])
+    def test_strips_the_wildcard_for_every_shell(
+        self, shell: str, build_config: ConfigBuilder
+    ) -> None:
+        """Windows spells the shell ``git_bash`` or ``powershell``, and their
+        allowlists match by prefix just as bash's does: a stored ``ls *`` matches no
+        command at all, so a permanent approval would quietly never take.
+        """
+        cfg = build_config()
+
+        assert cfg.build_tool_allowlist_update(shell, ["ls *"]) == {
+            "tools": {shell: {"allowlist": ["ls"]}}
+        }
+
+    def test_keeps_the_wildcard_for_a_tool_that_is_not_a_shell(
+        self, build_config: ConfigBuilder
+    ) -> None:
+        """Only the shells append " *" to mean "any arguments" -- anywhere else a
+        trailing wildcard is part of the pattern itself.
+        """
+        cfg = build_config()
+
+        assert cfg.build_tool_allowlist_update("edit", ["src/lib *"]) == {
+            "tools": {"edit": {"allowlist": ["src/lib *"]}}
+        }
+
     @pytest.mark.asyncio
     async def test_merges_and_sorts_with_existing(
         self,
@@ -1974,3 +2109,188 @@ class TestMigrateRenamedTools:
         with config_file.open("rb") as f:
             result = tomllib.load(f)
         assert result["tools"] == {"read_file": {"permission": "always"}}
+
+
+class TestThinkingLevels:
+    def test_model_without_a_set_offers_the_five(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        model = ModelConfig(name="m", provider="p", alias="m", thinking="medium")
+        cfg = make_config(models=[model], active_model="m")
+
+        active = cfg.get_active_model()
+        assert active.thinking_levels == ["off", "low", "medium", "high", "max"]
+        assert active.thinking == "medium"
+
+    def test_narrowed_set_offers_exactly_those_levels(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        model = ModelConfig(
+            name="m", provider="p", alias="m", thinking_levels=["off", "high"]
+        )
+        cfg = make_config(models=[model], active_model="m")
+
+        assert cfg.get_active_model().thinking_levels == ["off", "high"]
+
+    def test_stored_level_outside_the_set_resets_to_high(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        model = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            thinking="medium",
+            thinking_levels=["off", "high"],
+        )
+        cfg = make_config(models=[model], active_model="m")
+
+        assert cfg.get_active_model().thinking == "high"
+
+    def test_stored_low_resets_to_off_when_the_set_still_offers_it(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        # "low" was the historical no-reasoning pick; a curated set that
+        # dropped it carries that intent in "off" instead of re-enabling
+        # reasoning through the default.
+        model = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            thinking="low",
+            thinking_levels=["off", "high"],
+        )
+        cfg = make_config(models=[model], active_model="m")
+
+        assert cfg.get_active_model().thinking == "off"
+
+    def test_stored_low_resets_to_default_when_off_is_not_offered(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        # "medium" proves the fallback routes through default_thinking (the
+        # set's last entry) rather than a hardcoded "high".
+        model = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            thinking="low",
+            thinking_levels=["medium"],
+        )
+        cfg = make_config(models=[model], active_model="m")
+
+        assert cfg.get_active_model().thinking == "medium"
+
+    def test_stored_low_stays_on_the_uncurated_set(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        model = ModelConfig(name="m", provider="p", alias="m", thinking="low")
+        cfg = make_config(models=[model], active_model="m")
+
+        assert cfg.get_active_model().thinking == "low"
+
+    def test_reset_targets_the_last_entry_when_high_is_absent(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        # Rank comes from list order: a set listed non-ascending defaults to
+        # its last entry.
+        model = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            thinking="off",
+            thinking_levels=["medium", "low"],
+        )
+        cfg = make_config(models=[model], active_model="m")
+
+        assert cfg.get_active_model().thinking == "low"
+
+    def test_high_offered_wins_over_a_later_entry(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        model = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            thinking="off",
+            thinking_levels=["max", "high"],
+        )
+        cfg = make_config(models=[model], active_model="m")
+
+        assert cfg.get_active_model().thinking == "high"
+
+    def test_empty_set_offers_off_only(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        model = ModelConfig(
+            name="m", provider="p", alias="m", thinking="medium", thinking_levels=[]
+        )
+        cfg = make_config(models=[model], active_model="m")
+
+        active = cfg.get_active_model()
+        assert active.thinking_levels == ["off"]
+        assert active.thinking == "off"
+
+    def test_widened_set_revives_the_stored_level(
+        self, make_config: Callable[..., VibeConfigSchema]
+    ) -> None:
+        # The stored value stays in the user's file; the reset applies on every
+        # load and the stored level runs again once the set widens to include
+        # it — a fresh parse of the same file value keeps it.
+        narrowed = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            thinking="medium",
+            thinking_levels=["off", "high"],
+        )
+        cfg = make_config(models=[narrowed], active_model="m")
+        assert cfg.get_active_model().thinking == "high"
+
+        widened = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            thinking="medium",
+            thinking_levels=["off", "medium", "high"],
+        )
+        cfg = make_config(models=[widened], active_model="m")
+        assert cfg.get_active_model().thinking == "medium"
+
+    def test_widened_set_revives_a_stored_low(self) -> None:
+        # The low -> off reset is a re-derivation like any other: the stored
+        # low stays in the file and runs again once the set offers it.
+        narrowed = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            thinking="low",
+            thinking_levels=["off", "high"],
+        )
+        assert narrowed.thinking == "off"
+
+        widened = ModelConfig(
+            name="m",
+            provider="p",
+            alias="m",
+            thinking="low",
+            thinking_levels=["off", "low", "high"],
+        )
+        assert widened.thinking == "low"
+
+    def test_unknown_level_is_a_config_error(self) -> None:
+        # The same strictness as `thinking`: values outside the five canonical
+        # levels are rejected at parse, not silently dropped. Validated from a
+        # payload because the typed constructor cannot carry an invalid level.
+        with pytest.raises(ValidationError):
+            ModelConfig.model_validate({
+                "name": "m",
+                "provider": "p",
+                "alias": "m",
+                "thinking_levels": ["off", "turbo"],
+            })
+
+    def test_duplicate_levels_offer_one_picker_row(self) -> None:
+        model = ModelConfig(
+            name="m", provider="p", alias="m", thinking_levels=["off", "off", "high"]
+        )
+
+        assert model.thinking_levels == ["off", "high"]

@@ -16,6 +16,7 @@ from vibe.core.plugins._compatibility import (
     DetectedPluginFormat,
     PluginAdapterDiagnostic,
     PluginAdapterResult,
+    author_display_name,
     resolve_declared_path,
     typescript_identifier,
 )
@@ -113,6 +114,7 @@ class KimiPluginAdapter:
                     source_path=skill.source_path,
                     allowed_tools=skill.allowed_tools,
                     user_invocable=skill.user_invocable,
+                    model_invocable=skill.model_invocable,
                     license=skill.license,
                     compatibility=skill.compatibility,
                     metadata=skill.metadata,
@@ -145,6 +147,7 @@ class KimiPluginAdapter:
                 mcp_servers=mcp_servers,
                 tool_overrides=MappingProxyType({}),
                 private_metadata=MappingProxyType({"kimiManifest": raw_manifest}),
+                author=author_display_name(manifest.author),
                 adapted_skills=(*skills, *commands),
                 adapted_hooks=hooks,
             ),
@@ -205,6 +208,7 @@ class KimiPluginAdapter:
             if (
                 skill := adapt_skill_file(
                     path=path,
+                    root=root,
                     source_format="kimi_code",
                     diagnostics=diagnostics,
                     normalize_vendor_fields=True,

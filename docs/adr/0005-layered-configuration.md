@@ -51,11 +51,51 @@ layer still contributes.
 
 The default write target is selected from the installed layers:
 
-- a discovered and trusted project layer is the default write target;
+- `~/.vibe/config.toml` is the default write target whenever the user source is
+  enabled, including when a trusted project config is discovered: project
+  discovery walks up parent directories, so in a monorepo the closest project
+  file is rarely the scope the writer meant;
 - project-only composition uses the project layer, creating
   `.vibe/config.toml` on first write when absent;
-- otherwise `~/.vibe/config.toml` is selected when the user source is enabled;
 - composition without a persistent source uses the runtime override layer.
+
+`active_model` uses the same write-target resolution as every other field.
+When a session already has a pinned model, the app server additionally mirrors
+an implicit `active_model` write into the runtime override layer; this does not
+change the target of the original write. An explicit persistent target,
+including one selected through `/config`, changes only that layer. A write
+explicitly targeting the session override changes that override directly.
+Session metadata is synchronized from the effective model only when the next
+user turn starts or is enqueued.
+
+The thinking level travels with the model pick and is session-scoped the same
+way, except that it lives under a model entry rather than beside it: the
+app server mirrors the session's level into the runtime override layer as a
+field of the active model, so a level picked in one session is not the level
+another session reopens on. Session metadata records it at the same turn
+boundary as the model, and records the effective level, so a model change moves
+the recorded level to the model now active.
+
+A model declared by a layer above the override — an agent profile, an admin
+policy — is exempt: that layer both outranks the override and may be replaced
+while the session runs, which would leave the override as the model's only and
+incomplete definition. The level of such a model stays the layer's to set, and
+the session neither scopes nor records it.
+
+An `active_model` alias absent from the merged model catalog is normalized to
+the empty, unpinned sentinel. Normal default resolution then applies, including
+the routed default and `allowed_models`; the invalid source value is left
+untouched and reported as a validation warning.
+
+A `compaction_model` on another provider than the active model yields to the
+active model: compaction rides the active model's connection, so it has no route
+to a second provider. The source value is left untouched and reported as a
+validation warning rather than rejected, so a model pick, including a restored
+session pin, never fails on it.
+
+Clients that let a user pick a scope (the `/config` screen) offer the default
+target, the trusted project layer, and the session override layer, in that
+order; each write op names its target layer explicitly.
 
 An untrusted project layer loads empty and is skipped by the merge builder.
 When the user source is enabled, implicit writes fall back to the user layer.
@@ -142,10 +182,14 @@ config schema. A local hardware failure may produce a client warning, but it
 must not silently mutate server config.
 
 Before a session is attached, CLI and ACP launchers still load dotenv values,
-create initial files, run onboarding, and read startup config for process-level
-setup. This is bootstrap staging, not a second attached runtime. After
-attachment, live config reads, writes, reloads, trust decisions, and derived
-resource refreshes are server operations.
+create initial files, run onboarding, and read startup config for
+process-level setup. This is bootstrap staging, not a second attached runtime.
+Onboarding configuration writes go through the server: the session-less
+`setup/*` surface persists the wizard's choices, and `config/write` serves an
+attached session. The server owns keyring and `$VIBE_HOME/.env` credential
+custody — no client-side credential exception remains. After attachment,
+live config reads, writes, reloads, trust decisions, and derived resource
+refreshes are server operations.
 
 ## Rationale
 

@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import json
+from pathlib import Path
+import tomllib
 
 import httpx
 import pytest
 import respx
+import tomli_w
 
-from vibe.app_server.protocol import AppServerResponseError, ProtocolErrorCode
+from tests.app_server.backend_contract.conftest import connect_backend_contract_host
+from vibe.app_server.protocol import (
+    AppServerResponseError,
+    ClientCapabilities,
+    ProtocolErrorCode,
+    SessionOptions,
+)
 from vibe.app_server.session import AppServerSession
+from vibe.core.config import VibeConfigSchema
 
 
 @pytest.mark.asyncio
@@ -30,6 +41,23 @@ async def test_session_configuration_updates_and_reloads_through_the_backend(
 
 
 @pytest.mark.asyncio
+async def test_a_model_pick_goes_through_the_typed_write(
+    backend_contract_session: AppServerSession,
+) -> None:
+    """*Prepare*: A session on its configured model.
+    *Do*: Pick the thinking level, the way `/thinking` does.
+    *Assert*: It lands. The CLI used to post a JSON pointer it escaped itself at
+    `config/write`, which a running turn refuses outright; the typed operation
+    is the one the app-server can park until the turn ends.
+    """
+    config = backend_contract_session.resources.config
+
+    await config.write_model(reasoning_effort="low")
+
+    assert config.current.active_model.thinking == "low"
+
+
+@pytest.mark.asyncio
 async def test_config_updates_refresh_the_public_runtime_tool_catalog(
     backend_contract_session: AppServerSession,
 ) -> None:
@@ -40,6 +68,52 @@ async def test_config_updates_refresh_the_public_runtime_tool_catalog(
     )
 
     assert not backend_contract_session.resources.runtime.has_tool("grep")
+
+
+@pytest.mark.asyncio
+async def test_active_model_update_preserves_usage_and_updates_prices(
+    backend_contract_mistral_api: respx.Route,
+    backend_contract_mistral_response: Callable[[str], httpx.Response],
+    backend_contract_session: AppServerSession,
+) -> None:
+    """*Prepare*: Configure prices and accumulate usage with the default model.
+    *Do*: Switch to the differently priced built-in medium model.
+    *Assert*: Usage totals remain while prices change to the new model's rates.
+    """
+    # Prepare
+    await backend_contract_session.resources.config.update(
+        {
+            "models": [
+                {
+                    "name": "mistral-vibe-cli-latest",
+                    "provider": "mistral",
+                    "alias": "devstral-latest",
+                    "input_price": 1.0,
+                    "output_price": 2.0,
+                }
+            ]
+        },
+        reload_runtime=True,
+    )
+    backend_contract_mistral_api.mock(
+        return_value=backend_contract_mistral_response("priced")
+    )
+    _ = [event async for event in backend_contract_session.act("count this turn")]
+    before = backend_contract_session.resources.runtime.stats
+    assert before.input_price_per_million == 1.0
+    assert before.output_price_per_million == 2.0
+
+    # Do
+    await backend_contract_session.resources.config.update(
+        {"active_model": "mistral-medium-3.5"}, reload_runtime=True
+    )
+
+    # Assert
+    after = backend_contract_session.resources.runtime.stats
+    assert after.session_prompt_tokens == before.session_prompt_tokens
+    assert after.session_completion_tokens == before.session_completion_tokens
+    assert after.input_price_per_million == 1.5
+    assert after.output_price_per_million == 7.5
 
 
 @pytest.mark.asyncio
@@ -56,6 +130,273 @@ async def test_config_subscribers_observe_updates_until_unsubscribed(
     await backend_contract_session.resources.config.update({"theme": "gruvbox"})
 
     assert themes == ["monokai"]
+
+
+@pytest.mark.asyncio
+async def test_active_model_is_pinned_on_first_turn_and_restored_on_resume(
+    config_dir: Path,
+    tmp_path: Path,
+    experimental_harness: bool,
+    backend_contract_mistral_api: respx.Route,
+    backend_contract_mistral_response: Callable[[str], httpx.Response],
+) -> None:
+    config_file = config_dir / "config.toml"
+    config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    config["active_model"] = ""
+    config["models"].append({
+        "name": "alternate-model",
+        "provider": "mistral",
+        "alias": "alternate",
+    })
+    session_root = tmp_path / "sessions"
+    config["session_logging"] = {"enabled": True, "save_dir": str(session_root)}
+    config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
+    backend_contract_mistral_api.mock(
+        return_value=backend_contract_mistral_response("stored")
+    )
+
+    connection = await connect_backend_contract_host(
+        experimental_harness,
+        session_options=SessionOptions(),
+        capabilities=ClientCapabilities(),
+    )
+    session = await connection.host.open_session()
+    try:
+        assert session.resources.config.current.active_model_pinned is False
+        default_model = session.resources.config.current.active_model.alias
+        await session.resources.config.update(
+            {"active_model": "alternate"}, reload_runtime=True
+        )
+        assert session.resources.config.current.active_model.alias == "alternate"
+        assert (
+            _session_model_is_persisted(
+                session_root, session.session_id, experimental_harness
+            )
+            is False
+        )
+        await session.resources.config.update({"active_model": ""}, reload_runtime=True)
+        _ = [event async for event in session.act("pin this model")]
+        session_id = session.session_id
+        assert session.resources.config.current.active_model_pinned is True
+
+        await session.resources.config.update(
+            {"active_model": "alternate"}, reload_runtime=True
+        )
+        assert session.resources.config.current.active_model.alias == "alternate"
+        assert _stored_active_model(session_root, session_id, experimental_harness) == (
+            default_model
+        )
+        _ = [event async for event in session.act("persist the alternate model")]
+        assert _stored_active_model(session_root, session_id, experimental_harness) == (
+            "alternate"
+        )
+
+        await session.resources.config.update({"active_model": ""}, reload_runtime=True)
+        assert session.resources.config.current.active_model.alias == default_model
+        assert (
+            _stored_active_model(session_root, session_id, experimental_harness)
+            == "alternate"
+        )
+        _ = [event async for event in session.act("persist the default model")]
+        assert (
+            _stored_active_model(session_root, session_id, experimental_harness)
+            == default_model
+        )
+    finally:
+        await session.close()
+
+    config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    assert config["active_model"] == ""
+    config["active_model"] = "alternate"
+    config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
+
+    resumed_connection = await connect_backend_contract_host(
+        experimental_harness,
+        session_options=SessionOptions(),
+        capabilities=ClientCapabilities(),
+    )
+    resumed = await resumed_connection.host.resume_session(session_id)
+    try:
+        assert resumed.resources.config.current.active_model.alias == default_model
+        assert resumed.resources.config.current.active_model_pinned is True
+        await resumed.clear_history()
+        assert resumed.session_id != session_id
+        assert resumed.resources.config.current.active_model.alias == "alternate"
+    finally:
+        await resumed.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_layer", "updates_session_pin"), [("user-toml", False), ("overrides", True)]
+)
+async def test_explicit_active_model_target_controls_session_pin_update(
+    config_dir: Path,
+    tmp_path: Path,
+    experimental_harness: bool,
+    backend_contract_mistral_api: respx.Route,
+    backend_contract_mistral_response: Callable[[str], httpx.Response],
+    target_layer: str,
+    updates_session_pin: bool,
+) -> None:
+    config_file = config_dir / "config.toml"
+    config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    config["active_model"] = ""
+    config["models"].append({
+        "name": "alternate-model",
+        "provider": "mistral",
+        "alias": "alternate",
+    })
+    session_root = tmp_path / "sessions"
+    config["session_logging"] = {"enabled": True, "save_dir": str(session_root)}
+    config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
+    backend_contract_mistral_api.mock(
+        return_value=backend_contract_mistral_response("stored")
+    )
+
+    connection = await connect_backend_contract_host(
+        experimental_harness,
+        session_options=SessionOptions(),
+        capabilities=ClientCapabilities(),
+    )
+    session = await connection.host.open_session()
+    try:
+        _ = [event async for event in session.act("pin this model")]
+        pinned_model = session.resources.config.current.active_model.alias
+        assert (
+            _stored_active_model(session_root, session.session_id, experimental_harness)
+            == pinned_model
+        )
+
+        await session.resources.config.update(
+            {"active_model": "alternate"},
+            target_layer=target_layer,
+            reload_runtime=True,
+        )
+
+        active_model = "alternate" if updates_session_pin else pinned_model
+        assert session.resources.config.current.active_model.alias == active_model
+        assert (
+            _stored_active_model(session_root, session.session_id, experimental_harness)
+            == pinned_model
+        )
+
+        _ = [event async for event in session.act("persist the selected model")]
+        assert (
+            _stored_active_model(session_root, session.session_id, experimental_harness)
+            == active_model
+        )
+    finally:
+        await session.close()
+
+    persisted_config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    assert persisted_config["active_model"] == (
+        "" if updates_session_pin else "alternate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_removed_session_active_model_falls_back_to_default(
+    config_dir: Path,
+    tmp_path: Path,
+    experimental_harness: bool,
+    backend_contract_mistral_api: respx.Route,
+    backend_contract_mistral_response: Callable[[str], httpx.Response],
+) -> None:
+    config_file = config_dir / "config.toml"
+    config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    fallback_model = (
+        VibeConfigSchema(active_model="removed-model").get_active_model().alias
+    )
+    config["active_model"] = "removed-model"
+    config["models"].extend([
+        {"name": "removed-model", "provider": "mistral", "alias": "removed-model"},
+        {
+            "name": "lower-layer-model",
+            "provider": "mistral",
+            "alias": "lower-layer-model",
+        },
+    ])
+    session_root = tmp_path / "sessions"
+    config["session_logging"] = {"enabled": True, "save_dir": str(session_root)}
+    config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
+    backend_contract_mistral_api.mock(
+        return_value=backend_contract_mistral_response("stored")
+    )
+
+    connection = await connect_backend_contract_host(
+        experimental_harness,
+        session_options=SessionOptions(),
+        capabilities=ClientCapabilities(),
+    )
+    session = await connection.host.open_session()
+    try:
+        _ = [event async for event in session.act("pin the removed model")]
+        session_id = session.session_id
+        assert (
+            _stored_active_model(session_root, session_id, experimental_harness)
+            == "removed-model"
+        )
+    finally:
+        await session.close()
+
+    config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    config["active_model"] = "lower-layer-model"
+    config["models"] = [
+        model for model in config["models"] if model["alias"] != "removed-model"
+    ]
+    config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
+
+    resumed_connection = await connect_backend_contract_host(
+        experimental_harness,
+        session_options=SessionOptions(),
+        capabilities=ClientCapabilities(),
+    )
+    resumed = await resumed_connection.host.resume_session(session_id)
+    try:
+        assert resumed.resources.config.current.active_model.alias == fallback_model
+        assert (
+            resumed.resources.config.current.active_model.alias != "lower-layer-model"
+        )
+        assert resumed.resources.config.current.active_model_pinned is False
+        assert (
+            _stored_active_model(session_root, session_id, experimental_harness)
+            == "removed-model"
+        )
+        _ = [event async for event in resumed.act("pin the default model")]
+        assert resumed.resources.config.current.active_model_pinned is True
+        assert (
+            _stored_active_model(session_root, session_id, experimental_harness)
+            == fallback_model
+        )
+    finally:
+        await resumed.close()
+
+
+def _stored_active_model(
+    session_root: Path, session_id: str, experimental_harness: bool
+) -> str | None:
+    if experimental_harness:
+        from mistralai_vibe_local_harness.vibe._storage import UnifiedSessionStore
+
+        return (
+            UnifiedSessionStore(session_root, session_id)
+            .load()
+            .runtime_state.session_metadata.active_model
+        )
+    metadata_path = next(session_root.glob(f"*_{session_id[:8]}/meta.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    return metadata["config"].get("active_model")
+
+
+def _session_model_is_persisted(
+    session_root: Path, session_id: str, experimental_harness: bool
+) -> bool:
+    if experimental_harness:
+        from mistralai_vibe_local_harness.vibe._storage import UnifiedSessionStore
+
+        return UnifiedSessionStore(session_root, session_id).exists
+    return any(session_root.glob(f"*_{session_id[:8]}/meta.json"))
 
 
 @pytest.mark.asyncio
@@ -110,3 +451,59 @@ async def test_config_mutations_conflict_while_a_turn_is_running(
         await turn
 
     assert exc_info.value.error.code is ProtocolErrorCode.CONFLICT
+
+
+@pytest.mark.asyncio
+async def test_agent_install_and_uninstall_round_trip_through_the_backend(
+    backend_contract_session: AppServerSession,
+) -> None:
+    def agent_names() -> set[str]:
+        return {agent.name for agent in backend_contract_session.resources.agents.all}
+
+    assert "lean" not in agent_names()
+
+    await backend_contract_session.resources.agents.set_installed(
+        "lean", installed=True
+    )
+    await backend_contract_session.resources.runtime.refresh()
+
+    assert "lean" in agent_names()
+
+    await backend_contract_session.resources.agents.set_installed(
+        "lean", installed=False
+    )
+    await backend_contract_session.resources.runtime.refresh()
+
+    assert "lean" not in agent_names()
+
+
+@pytest.mark.asyncio
+async def test_agent_install_rejects_unknown_agent_names(
+    backend_contract_session: AppServerSession, experimental_harness: bool
+) -> None:
+    if not experimental_harness:
+        pytest.skip("validation semantics are unified-harness only")
+    with pytest.raises(AppServerResponseError) as exc_info:
+        await backend_contract_session.resources.agents.set_installed(
+            "no-such-agent", installed=True
+        )
+
+    assert exc_info.value.error.code is ProtocolErrorCode.INVALID_PARAMS
+    assert "no-such-agent" in exc_info.value.error.message
+
+
+@pytest.mark.asyncio
+async def test_agent_uninstall_switches_away_from_the_active_agent(
+    backend_contract_session: AppServerSession, experimental_harness: bool
+) -> None:
+    if not experimental_harness:
+        pytest.skip("active-agent switch semantics are unified-harness only")
+    resources = backend_contract_session.resources
+    await resources.agents.set_installed("lean", installed=True)
+    active = await resources.agents.switch("lean")
+    assert active.name == "lean"
+
+    await resources.agents.set_installed("lean", installed=False)
+
+    assert "lean" not in {agent.name for agent in resources.agents.all}
+    assert resources.agents.active.name != "lean"

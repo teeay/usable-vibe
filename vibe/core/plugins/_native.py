@@ -49,15 +49,29 @@ from vibe.core.plugins._compatibility import (
     PluginAdapterDiagnostic,
     PluginFormatAdapter,
     PluginToolOverride,
+    author_display_name,
     detect_plugin_source_format,
+    plugin_runtime_state_names,
     relative_plugin_path,
     typescript_identifier,
 )
 from vibe.core.plugins._content import digest_plugin_tree
+from vibe.core.plugins._diagnostics import PluginDiagnosticCode
 from vibe.core.plugins._foreign import OpenCodePluginAdapter
 from vibe.core.plugins._kimi import KimiPluginAdapter
-from vibe.core.skills.models import SkillInfo, SkillMetadata, SkillScope
-from vibe.core.skills.parser import SkillParseError, parse_skill_markdown
+from vibe.core.skills.models import (
+    DISABLE_MODEL_INVOCATION_FIELD,
+    SkillInfo,
+    SkillMetadata,
+    SkillScope,
+    SkillSource,
+)
+from vibe.core.skills.parser import (
+    SkillParseError,
+    load_openai_skill_metadata,
+    openai_skill_metadata_path,
+    parse_skill_markdown,
+)
 from vibe.utils.io import read_safe
 from vibe.utils.platform import is_windows
 
@@ -66,7 +80,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_RESERVED_NAMESPACES = {"file_system", "self", "process", "agent", "vibe"}
+_RESERVED_NAMESPACES = {"file_system", "self", "process", "skill", "subagent", "vibe"}
 _VIBE_EXTENSION = "ai.mistral.vibe"
 _TYPESCRIPT_IDENTIFIER_PATTERN = r"^[A-Za-z_$][A-Za-z0-9_$]*$"
 _PLUGIN_PLACEHOLDER_PATTERN = re.compile(r"\$\{PLUGIN_(?:ROOT|DATA)\}")
@@ -359,6 +373,7 @@ class PluginDescriptor:
     private_metadata: Mapping[str, object]
     manifest_digest: str
     content_digest: str
+    author: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,35 +483,81 @@ class PluginResolver:
         *,
         project_roots: Sequence[Path] = (),
         user_roots: Sequence[Path] = (),
+        plugin_dirs: Sequence[Path] = (),
+        builtin_roots: Sequence[Path] = (),
+        plugin_scopes: Mapping[Path, SkillScope] | None = None,
         data_root_base: Path | None = None,
         config_orchestrator: ConfigOrchestrator[VibeConfigSchema] | None = None,
     ) -> None:
         self._project_roots = tuple(project_roots)
         self._user_roots = tuple(user_roots)
+        self._builtin_roots = tuple(builtin_roots)
+        # Named outright rather than discovered under a root: a pinned session
+        # rebuilding its recorded set has nothing to scan, so these skip
+        # discovery and take their scope from ``plugin_scopes``.
+        self._plugin_dirs = tuple(plugin_dirs)
+        self._plugin_scopes = dict(plugin_scopes) if plugin_scopes is not None else {}
         self._data_root_base = data_root_base
         self._config_orchestrator = config_orchestrator
         self._issues: list[PluginConfigIssue] = []
         self._unsupported_components: list[PluginUnsupportedComponent] = []
+
+    @property
+    def _builtin_plugin_dirs(self) -> list[Path]:
+        dirs: list[Path] = []
+        for root in self._builtin_roots:
+            try:
+                dirs.extend(
+                    sorted(
+                        (
+                            path
+                            for path in root.iterdir()
+                            if path.is_dir()
+                            and not path.name.startswith("__")
+                            and (path / "plugin.json").is_file()
+                        ),
+                        key=lambda path: path.name,
+                    )
+                )
+            except OSError as error:
+                self._issues.append(
+                    PluginConfigIssue(file=root, message=f"Failed to discover: {error}")
+                )
+        return dirs
 
     @classmethod
     def from_harness_files(
         cls,
         harness_files: HarnessFilesManager,
         *,
+        builtin_roots: Sequence[Path] = (),
+        data_root_base: Path | None = None,
         config_orchestrator: ConfigOrchestrator[VibeConfigSchema] | None = None,
     ) -> PluginResolver:
         return cls(
             project_roots=harness_files.project_plugins_dirs,
             user_roots=harness_files.user_plugins_dirs,
+            builtin_roots=builtin_roots,
+            data_root_base=data_root_base,
             config_orchestrator=config_orchestrator,
         )
 
     def resolve(self) -> ResolvedPluginSet:
         self._issues = []
         self._unsupported_components = []
-        project = self._discover_scope(self._project_roots, SkillScope.PROJECT)
-        user = self._discover_scope(self._user_roots, SkillScope.GLOBAL)
-        selected = self._select_by_precedence(project, user)
+        named = self._named_dirs_by_scope()
+        project = self._load_scope(
+            [*named[SkillScope.PROJECT], *self._child_dirs(self._project_roots)],
+            SkillScope.PROJECT,
+        )
+        user = self._load_scope(
+            [*named[SkillScope.GLOBAL], *self._child_dirs(self._user_roots)],
+            SkillScope.GLOBAL,
+        )
+        builtin = self._load_scope(
+            [*named[SkillScope.BUILTIN], *self._builtin_plugin_dirs], SkillScope.BUILTIN
+        )
+        selected = self._select_by_precedence(project, user, builtin)
         selected = self._remove_namespace_collisions(selected)
         plugins = tuple(
             sorted(
@@ -508,17 +569,24 @@ class PluginResolver:
             for candidate in sorted(selected, key=lambda item: item.descriptor.name)
             for name, skill in candidate.skills.items()
         }
-        mcp_servers = tuple(
-            server
-            for candidate in sorted(selected, key=lambda item: item.descriptor.name)
-            for server in candidate.mcp_servers
+        mcp_servers = self._remove_config_shadowed_mcp_servers(
+            tuple(
+                server
+                for candidate in sorted(selected, key=lambda item: item.descriptor.name)
+                for server in candidate.mcp_servers
+            ),
+            {candidate.descriptor.name: candidate.descriptor for candidate in selected},
         )
         runtime_hooks = tuple(
             hook
             for candidate in sorted(
                 selected,
                 key=lambda item: (
-                    0 if item.descriptor.scope is SkillScope.PROJECT else 1,
+                    0
+                    if item.descriptor.scope is SkillScope.PROJECT
+                    else 1
+                    if item.descriptor.scope is SkillScope.GLOBAL
+                    else 2,
                     item.descriptor.name,
                 ),
             )
@@ -574,25 +642,60 @@ class PluginResolver:
             unsupported_components=tuple(self._unsupported_components),
         )
 
-    def _discover_scope(
-        self, roots: Sequence[Path], scope: SkillScope
-    ) -> list[_PluginCandidate]:
-        candidates: list[_PluginCandidate] = []
+    def _child_dirs(self, roots: Sequence[Path]) -> list[Path]:
+        """Every plugin directory sitting under one of these roots."""
+        plugin_dirs: list[Path] = []
         for root in roots:
             try:
-                plugin_dirs = sorted(
-                    (path for path in root.iterdir() if path.is_dir()),
-                    key=lambda path: path.name,
+                plugin_dirs.extend(
+                    sorted(
+                        (path for path in root.iterdir() if path.is_dir()),
+                        key=lambda path: path.name,
+                    )
                 )
             except OSError as error:
                 self._issues.append(
                     PluginConfigIssue(file=root, message=f"Failed to discover: {error}")
                 )
-                continue
-            for plugin_dir in plugin_dirs:
-                if candidate := self._load_plugin(plugin_dir, scope):
-                    candidates.append(candidate)
+        return plugin_dirs
+
+    def _named_dirs_by_scope(self) -> dict[SkillScope, list[Path]]:
+        buckets: dict[SkillScope, list[Path]] = {
+            SkillScope.PROJECT: [],
+            SkillScope.GLOBAL: [],
+            SkillScope.BUILTIN: [],
+        }
+        for plugin_dir in self._plugin_dirs:
+            scope = self._plugin_scopes.get(plugin_dir.resolve(), SkillScope.PROJECT)
+            buckets.get(scope, buckets[SkillScope.PROJECT]).append(plugin_dir)
+        return buckets
+
+    def _load_scope(
+        self, plugin_dirs: Sequence[Path], scope: SkillScope
+    ) -> list[_PluginCandidate]:
+        candidates = [
+            candidate
+            for plugin_dir in plugin_dirs
+            if (candidate := self._load_plugin(plugin_dir, scope))
+        ]
         return self._remove_same_scope_duplicates(candidates)
+
+    def _reject_builtin_foreign_format(
+        self, root: Path, source_format: DetectedPluginFormat
+    ) -> None:
+        self._issues.append(
+            PluginConfigIssue(
+                file=root,
+                message=(
+                    "Built-in plugins must use the Agent Plugins 1.0 format; "
+                    f"{source_format.value} is not supported"
+                ),
+                code="plugin.compatibility.format_unsupported_builtin",
+                fatal=True,
+                source_format=source_format,
+                component="manifest",
+            )
+        )
 
     def _load_plugin(
         self, plugin_dir: Path, scope: SkillScope
@@ -625,8 +728,10 @@ class PluginResolver:
             return None
         if detection.source_format is DetectedPluginFormat.AGENT_PLUGINS_1_0:
             return self._load_native_plugin(root, scope)
+        if scope is SkillScope.BUILTIN:
+            self._reject_builtin_foreign_format(root, detection.source_format)
         adapter = _compatibility_adapter(detection.source_format)
-        if adapter is not None:
+        if adapter is not None and scope is not SkillScope.BUILTIN:
             result = adapter.adapt(
                 root=root, data_root_base=self._plugin_data_root_base(root), scope=scope
             )
@@ -695,7 +800,12 @@ class PluginResolver:
         extension = self._parse_vibe_extension(manifest, resolved_manifest)
         try:
             manifest_digest = canonical_json_digest(manifest)
-            content_digest = digest_plugin_tree(root)
+            content_digest = digest_plugin_tree(
+                root,
+                ignored_names=plugin_runtime_state_names(
+                    DetectedPluginFormat.AGENT_PLUGINS_1_0
+                ),
+            )
         except OSError as error:
             self._issues.append(
                 PluginConfigIssue(
@@ -708,7 +818,12 @@ class PluginResolver:
             if extension is not None and extension.tool_namespace is not None
             else _typescript_identifier(manifest.name)
         )
-        if namespace in _RESERVED_NAMESPACES:
+        _builtin_reserved = (
+            _RESERVED_NAMESPACES
+            if scope is not SkillScope.BUILTIN
+            else (_RESERVED_NAMESPACES - {"vibe"})
+        )
+        if namespace in _builtin_reserved:
             self._issues.append(
                 PluginConfigIssue(
                     file=manifest_path,
@@ -723,7 +838,7 @@ class PluginResolver:
             or f"Capabilities provided by {manifest.name}.",
             root=root,
             manifest_path=resolved_manifest,
-            data_root=self._plugin_data_root_base(root) / manifest.name,
+            data_root=self._scope_data_root(scope, root) / manifest.name,
             namespace=namespace,
             scope=scope,
             source_format=DetectedPluginFormat.AGENT_PLUGINS_1_0,
@@ -736,6 +851,9 @@ class PluginResolver:
             private_metadata=MappingProxyType({}),
             manifest_digest=manifest_digest,
             content_digest=content_digest,
+            author=author_display_name(
+                manifest.author.name if manifest.author is not None else None
+            ),
         )
         skills = self._load_skills(descriptor)
         mcp_servers = self._load_mcp_servers(descriptor)
@@ -774,7 +892,9 @@ class PluginResolver:
             return None
         try:
             manifest_text = read_safe(package.manifest_path, raise_on_error=True).text
-            content_digest = digest_plugin_tree(root)
+            content_digest = digest_plugin_tree(
+                root, ignored_names=plugin_runtime_state_names(package.source_format)
+            )
         except OSError as error:
             self._issues.append(
                 PluginConfigIssue(
@@ -806,6 +926,7 @@ class PluginResolver:
             private_metadata=package.private_metadata,
             manifest_digest=manifest_digest,
             content_digest=content_digest,
+            author=package.author,
         )
         self._unsupported_components.extend(
             PluginUnsupportedComponent(
@@ -909,8 +1030,11 @@ class PluginResolver:
                 definition.source_path,
                 definition.prompt,
                 scope=plugin.scope,
+                model_invocable=definition.model_invocable,
             )
-            skills[alias] = skill.model_copy(update={"name": alias})
+            skills[alias] = skill.model_copy(
+                update={"name": alias, "source": SkillSource.PLUGIN}
+            )
         return skills
 
     @staticmethod
@@ -972,6 +1096,19 @@ class PluginResolver:
 
     def _plugin_data_root_base(self, root: Path) -> Path:
         return self._data_root_base or root.parent.parent / "plugin-data"
+
+    def _scope_data_root(self, scope: SkillScope, root: Path) -> Path:
+        if scope is SkillScope.BUILTIN:
+            if self._data_root_base is None:
+                self._issues.append(
+                    PluginConfigIssue(
+                        file=root,
+                        message="data_root_base is required for built-in plugins",
+                    )
+                )
+                return root.parent.parent / "plugin-data"
+            return self._data_root_base
+        return self._plugin_data_root_base(root)
 
     @staticmethod
     def _adapt_mcp_servers(
@@ -1477,6 +1614,47 @@ class PluginResolver:
                 )
         return tuple(selected)
 
+    def _remove_config_shadowed_mcp_servers(
+        self,
+        definitions: tuple[PluginMCPServerDefinition, ...],
+        plugins: Mapping[str, PluginDescriptor],
+    ) -> tuple[PluginMCPServerDefinition, ...]:
+        # The keyring, /mcp and every login key on the source id, so a plugin
+        # sharing one with a configured server would be handed the tokens the
+        # user granted that server and send them to the url the plugin
+        # declared. Config owns the name. Dropping rather than renaming: the
+        # name is the identity the token was granted against, so a rename would
+        # point the plugin's server at a grant that was never made.
+        if self._config_orchestrator is None:
+            return definitions
+        configured = {
+            server.name for server in self._config_orchestrator.config.mcp_servers
+        }
+        selected: list[PluginMCPServerDefinition] = []
+        for definition in definitions:
+            if definition.source_id not in configured:
+                selected.append(definition)
+                continue
+            plugin = plugins.get(definition.plugin_name)
+            self._issues.append(
+                PluginConfigIssue(
+                    file=definition.config_file,
+                    message=(
+                        f"Plugin {definition.plugin_name!r} MCP server "
+                        f"{definition.source_id!r} was disabled: a configured MCP "
+                        "server already uses that name, and the two would share "
+                        "credentials. Rename it in the plugin, or remove the "
+                        "configured server."
+                    ),
+                    severity="warning",
+                    code=PluginDiagnosticCode.MCP_SERVER_SHADOWED,
+                    fatal=False,
+                    source_format=None if plugin is None else plugin.source_format,
+                    component="mcp_server",
+                )
+            )
+        return tuple(selected)
+
     def _load_mcp_servers(
         self, plugin: PluginDescriptor
     ) -> tuple[PluginMCPServerDefinition, ...]:
@@ -1654,18 +1832,46 @@ class PluginResolver:
                         )
                     )
                     continue
-                skills[alias] = skill.model_copy(update={"name": alias})
+                skills[alias] = skill.model_copy(
+                    update={"name": alias, "source": SkillSource.PLUGIN}
+                )
         return skills
 
-    @staticmethod
-    def _parse_skill(path: Path, plugin: PluginDescriptor) -> SkillInfo:
+    def _parse_skill(self, path: Path, plugin: PluginDescriptor) -> SkillInfo:
         try:
             content = read_safe(path, raise_on_error=True).text
         except OSError as error:
             raise SkillParseError(f"Cannot read file: {error}") from error
         frontmatter, body = parse_skill_markdown(content)
         metadata = SkillMetadata.model_validate(frontmatter)
-        return SkillInfo.from_metadata(metadata, path, body.strip(), scope=plugin.scope)
+        try:
+            openai_metadata = load_openai_skill_metadata(path, root=plugin.root)
+        except SkillParseError as error:
+            self._issues.append(
+                PluginConfigIssue(
+                    file=openai_skill_metadata_path(path),
+                    message=(
+                        "Invalid OpenAI skill metadata; model invocation disabled: "
+                        f"{error}"
+                    ),
+                    code="plugin.skill.openai_metadata_invalid",
+                    fatal=False,
+                    source_format=plugin.source_format,
+                    component="skill",
+                )
+            )
+            model_invocable = False
+        else:
+            model_invocable = (
+                openai_metadata is None or openai_metadata.allows_implicit_invocation
+            )
+        return SkillInfo.from_metadata(
+            metadata,
+            path,
+            body.strip(),
+            scope=plugin.scope,
+            model_invocable=model_invocable,
+        )
 
     def _remove_same_scope_duplicates(
         self, candidates: Sequence[_PluginCandidate]
@@ -1689,15 +1895,26 @@ class PluginResolver:
 
     @staticmethod
     def _select_by_precedence(
-        project: Sequence[_PluginCandidate], user: Sequence[_PluginCandidate]
+        project: Sequence[_PluginCandidate],
+        user: Sequence[_PluginCandidate],
+        builtin: Sequence[_PluginCandidate] = (),
     ) -> list[_PluginCandidate]:
         project_by_name = {
             candidate.descriptor.name: candidate for candidate in project
         }
         user_by_name = {candidate.descriptor.name: candidate for candidate in user}
+        builtin_by_name = {
+            candidate.descriptor.name: candidate for candidate in builtin
+        }
         return [
-            project_by_name[name] if name in project_by_name else user_by_name[name]
-            for name in sorted(project_by_name.keys() | user_by_name.keys())
+            project_by_name[name]
+            if name in project_by_name
+            else user_by_name[name]
+            if name in user_by_name
+            else builtin_by_name[name]
+            for name in sorted(
+                project_by_name.keys() | user_by_name.keys() | builtin_by_name.keys()
+            )
         ]
 
     def _remove_namespace_collisions(
@@ -1766,6 +1983,8 @@ def _render_generated_skill(definition: AdaptedSkill) -> str:
     ]
     if definition.allowed_tools:
         lines.append("allowed-tools: " + json.dumps(list(definition.allowed_tools)))
+    if not definition.model_invocable:
+        lines.append(f"{DISABLE_MODEL_INVOCATION_FIELD}: true")
     lines.extend(["---", "", definition.prompt, ""])
     return "\n".join(lines)
 

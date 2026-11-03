@@ -6,6 +6,7 @@ import pytest
 from vibe.app_server._patch import apply_json_patch
 from vibe.app_server._projector import EventProjector
 from vibe.app_server.events import (
+    ChildSessionUpdated,
     ClientProjection,
     EventSequenceError,
     HistoryEntryAdded,
@@ -16,6 +17,7 @@ from vibe.app_server.events import (
     SessionCompacted,
     SessionSnapshot,
     StatsUpdated,
+    TurnQueueUpdated,
     UnknownNotificationError,
     parse_server_event,
     reconcile_snapshot,
@@ -25,25 +27,34 @@ from vibe.app_server.models import (
     CompletedEffectState,
     IdleSessionStatus,
     PublicCallbackEntry,
+    PublicChildSession,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
     PublicError,
     PublicMessageEntry,
+    PublicQueuedTurn,
     PublicReasoningEntry,
     PublicRetryCategory,
     PublicRetryState,
     PublicSession,
     PublicSessionState,
     PublicTurn,
+    PublicTurnQueue,
     PublicTurnStatus,
     ResourceContentBlock,
+    RunningSessionStatus,
     TextContentBlock,
+    TokenUsage,
 )
 from vibe.app_server.protocol import (
+    ChildSessionUpdatedParams,
     HistoryEntryAddedParams,
     JsonPatchOperation,
     MCPAuthRequiredParams,
     Notification,
+    SessionTextContentBlock,
+    TurnQueueUpdatedParams,
+    TurnUserInputEntry,
 )
 from vibe.core.tools.builtins.read_file import ReadFile, ReadFileArgs, ReadFileResult
 from vibe.core.tools.ui import ToolUIDataAdapter
@@ -80,6 +91,18 @@ def _notification(sequence: int, update) -> Notification:
     params = update.params.model_copy(update={"event_id": sequence})
     return Notification(
         method=update.method, params=params.model_dump(mode="json", by_alias=True)
+    )
+
+
+def _queued_turn(item_id: str, message_id: str, text: str) -> PublicQueuedTurn:
+    return PublicQueuedTurn(
+        id=item_id,
+        created_at=1,
+        entries=[
+            TurnUserInputEntry(
+                entry_id=message_id, content=[SessionTextContentBlock(text=text)]
+            )
+        ],
     )
 
 
@@ -132,6 +155,79 @@ def test_mcp_authorization_required_notification_is_typed() -> None:
     assert event == MCPAuthorizationRequiredEvent(params)
 
 
+def test_child_session_update_notification_is_typed() -> None:
+    child = PublicChildSession(
+        id="child-1",
+        name="test-audit",
+        agent_type="explore",
+        status=RunningSessionStatus(active_turn_id="turn-child-1"),
+        created_at=1,
+        updated_at=2,
+        token_usage=TokenUsage(input_tokens=800, output_tokens=200, total_tokens=1_000),
+    )
+    params = ChildSessionUpdatedParams(
+        event_id=1, session_id="session-1", emitted_at=3, child_session=child
+    )
+    notification = Notification(
+        method="session/childSessionUpdated",
+        params=params.model_dump(mode="json", by_alias=True),
+    )
+
+    projection = _projection()
+    event = projection.consume(notification)
+
+    assert event == ChildSessionUpdated(child)
+    assert projection.state.child_sessions == [child]
+    assert projection.last_event_id == 1
+
+
+def test_child_session_update_participates_in_root_event_sequence() -> None:
+    projection = _projection()
+    child = PublicChildSession(
+        id="child-1",
+        name="test-audit",
+        agent_type="explore",
+        status=IdleSessionStatus(),
+        created_at=1,
+        updated_at=1,
+    )
+    params = ChildSessionUpdatedParams(
+        event_id=1, session_id="session-1", emitted_at=3, child_session=child
+    )
+    projection.consume(
+        Notification(
+            method="session/childSessionUpdated",
+            params=params.model_dump(mode="json", by_alias=True),
+        )
+    )
+    with pytest.raises(EventSequenceError, match="expected 2, received 3"):
+        projection.consume(
+            Notification(
+                method="session/childSessionUpdated",
+                params=params.model_copy(update={"event_id": 3}).model_dump(
+                    mode="json", by_alias=True
+                ),
+            )
+        )
+
+
+def test_snapshot_reconciliation_replays_child_session_summaries() -> None:
+    previous = _projection().state
+    child = PublicChildSession(
+        id="child-1",
+        name="test-audit",
+        agent_type="explore",
+        status=IdleSessionStatus(),
+        created_at=1,
+        updated_at=1,
+    )
+    current = previous.model_copy(update={"child_sessions": [child]}, deep=True)
+
+    events = reconcile_snapshot(previous, current)
+
+    assert ChildSessionUpdated(child) in events
+
+
 class PrivateRuntimeEvent(BaseEvent):
     secret: str
 
@@ -172,6 +268,151 @@ def test_snapshot_reconciliation_replays_missing_stream_updates() -> None:
     assert apply_json_patch(
         entry.model_dump(mode="json", by_alias=True), update.patch
     ) == completed.model_dump(mode="json", by_alias=True)
+
+
+def test_reconnect_replays_steered_user_before_later_output_and_queue_update() -> None:
+    queued = _queued_turn("queue-1", "message-1", "steer me")
+    previous = _projection().state.model_copy(
+        update={"turn_queue": PublicTurnQueue(items=[queued])}, deep=True
+    )
+    steered = PublicMessageEntry(
+        id="message-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        role="user",
+        content=[TextContentBlock(text="steer me")],
+        source="turn_steer",
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        created_at=2,
+        updated_at=2,
+    )
+    later = PublicMessageEntry(
+        id="assistant-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        role="assistant",
+        content=[TextContentBlock(text="after steer")],
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        created_at=3,
+        updated_at=3,
+    )
+    current = previous.model_copy(
+        update={
+            "event_id": 4,
+            "history": [steered, later],
+            "turn_queue": PublicTurnQueue(),
+        },
+        deep=True,
+    )
+
+    events = reconcile_snapshot(previous, current)
+
+    assert [type(event) for event in events] == [
+        SessionSnapshot,
+        HistoryEntryAdded,
+        HistoryEntryAdded,
+        TurnQueueUpdated,
+    ]
+    added = [event.entry for event in events if isinstance(event, HistoryEntryAdded)]
+    assert [entry.id for entry in added] == ["message-1", "assistant-1"]
+    assert isinstance(added[0], PublicMessageEntry)
+    assert added[0].source == "turn_steer"
+
+
+def test_turn_queue_update_replaces_public_queue_state() -> None:
+    projection = _projection()
+    queue = PublicTurnQueue(
+        items=[_queued_turn("queue-1", "message-1", "next")], paused=True
+    )
+    notification = Notification(
+        method="turn/queueUpdated",
+        params=TurnQueueUpdatedParams(
+            event_id=1, session_id="session-1", queue=queue, emitted_at=2
+        ).model_dump(mode="json", by_alias=True),
+    )
+
+    event = projection.consume(notification)
+
+    assert isinstance(event, TurnQueueUpdated)
+    assert event.queue == queue
+    assert projection.state.turn_queue == queue
+
+
+def test_turn_queue_read_does_not_overwrite_newer_notification() -> None:
+    projection = _projection()
+    response_queue = PublicTurnQueue(
+        items=[_queued_turn("queue-1", "message-1", "next")]
+    )
+    after_event_id = projection.last_event_id
+    notification = Notification(
+        method="turn/queueUpdated",
+        params=TurnQueueUpdatedParams(
+            event_id=1, session_id="session-1", queue=PublicTurnQueue(), emitted_at=2
+        ).model_dump(mode="json", by_alias=True),
+    )
+
+    projection.consume(notification)
+    queue = projection.adopt_turn_queue(response_queue, after_event_id=after_event_id)
+
+    assert queue == PublicTurnQueue()
+    assert projection.state.turn_queue == PublicTurnQueue()
+
+
+def test_enqueue_reconciliation_only_skips_a_retired_queue_item() -> None:
+    projection = _projection()
+    existing = _queued_turn("queue-existing", "message-existing", "existing")
+    queued = _queued_turn("queue-new", "message-new", "new").model_copy(
+        update={"created_at": 2}
+    )
+    first_update = Notification(
+        method="turn/queueUpdated",
+        params=TurnQueueUpdatedParams(
+            event_id=1,
+            session_id="session-1",
+            queue=PublicTurnQueue(items=[existing]),
+            emitted_at=2,
+        ).model_dump(mode="json", by_alias=True),
+    )
+    second_update = Notification(
+        method="turn/queueUpdated",
+        params=TurnQueueUpdatedParams(
+            event_id=2,
+            session_id="session-1",
+            queue=PublicTurnQueue(items=[existing]),
+            emitted_at=3,
+        ).model_dump(mode="json", by_alias=True),
+    )
+
+    projection.consume(first_update)
+    projection.track_queued_turn(queued, session_id="session-1")
+
+    assert [item.id for item in projection.state.turn_queue.items] == [
+        existing.id,
+        queued.id,
+    ]
+
+    projection.consume(second_update)
+    projection.track_queued_turn(queued, session_id="session-1")
+
+    assert [item.id for item in projection.state.turn_queue.items] == [existing.id]
+
+
+def test_started_turn_prevents_stale_enqueue_reconciliation() -> None:
+    projection = _projection()
+    queued = _queued_turn("queue-1", "message-1", "queued")
+    projection.begin_turn(
+        PublicTurn(
+            id="turn-1",
+            session_id="session-1",
+            status=PublicTurnStatus.IN_PROGRESS,
+            started_at=2,
+            queue_item_id=queued.id,
+        )
+    )
+
+    projection.track_queued_turn(queued, session_id="session-1")
+
+    assert projection.state.turn_queue.items == []
 
 
 def test_live_snapshot_preserves_loaded_history_and_turn_prefixes() -> None:
@@ -476,6 +717,80 @@ def test_streaming_message_is_added_patched_and_frozen() -> None:
         projection.consume(_notification(4, patched[0]))
 
 
+@pytest.mark.parametrize(
+    ("input_fields", "input_patch"),
+    [
+        pytest.param(
+            {},
+            JsonPatchOperation(op="add", path="/inputEntryId", value="steer-1"),
+            id="legacy-omitted-add",
+        ),
+        pytest.param(
+            {"inputEntryId": None},
+            JsonPatchOperation(op="replace", path="/inputEntryId", value="steer-1"),
+            id="nullable-replace",
+        ),
+    ],
+)
+def test_history_patch_links_legacy_and_nullable_input_entry_id(
+    input_fields: dict[str, JsonValue], input_patch: JsonPatchOperation
+) -> None:
+    """*Prepare*: A streaming entry from an older or current server.
+    *Do*: Apply the server's add or replace patch to link its input.
+    *Assert*: Both wire forms update the client projection without losing content.
+    """
+    # Prepare
+    projection = _projection()
+    projection.consume(
+        Notification(
+            method="history/entryAdded",
+            params={
+                "eventId": 1,
+                "sessionId": "session-1",
+                "emittedAt": 1,
+                "entry": {
+                    "type": "message",
+                    "id": "assistant-1",
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "generationStatus": "in_progress",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "relatedEntryId": None,
+                    **input_fields,
+                },
+            },
+        )
+    )
+
+    # Do
+    event = projection.consume(
+        Notification(
+            method="history/entryUpdated",
+            params={
+                "eventId": 2,
+                "sessionId": "session-1",
+                "emittedAt": 2,
+                "entryId": "assistant-1",
+                "patch": [input_patch.model_dump(mode="json", by_alias=True)],
+            },
+        )
+    )
+
+    # Assert
+    assert isinstance(event, HistoryEntryUpdated)
+    assert event.previous.input_entry_id is None
+    assert event.entry.input_entry_id == "steer-1"
+    entry = projection.history[0]
+    assert isinstance(entry, PublicMessageEntry)
+    assert entry.input_entry_id == "steer-1"
+    assert entry.text == "hello"
+    assert entry.related_entry_id is None
+    assert projection.last_event_id == 2
+
+
 def test_in_progress_entry_identity_is_frozen() -> None:
     projector = EventProjector("session-1", "turn-1")
     projector.project(AssistantEvent(content="hello", message_id="message-1"))
@@ -509,8 +824,35 @@ def test_tool_call_completes_streamed_text_before_adding_effect() -> None:
     assert message.generation_status == "completed"
     assert effect.generation_status == "in_progress"
 
-    with pytest.raises(ValueError, match="frozen"):
-        projector.project(ReasoningEvent(content="late", message_id="reasoning-1"))
+    # The backend can keep reusing the same message_id for reasoning/text
+    # that streams in after the tool call already completed that entry (seen
+    # with reasoning + speculative decoding on some OpenAI-compatible
+    # backends). That must start a fresh entry, not patch the frozen one.
+    late_updates = projector.project(
+        ReasoningEvent(content="late", message_id="reasoning-1")
+    )
+    assert [update.method for update in late_updates] == ["history/entryAdded"]
+    *_, late_reasoning = projector.history
+    assert isinstance(late_reasoning, PublicReasoningEntry)
+    assert late_reasoning.id != reasoning.id
+    assert late_reasoning.text == "late"
+    assert late_reasoning.generation_status == "in_progress"
+
+
+def test_assistant_text_after_tool_call_reusing_message_id_starts_a_new_entry() -> None:
+    projector = EventProjector("session-1", "turn-1")
+    projector.project(AssistantEvent(content="answer", message_id="message-1"))
+    projector.project(_read_call())
+
+    updates = projector.project(AssistantEvent(content="more", message_id="message-1"))
+
+    assert [update.method for update in updates] == ["history/entryAdded"]
+    message, _effect, late_message = projector.history
+    assert isinstance(message, PublicMessageEntry)
+    assert isinstance(late_message, PublicMessageEntry)
+    assert late_message.id != message.id
+    assert late_message.text == "more"
+    assert late_message.generation_status == "in_progress"
 
 
 def test_event_sequence_rejects_gaps_and_read_resynchronizes() -> None:

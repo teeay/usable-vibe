@@ -55,6 +55,18 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
     def layers(self) -> tuple[ConfigLayer[RawConfig], ...]:
         return tuple(self._extra_layers)
 
+    def get_layer(self, name: str) -> ConfigLayer[RawConfig]:
+        """Only the inserted layers exist here; the verbatim config is not one.
+
+        Callers that ask for the writable layer get a ``KeyError``, which is the
+        truthful answer for a double with no layer stack and reads as "assume a
+        single layer".
+        """
+        for layer in self._extra_layers:
+            if layer.name == name:
+                return layer
+        raise KeyError(f"No layer named {name!r}")
+
     def insert_layer(self, layer: ConfigLayer[RawConfig], index: int) -> None:
         self._extra_layers.insert(index, layer)
 
@@ -192,8 +204,11 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
         self._publish(before, reason)
         return []
 
-    async def reload(self) -> None:
-        return None
+    async def reload(
+        self, *, preflight: Callable[[C], Awaitable[None]] | None = None
+    ) -> None:
+        if preflight is not None:
+            await preflight(self._config)
 
     async def _persistence_orchestrator(self) -> ConfigOrchestrator[C]:
         layer = UserConfigLayer()

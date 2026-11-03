@@ -200,12 +200,26 @@ class SessionMetadata(BaseModel):
     loops: list[ScheduledLoop] = Field(default_factory=list)
     title: str | None = None
     title_source: Literal["auto", "manual"] = "auto"
+    bumped_at: str | None = None
+    # When the user pinned this session, or ``None`` while it is unpinned. A
+    # timestamp rather than a flag so the pinned shelf can be ordered by when
+    # each pin was made without a second field to keep in step.
+    pinned_at: str | None = None
+    # When the user archived this session, or ``None`` while it is visible.
+    archived_at: str | None = None
+    # These fields are absent from sessions written before unseen tracking.
+    # Null/null is the lazy migration: old sessions remain seen.
+    unseen_at: str | None = None
+    seen_at: str | None = None
     # The sticky GrowthBook variant assignment, persisted so a resumed session
     # keeps its buckets. NOTE: plan/org attributes and user_plan are user-scoped,
     # not session-scoped, so they are deliberately NOT persisted here — they are
     # re-resolved from the user-scoped whoami/identity cache on every session, so
     # resuming never reports a stale plan.
     experiments: EvalResponse | None = None
+    # Session-scoped config snapshot. New sessions pin ``active_model`` to its
+    # resolved alias before their first user turn; older snapshots remain valid.
+    config: dict[str, JsonValue] | None = None
     import_provenance: dict[str, JsonValue] | None = None
     created_worktree: WorktreeContext | None = None
 
@@ -557,6 +571,9 @@ class ToolResultEvent(BaseEvent):
     duration: float | None = None
     tool_call_id: str
     presentation: ToolResultPresentation | None = None
+    decision: Literal["execute", "skip"] | None = None
+    approval_type: Literal["always", "never", "ask"] | None = None
+    approval_source: Literal["config", "smart", "user", "bypass", "never"] | None = None
 
 
 class ToolStreamEvent(BaseEvent):
@@ -635,6 +652,13 @@ class ContextClearedEvent(BaseEvent):
 
 class SessionTitleUpdatedEvent(BaseEvent):
     title: str
+    session_id: str
+
+
+class BackgroundWorkEvent(BaseEvent):
+    work_id: str
+    kind: Literal["session_title"]
+    phase: Literal["started", "finished"]
     session_id: str
 
 

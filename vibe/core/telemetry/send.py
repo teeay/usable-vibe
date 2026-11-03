@@ -35,10 +35,17 @@ from vibe.utils.http import (
 
 if TYPE_CHECKING:
     from vibe.core.agent_loop import ToolDecision
+    from vibe.core.experiments.active import ExperimentSurface
     from vibe.core.experiments.models import ExperimentAttributes
 
 _DEFAULT_TELEMETRY_BASE_URL = "https://api.mistral.ai"
 _DATALAKE_EVENTS_PATH = "/v1/datalake/events"
+
+type SubagentOperation = Literal[
+    "list", "spawn", "wait", "send_message", "interrupt", "close"
+]
+type SubagentOutcome = Literal["success", "failure", "timeout"]
+type SubagentProfileSource = Literal["generic", "vibe_profile"]
 
 
 def get_mistral_provider_and_api_key(
@@ -65,11 +72,105 @@ def get_mistral_provider_and_api_key(
     return provider, api_key
 
 
+def mistral_credential_cache_key(config: VibeConfigSchema) -> str | None:
+    """Stable, anonymous per-user cache key derived from the Mistral API key.
+
+    The single resolution for on-disk caches keyed by user (experiment eval,
+    model catalog): None means no Mistral credential, so the caller has no
+    entry to read or write.
+    """
+    from vibe.core.experiments.manager import hash_api_key
+
+    provider_and_key = get_mistral_provider_and_api_key(config)
+    if provider_and_key is None:
+        return None
+    _provider, api_key = provider_and_key
+    return hash_api_key(api_key)
+
+
 def _extract_file_extension(path: object) -> str | None:
     if not isinstance(path, (str, Path)):
         return None
     suffix = Path(path).suffix.lower()
     return suffix or None
+
+
+def send_unified_subagent_tool_call_finished(
+    client: TelemetryClient,
+    *,
+    operation: SubagentOperation,
+    outcome: SubagentOutcome,
+    model: str,
+    profile_source: SubagentProfileSource | None = None,
+    message_id: str | None = None,
+) -> None:
+    """Record one terminal Unified subagent operation without user content.
+
+    Stateful subagent effects are produced by Harness Core rather than the
+    legacy ``ResolvedToolCall`` path. Keep their analytics on the existing
+    tool-finished event while exposing only the approved low-cardinality
+    dimensions. In particular, never add agent names, child IDs, prompts,
+    paths, or error messages here.
+    """
+    core_operation = "stop" if operation == "close" else operation
+    payload: dict[str, Any] = {
+        "tool_name": f"subagent.{core_operation}",
+        "status": "success" if outcome == "success" else "failure",
+        "decision": None,
+        "approval_type": None,
+        "agent_profile_name": None,
+        "model": model,
+        "nb_files_created": 0,
+        "nb_files_modified": 0,
+        "file_extension": None,
+        "message_id": message_id,
+        "subagent_operation": operation,
+        "subagent_outcome": outcome,
+        "subagent_depth": 1,
+    }
+    if profile_source is not None:
+        payload["subagent_profile_source"] = profile_source
+    client.send_telemetry_event("vibe.tool_call_finished", payload)
+
+
+def send_unified_tool_call_finished(  # noqa: PLR0913
+    client: TelemetryClient,
+    *,
+    tool_name: str,
+    status: Literal["success", "failure", "skipped"],
+    model: str,
+    agent_profile_name: str | None,
+    nb_files_created: int = 0,
+    nb_files_modified: int = 0,
+    file_extension: str | None = None,
+    message_id: str | None = None,
+    decision: Literal["execute", "skip"] | None = None,
+    approval_type: Literal["always", "never", "ask"] | None = None,
+    approval_source: Literal["config", "smart", "user", "bypass", "never"]
+    | None = None,
+) -> None:
+    """Record one terminal ordinary (non-subagent) Unified tool call.
+
+    The harness runs tool calls in Core, so they never pass through the legacy
+    ``ResolvedToolCall`` path. Hand-build the same ``vibe.tool_call_finished``
+    payload the legacy loop emits, sourcing name/status/file counts from the
+    reconciled effect and ``decision``/``approval_type``/``approval_source``
+    from the effect state.
+    """
+    payload: dict[str, Any] = {
+        "tool_name": tool_name,
+        "status": status,
+        "decision": decision,
+        "approval_type": approval_type,
+        "approval_source": approval_source,
+        "agent_profile_name": agent_profile_name,
+        "model": model,
+        "nb_files_created": nb_files_created,
+        "nb_files_modified": nb_files_modified,
+        "file_extension": file_extension,
+        "message_id": message_id,
+    }
+    client.send_telemetry_event("vibe.tool_call_finished", payload)
 
 
 class TelemetryClient:
@@ -84,6 +185,7 @@ class TelemetryClient:
         experiment_attributes_getter: (
             Callable[[], ExperimentAttributes | None] | None
         ) = None,
+        harness_backend: ExperimentSurface | None = None,
     ) -> None:
         self._config_getter = config_getter
         self._session_id_getter = session_id_getter
@@ -92,6 +194,7 @@ class TelemetryClient:
         self._experiments_getter = experiments_getter
         self._user_plan_getter = user_plan_getter
         self._experiment_attributes_getter = experiment_attributes_getter
+        self._harness_backend = harness_backend
         self._client: VibeAsyncHTTPClient | None = None
         self._pending_tasks: set[asyncio.Task[Any]] = set()
         self.last_correlation_id: str | None = None
@@ -160,8 +263,14 @@ class TelemetryClient:
             experiment_assignments=experiment_assignments,
             user_plan=self.user_plan,
             experiment_attributes=(
-                attributes.model_dump(exclude_none=True) if attributes else None
+                # mode="json" so nested enums (harness, terminal_emulator)
+                # serialize to their string values, matching the top-level fields
+                # and keeping the payload/logs free of Python enum reprs.
+                attributes.model_dump(mode="json", exclude_none=True)
+                if attributes
+                else None
             ),
+            harness_backend=self._harness_backend,
         )
 
     def send_telemetry_event(
@@ -267,6 +376,11 @@ class TelemetryClient:
     ) -> None:
         verdict_value = decision.verdict.value if decision else None
         approval_type_value = decision.approval_type.value if decision else None
+        approval_source_value = (
+            decision.approval_source.value
+            if decision and decision.approval_source
+            else None
+        )
 
         nb_files_created, nb_files_modified, file_extension = (
             self._calculate_file_metrics(tool_call, status, result)
@@ -278,6 +392,7 @@ class TelemetryClient:
             "status": status,
             "decision": verdict_value,
             "approval_type": approval_type_value,
+            "approval_source": approval_source_value,
             "agent_profile_name": agent_profile_name,
             "model": model,
             "nb_files_created": nb_files_created,
@@ -345,6 +460,7 @@ class TelemetryClient:
             "nb_mcp_servers": nb_mcp_servers,
             "nb_models": nb_models,
             "entrypoint": lc.agent_entrypoint if lc else "unknown",
+            "host_kind": "local",
             "version": __version__,
             "client_name": lc.client_name if lc else None,
             "client_version": lc.client_version if lc else None,

@@ -75,6 +75,31 @@ async def update_saved_session_title(
     return await update_saved_session_title_at_path(session_dir, title)
 
 
+async def update_saved_session_pin_at_path(
+    session_dir: Path, pinned_at: str | None
+) -> dict[str, Any]:
+    """Pin or unpin a session no agent is holding, by rewriting the record.
+
+    Unified's merged catalogue uses this for sessions in the older store.
+    Unpinning clears the timestamp; repeated pinning keeps the original so
+    the pinned shelf does not reorder.
+    """
+    metadata = _load_raw_metadata(session_dir)
+    existing = metadata.get("pinned_at")
+    if pinned_at is not None and isinstance(existing, str):
+        return metadata
+    updated_metadata = {**metadata, "pinned_at": pinned_at}
+    await SessionLogger.persist_metadata(updated_metadata, session_dir)
+    return updated_metadata
+
+
+async def update_saved_session_pin(
+    session_id: str, pinned_at: str | None, session_config: SessionLoggingConfig
+) -> dict[str, Any]:
+    session_dir = _resolve_saved_session_dir(session_id, session_config)
+    return await update_saved_session_pin_at_path(session_dir, pinned_at)
+
+
 async def relocate_saved_session_at_path(
     session_dir: Path, cwd: Path
 ) -> dict[str, Any]:
@@ -114,11 +139,13 @@ async def relocate_saved_session(
 
 async def delete_saved_session(
     session_id: str, session_config: SessionLoggingConfig
-) -> None:
+) -> bool:
+    """Remove a saved session, reporting whether this store held one."""
     session_dir = _find_saved_session_dir(session_id, session_config)
     if session_dir is None:
         last_session_pointer.clear_matching(session_config, session_id)
-        return
+        return False
 
     await asyncio.to_thread(shutil.rmtree, session_dir)
     last_session_pointer.clear_matching(session_config, session_id)
+    return True

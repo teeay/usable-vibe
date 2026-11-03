@@ -4,12 +4,13 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import ClassVar
 
 from rich.text import Text
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container, Vertical
-from textual.events import DescendantBlur
+from textual.containers import Container, Horizontal, Vertical
+from textual.events import DescendantBlur, DescendantFocus
 from textual.message import Message
-from textual.widgets import OptionList
+from textual.widgets import Input, OptionList
 from textual.widgets.option_list import Option, OptionDoesNotExist
 from textual.worker import Worker
 
@@ -19,27 +20,77 @@ from vibe.app_server.models import (
     MCPSourceSummary,
     MCPState,
 )
+from vibe.cli.autocompletion.fuzzy import fuzzy_match
 from vibe.cli.textual_ui.shortcut_hints import shortcut, shortcut_hint
 from vibe.cli.textual_ui.widgets.navigable_option_list import NavigableOptionList
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
+from vibe.cli.textual_ui.widgets.vscode_compat import VscodeCompatInput
 
+_REFRESHING_LABEL = "refreshing"
+_MANAGE_CONNECTORS_OPTION_ID = "action:manage-connectors"
 _LIST_VIEW_HELP_TOOLS = (
     f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Show tools  "
-    f"{shortcut('d')} Disable  {shortcut('e')} Enable  {shortcut('Esc')} Close"
+    f"{shortcut('d')} Disable  {shortcut('e')} Enable  {shortcut('r')} Refresh  "
+    f"{shortcut('Esc')} Close"
 )
 _LIST_VIEW_HELP_AUTH = (
     f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Connect  "
-    f"{shortcut('d')} Disable  {shortcut('e')} Enable  {shortcut('Esc')} Close"
+    f"{shortcut('d')} Disable  {shortcut('e')} Enable  {shortcut('r')} Refresh  "
+    f"{shortcut('Esc')} Close"
 )
 _DETAIL_VIEW_HELP = (
     f"{shortcut('↑↓/jk')} Navigate  {shortcut('d')} Disable  "
-    f"{shortcut('e')} Enable  {shortcut('Backspace')} Back  {shortcut('Esc')} Close"
+    f"{shortcut('e')} Enable  {shortcut('r')} Refresh  "
+    f"{shortcut('Backspace')} Back  {shortcut('Esc')} Close"
 )
 _DETAIL_VIEW_HELP_NO_TOOLS = (
-    f"{shortcut('↑↓/jk')} Navigate  {shortcut('Backspace')} Back  "
-    f"{shortcut('Esc')} Close"
+    f"{shortcut('↑↓/jk')} Navigate  {shortcut('r')} Refresh  "
+    f"{shortcut('Backspace')} Back  {shortcut('Esc')} Close"
 )
 _BACKGROUND_REFRESH_INTERVAL_SECONDS = 60.0
+
+
+class MCPOptionList(NavigableOptionList):
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("left", "focus_search", "Search", show=False)
+    ]
+
+    def __init__(
+        self, *, focus_search: Callable[[], None], id: str | None = None
+    ) -> None:
+        super().__init__(id=id)
+        self._focus_search = focus_search
+
+    def action_cursor_up(self) -> None:
+        if self.highlighted == self._first_selectable_index():
+            self._focus_search()
+            return
+        super().action_cursor_up()
+
+    def action_cursor_down(self) -> None:
+        if self.highlighted == self._last_selectable_index():
+            self._focus_search()
+            return
+        super().action_cursor_down()
+
+    def action_focus_search(self) -> None:
+        self._focus_search()
+
+    def _first_selectable_index(self) -> int | None:
+        return next(
+            (index for index, option in enumerate(self.options) if not option.disabled),
+            None,
+        )
+
+    def _last_selectable_index(self) -> int | None:
+        return next(
+            (
+                index
+                for index in range(len(self.options) - 1, -1, -1)
+                if not self.options[index].disabled
+            ),
+            None,
+        )
 
 
 class MCPApp(Container):
@@ -49,6 +100,7 @@ class MCPApp(Container):
         Binding("backspace", "back", "Back", show=False),
         Binding("d", "disable", "Disable", show=False),
         Binding("e", "enable", "Enable", show=False),
+        Binding("r", "refresh", "Refresh", show=False),
     ]
 
     class MCPClosed(Message):
@@ -92,19 +144,25 @@ class MCPApp(Container):
         self._viewing_kind: MCPSourceKind | None = None
         self._refresh_callback = refresh_callback
         self._refreshing = False
+        self._query = ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mcp-content"):
             yield NoMarkupStatic("", id="mcp-title", classes="settings-title")
-            yield NoMarkupStatic("")
-            yield NavigableOptionList(id="mcp-options")
+            with Horizontal(id="mcp-search-row"):
+                yield NoMarkupStatic("🔍", id="mcp-search-icon")
+                yield VscodeCompatInput(
+                    placeholder="Search servers and connectors (← to focus)",
+                    id="mcp-search",
+                    compact=True,
+                )
+            yield MCPOptionList(focus_search=self._focus_search, id="mcp-options")
             yield NoMarkupStatic("", id="mcp-help", classes="settings-help")
 
     def on_mount(self) -> None:
         self._refresh_view(self._viewing_name)
         self.query_one(OptionList).focus()
         if self._refresh_callback is not None:
-            self._start_refresh()
             self.set_interval(_BACKGROUND_REFRESH_INTERVAL_SECONDS, self._start_refresh)
 
     def refresh_index(self) -> None:
@@ -113,9 +171,43 @@ class MCPApp(Container):
         self._rebuild_preserving_scroll()
 
     def on_descendant_blur(self, _event: DescendantBlur) -> None:
+        if self.screen.focused in {self.query_one(Input), self.query_one(OptionList)}:
+            return
         self.query_one(OptionList).focus()
 
+    def on_descendant_focus(self, event: DescendantFocus) -> None:
+        search = self.query_one(Input)
+        if event.control is not search:
+            return
+        self.query_one(OptionList).scroll_to(
+            y=0, animate=False, force=True, immediate=True
+        )
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "mcp-search":
+            return
+        self._query = event.value
+        if self._viewing_name is None:
+            self._refresh_view(None)
+
+    def on_key(self, event: events.Key) -> None:
+        if self.screen.focused is not self.query_one(Input):
+            return
+        match event.key:
+            case "up":
+                self._focus_list(last=True)
+            case "down":
+                self._focus_list(last=False)
+            case _:
+                return
+        event.prevent_default()
+        event.stop()
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option.id == _MANAGE_CONNECTORS_OPTION_ID:
+            if url := self._state.manage_connectors_url:
+                self.app.open_url(url)
+            return
         target = _source_from_option_id(event.option.id or "")
         if target is not None:
             name, kind = target
@@ -139,7 +231,7 @@ class MCPApp(Container):
             source = self._source_for_option(event.option)
             self._set_help_text(
                 _LIST_VIEW_HELP_AUTH
-                if source is not None and source.status is MCPSourceStatus.NEEDS_AUTH
+                if source is not None and _awaits_auth(source)
                 else _LIST_VIEW_HELP_TOOLS
             )
 
@@ -156,11 +248,25 @@ class MCPApp(Container):
     def action_enable(self) -> None:
         self._set_highlighted_disabled(disabled=False)
 
+    def action_refresh(self) -> None:
+        # No callback means this browser was opened without a live session, so
+        # there is nothing to re-fetch. _start_refresh already ignores that case
+        # and coalesces against an in-flight refresh.
+        if self._refresh_callback is None:
+            return
+        self._start_refresh()
+
     def _start_refresh(self) -> None:
         if self._refresh_callback is None or self._refreshing:
             return
         self._refreshing = True
-        self.run_worker(self._run_refresh(), exclusive=True, group="refresh")
+        if self.is_attached and self._viewing_name is None:
+            self._rebuild_preserving_scroll()
+        # The callback owns loop-bound app-server state. Its blocking discovery
+        # setup is offloaded at the app-server and Runtime I/O boundaries.
+        self.run_worker(
+            self._run_refresh(), exclusive=True, group="refresh", exit_on_error=False
+        )
 
     async def _run_refresh(self) -> None:
         if self._refresh_callback is not None:
@@ -174,25 +280,52 @@ class MCPApp(Container):
             self.refresh_index()
 
     def _set_highlighted_disabled(self, *, disabled: bool) -> None:
+        """Toggle the highlighted source, painting only what the UI can know.
+
+        Disabling always takes effect, so the row can go straight to
+        ``DISABLED``. Enabling only clears the config flag: whether the source
+        then connects depends on discovery and auth, so painting ``ENABLED``
+        here reports success the UI has not observed. A server that is failing
+        discovery, or a connector that was never linked, would flash as enabled
+        and revert to its real status on the next repaint. Leave the status to
+        the authoritative refresh that follows the toggle.
+        """
         if self._viewing_name is not None and self._viewing_kind is not None:
             self._set_highlighted_tool_disabled(disabled=disabled)
             return
         target = self._highlighted_source()
         if target is None:
             return
-        target.status = (
-            MCPSourceStatus.DISABLED if disabled else MCPSourceStatus.ENABLED
-        )
+        if self._reject_plugin_toggle(target):
+            return
+        if disabled:
+            target.status = MCPSourceStatus.DISABLED
         self.post_message(
             self.MCPToggled(name=target.name, kind=target.kind, disabled=disabled)
         )
         self._rebuild_preserving_scroll()
+
+    def _reject_plugin_toggle(self, source: MCPSourceSummary) -> bool:
+        # Guards the server row and the tool rows under it alike: a toggle is
+        # written to that server's ``[[mcp_servers]]`` entry, and a plugin
+        # server has none, so the catalog would reject the request.
+        if source.plugin_name is None:
+            return False
+        self.notify(
+            f"{source.name} is managed by the {source.plugin_name} plugin and "
+            "cannot be toggled here.",
+            severity="warning",
+            markup=False,
+        )
+        return True
 
     def _set_highlighted_tool_disabled(self, *, disabled: bool) -> None:
         source = self._viewing_source()
         option_list = self.query_one(OptionList)
         highlighted = option_list.highlighted
         if source is None or highlighted is None:
+            return
+        if self._reject_plugin_toggle(source):
             return
         option_id = option_list.get_option_at_index(highlighted).id or ""
         if not option_id.startswith("tool:"):
@@ -240,10 +373,14 @@ class MCPApp(Container):
     def _show_list_view(self, option_list: OptionList) -> None:
         self._viewing_name = None
         self._viewing_kind = None
-        servers = _sort_sources_for_menu(self._sources(MCPSourceKind.SERVER))
-        connectors = _sort_sources_for_menu(self._sources(MCPSourceKind.CONNECTOR))
+        self.query_one("#mcp-search-row", Horizontal).display = True
+        all_servers = self._sources(MCPSourceKind.SERVER)
+        all_connectors = self._sources(MCPSourceKind.CONNECTOR)
+        servers = _filter_sources(all_servers, self._query)
+        connectors = _filter_sources(all_connectors, self._query)
+        title = "MCP Servers & Connectors" if all_connectors else "MCP Servers"
         self.query_one("#mcp-title", NoMarkupStatic).update(
-            "MCP Servers & Connectors" if connectors else "MCP Servers"
+            f"{title}  ({_REFRESHING_LABEL})" if self._refreshing else title
         )
         self._set_help_text(_LIST_VIEW_HELP_TOOLS)
         if servers:
@@ -251,26 +388,60 @@ class MCPApp(Container):
         if connectors:
             if servers:
                 option_list.add_option(Option(Text("", no_wrap=True), disabled=True))
-            self._add_source_group(option_list, "Workspace Connectors", connectors)
+            manage_option = None
+            if self._state.manage_connectors_url:
+                manage_option = Option(
+                    Text("+ Add more connectors in Studio", style="underline"),
+                    id=_MANAGE_CONNECTORS_OPTION_ID,
+                )
+            self._add_source_group(
+                option_list,
+                "Available Connectors",
+                connectors,
+                lead_option=manage_option,
+            )
         if not servers and not connectors:
             option_list.add_option(
-                Option("No MCP servers or connectors configured", disabled=True)
+                Option(
+                    "No matching MCP servers or connectors"
+                    if self._query.strip()
+                    else "No MCP servers or connectors configured",
+                    disabled=True,
+                )
             )
+            option_list.highlighted = None
             return
+        # Land on the first server/connector row, never the "manage" action, so
+        # an accidental Enter can't open the browser.
         option_list.highlighted = next(
             (
                 index
                 for index, option in enumerate(option_list.options)
-                if not option.disabled
+                if option.id is not None
+                and _source_from_option_id(option.id) is not None
             ),
-            0,
+            next(
+                (
+                    index
+                    for index, option in enumerate(option_list.options)
+                    if not option.disabled
+                ),
+                0,
+            ),
         )
 
     def _add_source_group(
-        self, option_list: OptionList, title: str, sources: Sequence[MCPSourceSummary]
+        self,
+        option_list: OptionList,
+        title: str,
+        sources: Sequence[MCPSourceSummary],
+        *,
+        lead_option: Option | None = None,
     ) -> None:
         option_list.add_option(Option(Text(title, style="bold"), disabled=True))
-        max_name = max(len(source.name) for source in sources)
+        if lead_option is not None:
+            option_list.add_option(lead_option)
+        max_name = max(len(source.display_name) for source in sources)
         max_transport = max(len(source.transport) + 2 for source in sources)
         tool_labels = {}
         for source in sources:
@@ -285,11 +456,21 @@ class MCPApp(Container):
             else:
                 tool_labels[source.name] = _tool_count_text(enabled, total)
         max_tools = max(len(label) for label in tool_labels.values())
+        # Only claim a column when something in this group is plugin-owned.
+        owner_tags = {
+            source.name: ""
+            if source.plugin_name is None
+            else f"[plugin:{source.plugin_name}]"
+            for source in sources
+        }
+        max_owner = max(len(tag) for tag in owner_tags.values())
         for source in sources:
             label = Text(no_wrap=True)
             type_tag = f"[{source.transport}]"
-            label.append(f"  {source.name:<{max_name}}")
+            label.append(f"  {source.display_name:<{max_name}}")
             label.append(f"  {type_tag:<{max_transport}}", style="dim")
+            if max_owner:
+                label.append(f"  {owner_tags[source.name]:<{max_owner}}", style="dim")
             label.append(f"  {tool_labels[source.name]:<{max_tools}}", style="dim")
             symbol, style, status = _source_status(source)
             _append_status(label, symbol, style, status)
@@ -302,8 +483,11 @@ class MCPApp(Container):
     ) -> None:
         self._viewing_name = source.name
         self._viewing_kind = source.kind
+        self.query_one("#mcp-search-row", Horizontal).display = False
         prefix = "Connector" if source.kind is MCPSourceKind.CONNECTOR else "MCP Server"
-        self.query_one("#mcp-title", NoMarkupStatic).update(f"{prefix}: {source.name}")
+        self.query_one("#mcp-title", NoMarkupStatic).update(
+            f"{prefix}: {source.display_name}"
+        )
         if source.error:
             self._set_help_text(_DETAIL_VIEW_HELP_NO_TOOLS)
             option_list.add_option(Option("Failed to bootstrap", disabled=True))
@@ -392,6 +576,22 @@ class MCPApp(Container):
     def _set_help_text(self, text: str) -> None:
         self.query_one("#mcp-help", NoMarkupStatic).update(shortcut_hint(text))
 
+    def _focus_search(self) -> None:
+        if self._viewing_name is None:
+            self.query_one(Input).focus()
+
+    def _focus_list(self, *, last: bool) -> None:
+        option_list = self.query_one(MCPOptionList)
+        selectable = [
+            index
+            for index, option in enumerate(option_list.options)
+            if not option.disabled
+        ]
+        if not selectable:
+            return
+        option_list.highlighted = selectable[-1] if last else selectable[0]
+        option_list.focus()
+
 
 def _source_option_id(name: str, kind: MCPSourceKind) -> str:
     return f"{kind.value}:{name}"
@@ -403,6 +603,11 @@ def _source_from_option_id(value: str) -> tuple[str, MCPSourceKind] | None:
         if value.startswith(prefix):
             return value.removeprefix(prefix), kind
     return None
+
+
+def _awaits_auth(source: MCPSourceSummary) -> bool:
+    # A bootstrap error shows in the detail view instead of the auth flow.
+    return source.status is MCPSourceStatus.NEEDS_AUTH and not source.error
 
 
 def _source_status(source: MCPSourceSummary) -> tuple[str, str, str]:
@@ -445,5 +650,26 @@ def _sort_sources_for_menu(
 ) -> list[MCPSourceSummary]:
     return sorted(
         sources,
-        key=lambda source: (not source.tools, source.name.casefold(), source.name),
+        # Order by the visible title; name is the stable tiebreaker.
+        key=lambda source: (
+            not source.tools,
+            source.display_name.casefold(),
+            source.name,
+        ),
     )
+
+
+def _filter_sources(
+    sources: Sequence[MCPSourceSummary], query: str
+) -> list[MCPSourceSummary]:
+    ordered = _sort_sources_for_menu(sources)
+    needle = query.strip()
+    if not needle:
+        return ordered
+    scored = [
+        (match.score, index, source)
+        for index, source in enumerate(ordered)
+        if (match := fuzzy_match(needle, source.display_name)).matched
+    ]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [source for _, _, source in scored]

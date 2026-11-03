@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, cast
 
 from pydantic import JsonValue
 
 from vibe.app_server._account import AccountController, AccountGateway
 from vibe.app_server._admin_config import (
+    apply_admin_config as _apply_admin_config,
     refresh_admin_layer,
     report_admin_config_outcome,
 )
@@ -16,33 +18,52 @@ from vibe.app_server._config_introspect import (
     POPULAR_SETTINGS,
     build_field_wires,
     collect_layer_values,
+    effective_config_response,
 )
-from vibe.app_server._config_write import config_write_ops_to_patches
+from vibe.app_server._config_write import (
+    config_write_ops_to_patches,
+    config_write_targets,
+    model_config_write_ops,
+)
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
 from vibe.app_server._execution import SessionExecution
 from vibe.app_server._identity import IdentityController, IdentityGateway
 from vibe.app_server._model import ProtocolModel, validate_wire
-from vibe.app_server._narration import NarrationService
+from vibe.app_server._narration import NarrationContext, NarrationService
 from vibe.app_server._projection import (
     project_agents,
     project_config,
     project_connectors,
     project_debug_logs,
     project_diagnostics,
+    project_installed_skills,
     project_mcp,
     project_session_log,
     project_skills,
     project_stats,
     project_tools,
 )
+from vibe.app_server._session_model import (
+    active_model_override_write_requested,
+    set_session_active_model_override,
+    with_session_active_model_write,
+)
+from vibe.app_server._skills_service import SkillsController
 from vibe.app_server.config import ProxySettingsView
-from vibe.app_server.models import AccountView, IdentityView, MCPState, ScheduledLoop
+from vibe.app_server.models import (
+    AccountView,
+    IdentityView,
+    MCPState,
+    ScheduledLoop,
+    SkillSummary,
+)
 from vibe.app_server.protocol import (
     AccountReadParams,
     AccountReadResponse,
     AgentInstallParams,
     AgentsListParams,
     AgentsListResponse,
+    ConfigEffectiveReadParams,
     ConfigFieldsReadParams,
     ConfigFieldsReadResponse,
     ConfigMutationResponse,
@@ -79,14 +100,13 @@ from vibe.app_server.protocol import (
     LoopsDeleteResponse,
     LoopsListParams,
     LoopsListResponse,
+    ModelConfigWriteParams,
     NarrationSummarizeParams,
     NarrationSummarizeResponse,
     ProtocolErrorCode,
     RuntimeReadParams,
     RuntimeReadResponse,
     RuntimeSnapshot,
-    SkillsListParams,
-    SkillsListResponse,
     StatsReadParams,
     StatsReadResponse,
     TelemetryRecordParams,
@@ -94,13 +114,9 @@ from vibe.app_server.protocol import (
     ToolsListResponse,
 )
 from vibe.core.agent_loop import AgentLoop
-from vibe.core.config.admin_config import (
-    MANAGED_CONFIG_TIMEOUT,
-    AdminConfigApplyResult,
-    AdminConfigOutcome,
-)
-from vibe.core.config.layers.overrides import OverridesLayer
-from vibe.core.config.orchestrator import ConfigPatchValidationError
+from vibe.core.config import VibeConfigSchema
+from vibe.core.config.admin_config import MANAGED_CONFIG_TIMEOUT, AdminConfigApplyResult
+from vibe.core.config.orchestrator import ConfigOrchestrator, ConfigPatchValidationError
 from vibe.core.feedback import (
     record_feedback_asked,
     record_feedback_given,
@@ -117,7 +133,57 @@ from vibe.core.proxy_setup import (
     unset_proxy_var,
 )
 from vibe.core.types import Role, ScheduledLoop as CoreScheduledLoop
-from vibe.observability.logging import logger
+from vibe.feedback import FEEDBACK_SNOOZED_COOLDOWN_SECONDS
+from vibe.observability.logging import logger, set_config_log_level
+
+
+class _LegacySkillsHost:
+    """``SkillsHost`` over the legacy agent loop.
+
+    A skill change is picked up by reloading the loop, which re-walks the search
+    paths; the snapshot is re-projected afterwards so the client sees the new
+    catalogue in the same response.
+    """
+
+    def __init__(
+        self,
+        agent_loop: AgentLoop,
+        execution: SessionExecution,
+        runtime_snapshot: Callable[[], RuntimeSnapshot],
+        require_session: Callable[[str], None],
+    ) -> None:
+        self._agent_loop = agent_loop
+        self._execution = execution
+        self._runtime_snapshot = runtime_snapshot
+        self._require_session = require_session
+
+    @property
+    def config(self) -> VibeConfigSchema:
+        return self._agent_loop.config
+
+    @property
+    def config_orchestrator(self) -> ConfigOrchestrator[VibeConfigSchema]:
+        return self._agent_loop.config_orchestrator
+
+    @property
+    def skill_roots(self) -> list[Path]:
+        return self._agent_loop.harness_files.project_roots
+
+    def require_idle(self) -> None:
+        self._execution.require_idle()
+
+    def require_session(self, session_id: str) -> None:
+        self._require_session(session_id)
+
+    def list_skills(self) -> list[SkillSummary]:
+        return project_skills(self._agent_loop)
+
+    def installed_skills(self) -> list[SkillSummary]:
+        return project_installed_skills(self._agent_loop)
+
+    async def refresh(self) -> RuntimeSnapshot:
+        await self._agent_loop.reload_with_initial_messages(reload_hooks=True)
+        return self._runtime_snapshot()
 
 
 class ResourceRequestHandler:
@@ -138,7 +204,19 @@ class ResourceRequestHandler:
         self._identity = IdentityController(agent_loop, identity_gateway)
         self._loops = LoopManager(agent_loop.session_logger)
         self._logs = LogReader()
-        self._narration = NarrationService(agent_loop)
+        self._narration = NarrationService(
+            lambda: NarrationContext(
+                config=agent_loop.config,
+                launch_context=agent_loop.launch_context,
+                parent_session_id=agent_loop.parent_session_id,
+                user_plan=agent_loop.user_plan,
+            )
+        )
+        self._skills = SkillsController(
+            _LegacySkillsHost(
+                agent_loop, execution, self.runtime_snapshot, self._require_session
+            )
+        )
         self._mcp_discovery_errors: dict[str, str] = {}
         self.restore_loops()
 
@@ -155,7 +233,9 @@ class ResourceRequestHandler:
                 result = await self._dispatch_config(method, raw_params)
             case "agents":
                 result = await self._dispatch_agents(method, raw_params)
-            case "skills" | "tools" | "stats" | "diagnostics":
+            case "skills":
+                result = await self._skills.dispatch(method, raw_params)
+            case "tools" | "stats" | "diagnostics":
                 result = self._dispatch_catalog(method, raw_params)
             case "connectors":
                 result = await self._dispatch_connectors(method, raw_params)
@@ -223,6 +303,7 @@ class ResourceRequestHandler:
             hooks_count=hooks_count,
             connectors=project_connectors(self._agent_loop),
             mcp=self._mcp_state(),
+            bypass_tool_permissions=self._agent_loop.bypass_tool_permissions,
         )
 
     def _mcp_state(self) -> MCPState:
@@ -263,14 +344,25 @@ class ResourceRequestHandler:
                     validate_wire(ConfigReadParams, raw_params)
                 )
                 runtime_updated = False
-            case "config/write":
-                write_response = await self._config_write(
+            case "config/write" | "config/model/write":
+                write_params = (
                     validate_wire(ConfigWriteParams, raw_params)
+                    if method == "config/write"
+                    else self._model_config_write_params(
+                        validate_wire(ModelConfigWriteParams, raw_params)
+                    )
                 )
+                write_response = await self._config_write(write_params)
                 response = write_response
-                runtime_updated = not write_response.rejected and not (
-                    write_response.failures
+                runtime_updated = write_response.applied
+            case "config/effective/read":
+                effective_params = validate_wire(ConfigEffectiveReadParams, raw_params)
+                self._require_session(effective_params.session_id)
+                response = effective_config_response(
+                    self._agent_loop.config_orchestrator.config,
+                    bypass_tool_permissions=self._agent_loop.bypass_tool_permissions,
                 )
+                runtime_updated = False
             case "config/fields/read":
                 response = await self._config_fields_read(
                     validate_wire(ConfigFieldsReadParams, raw_params)
@@ -332,12 +424,10 @@ class ResourceRequestHandler:
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult:
         match method:
-            case "skills/list":
-                response: ProtocolModel = self._skills_list(
-                    validate_wire(SkillsListParams, raw_params)
-                )
             case "tools/list":
-                response = self._tools_list(validate_wire(ToolsListParams, raw_params))
+                response: ProtocolModel = self._tools_list(
+                    validate_wire(ToolsListParams, raw_params)
+                )
             case "stats/read":
                 response = self._stats_read(validate_wire(StatsReadParams, raw_params))
             case "diagnostics/list":
@@ -387,7 +477,6 @@ class ResourceRequestHandler:
                         loops=[_project_loop(loop) for loop in self._loops.loops]
                     )
                 case "loops/create":
-                    self._execution.require_idle()
                     params = validate_wire(LoopsCreateParams, raw_params)
                     self._require_session(params.session_id)
                     response = LoopsCreateResponse(
@@ -396,14 +485,12 @@ class ResourceRequestHandler:
                         )
                     )
                 case "loops/delete":
-                    self._execution.require_idle()
                     params = validate_wire(LoopsDeleteParams, raw_params)
                     self._require_session(params.session_id)
                     response = LoopsDeleteResponse(
                         loop=_project_loop(await self._loops.delete(params.loop_id))
                     )
                 case "loops/clear":
-                    self._execution.require_idle()
                     params = validate_wire(LoopsClearParams, raw_params)
                     self._require_session(params.session_id)
                     response = LoopsClearResponse(count=await self._loops.clear())
@@ -454,7 +541,8 @@ class ResourceRequestHandler:
                             user_messages + params.pending_user_messages
                         ),
                         cache_store=self._agent_loop.cache_store,
-                    )
+                    ),
+                    snooze_duration_seconds=FEEDBACK_SNOOZED_COOLDOWN_SECONDS,
                 )
             case "feedback/record":
                 params = validate_wire(FeedbackRecordParams, raw_params)
@@ -491,14 +579,46 @@ class ResourceRequestHandler:
             mcp_servers_enabled=mcp_servers_enabled,
         )
 
+    def _model_config_write_params(
+        self, params: ModelConfigWriteParams
+    ) -> ConfigWriteParams:
+        """Lower a model pick onto this backend's generic write.
+
+        The legacy backend applies configuration synchronously, so a pick keeps
+        the idle-only contract here; only the Unified backend can park one.
+        """
+        try:
+            ops = model_config_write_ops(
+                self._agent_loop.config,
+                model_alias=params.model_alias,
+                reasoning_effort=params.reasoning_effort,
+            )
+        except ValueError as exc:
+            raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
+        return ConfigWriteParams(
+            session_id=params.session_id,
+            ops=ops,
+            reason="model configuration",
+            reload_runtime=True,
+        )
+
     async def _config_write(self, params: ConfigWriteParams) -> ConfigWriteResponse:
         self._execution.require_idle()
         self._require_session(params.session_id)
+        session_model_pinned = self._agent_loop.session_logger.active_model is not None
+        update_session_override = (
+            session_model_pinned and active_model_override_write_requested(params.ops)
+        )
+        ops = (
+            with_session_active_model_write(params.ops)
+            if update_session_override
+            else params.ops
+        )
         durable_aliases = (
             await self._agent_loop.config_orchestrator.durable_model_aliases()
         )
         operations = config_write_ops_to_patches(
-            self._agent_loop.config, params.ops, durable_model_aliases=durable_aliases
+            self._agent_loop.config, ops, durable_model_aliases=durable_aliases
         )
         try:
             failures = await self._agent_loop.config_orchestrator.apply_patch(
@@ -511,6 +631,21 @@ class ResourceRequestHandler:
                 runtime=self.runtime_snapshot(),
                 failures=[str(failure) for failure in failures],
             )
+        if update_session_override:
+            active_model = self._agent_loop.config.get_active_model().alias
+            failures = await set_session_active_model_override(
+                self._agent_loop.config_orchestrator,
+                active_model,
+                reason="normalize session active model",
+            )
+            if failures:
+                return ConfigWriteResponse(
+                    runtime=self.runtime_snapshot(),
+                    failures=[str(failure) for failure in failures],
+                )
+        # The config tier is latched once per process at session start, so without
+        # this a written log_level only takes effect after a restart.
+        set_config_log_level(self._agent_loop.config.log_level)
         if params.reload_runtime:
             self._clear_mcp_discovery_errors()
             await self._agent_loop.reload_with_initial_messages(reload_hooks=True)
@@ -549,19 +684,14 @@ class ResourceRequestHandler:
         admin layer stays empty and has no impact on the client. Returns whether
         the effective config changed, so the caller can push a runtime update.
         """
-        result = await self._refresh_admin_layer()
-        if not result.applied:
-            self._report_admin_config_outcome(result)
-            return False
-        try:
-            await self._agent_loop.refresh_config()
-        except Exception as exc:
-            logger.warning("Failed to apply admin-managed config", exc_info=exc)
-            self._agent_loop.telemetry_client.send_admin_config_applied(
-                outcome=AdminConfigOutcome.APPLY_FAILED, error=str(exc)
-            )
-            return False
-        self._report_admin_config_outcome(result)
+        return await _apply_admin_config(
+            self._agent_loop.config_orchestrator,
+            apply=self._refresh_agent_config,
+            telemetry=self._agent_loop.telemetry_client,
+        )
+
+    async def _refresh_agent_config(self) -> bool:
+        await self._agent_loop.refresh_config()
         return True
 
     def _report_admin_config_outcome(self, result: AdminConfigApplyResult) -> None:
@@ -605,7 +735,6 @@ class ResourceRequestHandler:
         orchestrator = self._agent_loop.config_orchestrator
         config = orchestrator.config
         layer_values = await collect_layer_values(orchestrator.layers)
-        # Per-tool config editing is not exposed in the settings screen yet.
         fields = [
             wire
             for wire in build_field_wires(
@@ -616,16 +745,11 @@ class ResourceRequestHandler:
         return ConfigFieldsReadResponse(fields=fields, targets=self._config_targets())
 
     def _config_targets(self) -> list[str]:
-        orchestrator = self._agent_loop.config_orchestrator
-        names = {layer.name for layer in orchestrator.layers}
-        writable = orchestrator.writable_layer_name
-        targets = [writable]
-        if OverridesLayer.NAME in names and OverridesLayer.NAME not in targets:
-            targets.append(OverridesLayer.NAME)
-        return targets
+        return config_write_targets(self._agent_loop.config_orchestrator)
 
     def _agents_list(self, params: AgentsListParams) -> AgentsListResponse:
-        self._require_session(params.session_id)
+        if params.session_id is not None:
+            self._require_session(params.session_id)
         active, agents = project_agents(self._agent_loop)
         return AgentsListResponse(active=active, agents=agents)
 
@@ -657,10 +781,6 @@ class ResourceRequestHandler:
             )
         active, agents = project_agents(self._agent_loop)
         return AgentsListResponse(active=active, agents=agents)
-
-    def _skills_list(self, params: SkillsListParams) -> SkillsListResponse:
-        self._require_session(params.session_id)
-        return SkillsListResponse(skills=project_skills(self._agent_loop))
 
     def _tools_list(self, params: ToolsListParams) -> ToolsListResponse:
         self._require_session(params.session_id)

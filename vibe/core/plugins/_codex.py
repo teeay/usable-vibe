@@ -17,11 +17,21 @@ from vibe.core.plugins._compatibility import (
     DetectedPluginFormat,
     PluginAdapterDiagnostic,
     PluginAdapterResult,
+    author_display_name,
     resolve_declared_path,
     typescript_identifier,
 )
 from vibe.core.skills.models import SkillScope
+from vibe.core.skills.parser import (
+    OPENAI_SKILL_METADATA_FILENAME,
+    SkillParseError,
+    parse_openai_skill_metadata,
+)
 from vibe.utils.io import read_safe
+
+# Only ``openai.yaml`` is executable metadata in Codex. ``openai.yml`` is
+# scanned so the compatibility report can identify it as retained-but-unsupported.
+_CODEX_AGENT_METADATA_FILENAMES = (OPENAI_SKILL_METADATA_FILENAME, "openai.yml")
 
 
 class _CodexPluginManifest(BaseModel):
@@ -30,6 +40,7 @@ class _CodexPluginManifest(BaseModel):
     name: str | None = Field(default=None, max_length=256)
     version: str | None = None
     description: str | None = None
+    author: JsonValue = None
     skills: JsonValue = None
     mcp_servers: JsonValue = Field(default=None, alias="mcpServers")
     apps: JsonValue = None
@@ -125,6 +136,7 @@ class CodexPluginAdapter:
             mcp_servers=mcp_servers,
             tool_overrides=MappingProxyType({}),
             private_metadata=MappingProxyType(private_metadata),
+            author=author_display_name(manifest.author),
         )
         return PluginAdapterResult(
             package=package,
@@ -453,7 +465,7 @@ class CodexPluginAdapter:
             except OSError:
                 continue
             for skill_dir in skill_dirs:
-                for filename in ("openai.yaml", "openai.yml"):
+                for filename in _CODEX_AGENT_METADATA_FILENAMES:
                     candidate = skill_dir / "agents" / filename
                     if candidate.exists() or candidate.is_symlink():
                         candidates.add(candidate)
@@ -485,6 +497,16 @@ class CodexPluginAdapter:
                     )
                 )
                 continue
+            if candidate.name == OPENAI_SKILL_METADATA_FILENAME:
+                try:
+                    metadata = parse_openai_skill_metadata(
+                        read_safe(resolved, raise_on_error=True).text
+                    )
+                except (OSError, SkillParseError):
+                    pass
+                else:
+                    if not metadata.has_unhandled_fields:
+                        continue
             diagnostics.append(
                 PluginAdapterDiagnostic(
                     severity="info",

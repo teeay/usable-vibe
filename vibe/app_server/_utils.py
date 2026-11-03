@@ -3,11 +3,20 @@ from __future__ import annotations
 import base64
 import binascii
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
-import time
 
 from pydantic import BaseModel, JsonValue
 
+# Redundant aliases: the helpers now live in ``_time`` (so the legacy session
+# importer can read them without importing this module), but existing callers
+# still import them from here.
+from vibe.app_server._time import (
+    iso_from_time_ms as iso_from_time_ms,
+    now_ms as now_ms,
+    optional_time_ms as optional_time_ms,
+    time_ms as time_ms,
+)
 from vibe.app_server.models import (
     FileImageSource as PublicFileImageSource,
     ImageContentBlock,
@@ -34,6 +43,14 @@ from vibe.core.types import (
 )
 from vibe.user_content import UserResource, render_user_resources
 
+# The statuses a provider refuses a credential with. Mirrors the Harness's
+# ``_REJECTION_REASONS`` so both backends classify a 403 the same way; neither
+# is worth a retry or a Sentry report.
+_REFUSED_CREDENTIAL_STATUSES = frozenset({
+    HTTPStatus.UNAUTHORIZED,
+    HTTPStatus.FORBIDDEN,
+})
+
 
 @dataclass(frozen=True, slots=True)
 class DecodedInput:
@@ -43,19 +60,23 @@ class DecodedInput:
     resources: list[UserResource]
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
 def decode_input(
     params: TurnStartParams | TurnSteerParams | ContextInjectParams,
+    *,
+    session_dir: Path | None,
+) -> DecodedInput:
+    return decode_content_blocks(params.input, session_dir=session_dir)
+
+
+def decode_content_blocks(
+    content: list[TextContentBlock | ImageContentBlock | ResourceContentBlock],
     *,
     session_dir: Path | None,
 ) -> DecodedInput:
     text: list[str] = []
     images: list[ImageAttachment] = []
     resources: list[UserResource] = []
-    for block in params.input:
+    for block in content:
         match block:
             case TextContentBlock():
                 text.append(block.text)
@@ -125,12 +146,19 @@ def public_error(exc: Exception) -> PublicError:  # noqa: PLR0912
             code = TurnErrorCode.INCOMPLETE_STREAM
         case BackendError() if exc.is_invalid_model:
             code = TurnErrorCode.INVALID_MODEL
+        case BackendError() if exc.status in _REFUSED_CREDENTIAL_STATUSES:
+            code = TurnErrorCode.INVALID_API_KEY
         case BackendError():
             code = TurnErrorCode.BACKEND_ERROR
         case RuntimeError() if (
             isinstance(cause := exc.__cause__, BackendError) and cause.is_invalid_model
         ):
             code = TurnErrorCode.INVALID_MODEL
+        case RuntimeError() if (
+            isinstance(cause := exc.__cause__, BackendError)
+            and cause.status in _REFUSED_CREDENTIAL_STATUSES
+        ):
+            code = TurnErrorCode.INVALID_API_KEY
         case RuntimeError() if isinstance(cause := exc.__cause__, BackendError):
             code = TurnErrorCode.BACKEND_ERROR
             details["provider"] = cause.provider

@@ -23,7 +23,7 @@ from vibe.cli.textual_ui.widgets.chat_input.completion_manager import (
     MultiCompletionManager,
 )
 from vibe.cli.textual_ui.widgets.chat_input.paste_path import (
-    maybe_prepend_at_for_image_path,
+    maybe_prepend_at_for_path,
     rewrite_bare_image_paths_in_text,
 )
 from vibe.cli.textual_ui.widgets.vscode_compat import patch_vscode_space
@@ -48,6 +48,9 @@ FEEDBACK_SNOOZE_LABEL = "snooze"
 
 class ChatTextArea(TextArea):
     ALLOW_SELECT: ClassVar[bool] = False
+    # User preference, separate from TextArea.cursor_blink (the effective state).
+    cursor_blink_enabled: reactive[bool] = reactive(True)
+    recording: reactive[bool] = reactive(False, toggle_class="recording")
 
     _CHAT_THEME: ClassVar[TextAreaTheme] = TextAreaTheme(
         name="vibe-chat",
@@ -159,6 +162,9 @@ class ChatTextArea(TextArea):
     class HistoryNext(Message):
         pass
 
+    class NavigateBelow(Message):
+        pass
+
     class HistoryReset(Message):
         """Message sent when history navigation should be reset."""
 
@@ -179,6 +185,14 @@ class ChatTextArea(TextArea):
 
     class QueueEditCancelled(Message):
         """Message sent when the user cancels queue-edit mode (Escape)."""
+
+    class SteerQueueRequested(Message):
+        """Flush queued prompts into the active turn as steering.
+
+        Posted on ctrl+enter (and super+enter) while the input is empty, so the
+        user can promote everything waiting in the queue into the running turn
+        instead of waiting for it to finish.
+        """
 
     class ModeChanged(Message):
         """Message sent when the input mode changes (>, !, /, &)."""
@@ -223,6 +237,7 @@ class ChatTextArea(TextArea):
         self._cursor_moved_since_load: bool = False
         self._completion_manager: MultiCompletionManager | None = None
         self._app_has_focus: bool = True
+        self._focus_relinquished: bool = False
         self._voice_manager = voice_manager
         self._last_keystroke_time: float = 0.0
         self._click_chain: int = 0
@@ -232,6 +247,9 @@ class ChatTextArea(TextArea):
         self._drag_chain: int = 0
         self._drag_anchor: Location | None = None
         self._dragged: bool = False
+
+        for attribute in ("cursor_blink_enabled", "read_only", "recording"):
+            self.watch(self, attribute, self._refresh_cursor_blink)
 
     # Workaround for an undo crash fixed upstream in
     # https://github.com/Textualize/textual/pull/6687 — remove this override
@@ -245,14 +263,32 @@ class ChatTextArea(TextArea):
         # app.clear_selection() and wipe an in-progress selection elsewhere.
         self.set_reactive(TextArea.selection, Selection.cursor(self.cursor_location))
         self.refresh()
-        if self._app_has_focus:
+        if self._app_has_focus and not self._focus_relinquished:
             self.call_after_refresh(self.focus)
+
+    def on_focus(self) -> None:
+        self._focus_relinquished = False
 
     def set_app_focus(self, has_focus: bool) -> None:
         self._app_has_focus = has_focus
-        self.cursor_blink = has_focus
-        if has_focus and not self.has_focus:
+        self._refresh_cursor_blink()
+        if has_focus and self.has_focus:
+            self._focus_relinquished = False
+        if has_focus and not self.has_focus and not self._focus_relinquished:
             self.call_after_refresh(self.focus)
+
+    def _refresh_cursor_blink(self) -> None:
+        self.cursor_blink = (
+            self.cursor_blink_enabled
+            and self._app_has_focus
+            and not self.read_only
+            and not self.recording
+        )
+        if not self.cursor_blink and self.has_focus:
+            # A steady caret must not inherit the hidden blink phase: Textual
+            # resets the phase in its cursor_blink watcher only when the value
+            # actually changes, so force the caret visible here.
+            self._pause_blink(visible=True)
 
     def on_click(self, event: events.Click) -> None:
         self._mark_cursor_moved_if_needed()
@@ -426,7 +462,7 @@ class ChatTextArea(TextArea):
         # second time and double-insert). TextArea._on_paste in the same
         # MRO still runs inside this dispatch cycle and performs the
         # single insertion using the mutated text.
-        event.text = maybe_prepend_at_for_image_path(event.text)
+        event.text = maybe_prepend_at_for_path(event.text)
         # Empty paste = either truly empty clipboard, or clipboard holds
         # image bytes the terminal cannot deliver as text. The app handler
         # peeks the OS clipboard in a worker and, if it finds image bytes,
@@ -668,6 +704,17 @@ class ChatTextArea(TextArea):
                     self.post_message(self.Submitted(self.get_full_text().strip()))
                     return
 
+        if event.key in {"ctrl+enter", "super+enter"}:
+            event.prevent_default()
+            event.stop()
+            if (
+                not self._queue_selection_active
+                and not self._queue_edit_active
+                and not self.get_full_text().strip()
+            ):
+                self.post_message(self.SteerQueueRequested())
+            return
+
         if event.key == "enter":
             event.prevent_default()
             event.stop()
@@ -713,6 +760,15 @@ class ChatTextArea(TextArea):
         if event.key == "down" and self._handle_history_down():
             event.prevent_default()
             event.stop()
+            return
+
+        if event.key == "down" and self.navigator.is_last_wrapped_line(
+            self.cursor_location
+        ):
+            event.prevent_default()
+            event.stop()
+            self._focus_relinquished = True
+            self.post_message(self.NavigateBelow())
             return
 
         patch_vscode_space(event)

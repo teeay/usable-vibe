@@ -9,12 +9,12 @@ from tests.conftest import (
     committed_scrollback,
 )
 from vibe.app_server.models import (
+    RemoteProjectLink,
     VibeCodeGitInfo,
     VibeCodePickerContext,
     VibeCodePickerState,
     VibeCodePickerView,
     VibeCodeProject,
-    VibeCodeProjectLink,
     VibeCodeRepository,
 )
 from vibe.app_server.protocol import (
@@ -42,8 +42,8 @@ def _project(project_id: str, name: str, repo_url: str = REPO_URL) -> VibeCodePr
     )
 
 
-def _link(project: VibeCodeProject, repo_url: str = REPO_URL) -> VibeCodeProjectLink:
-    return VibeCodeProjectLink(
+def _link(project: VibeCodeProject, repo_url: str = REPO_URL) -> RemoteProjectLink:
+    return RemoteProjectLink(
         repo_root=REPO_ROOT,
         repo_url=repo_url,
         project_id=project.project_id,
@@ -55,7 +55,7 @@ def _view(
     projects: list[VibeCodeProject],
     *,
     next_cursor: str | None = None,
-    saved_link: VibeCodeProjectLink | None = None,
+    saved_link: RemoteProjectLink | None = None,
     saved_project_link_cleared: bool = False,
     project_repo_remote_changed: bool = False,
 ) -> VibeCodePickerView:
@@ -187,7 +187,7 @@ async def test_vibe_code_project_command_opens_public_picker_view(
         next_cursor="next-page",
     )
     resource = FakeVibeCodeResource(view)
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -216,7 +216,7 @@ async def test_vibe_code_project_command_uses_server_access_policy(
         _view([]),
         open_error=_response_error("Vibe Code project access is unavailable."),
     )
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -242,7 +242,7 @@ async def test_vibe_code_project_load_more_uses_canonical_public_view(
     ])
     resource = FakeVibeCodeResource(initial_view)
     resource.load_more_result = next_view, "project:docs"
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -279,7 +279,7 @@ async def test_vibe_code_project_create_uses_public_git_and_resource_results(
     resource = FakeVibeCodeResource(initial_view)
     resource.create_result = created_view, created
     resource.select_result = selected_view, created
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -317,7 +317,7 @@ async def test_vibe_code_project_selection_applies_server_view(
     selected_view = _linked_view(initial_view, project)
     resource = FakeVibeCodeResource(initial_view)
     resource.select_result = selected_view, project
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -343,7 +343,7 @@ async def test_vibe_code_project_unlink_applies_server_view(
     unlinked_view = _view([project], saved_project_link_cleared=True)
     resource = FakeVibeCodeResource(linked_view)
     resource.unlink_result = unlinked_view
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -367,7 +367,7 @@ async def test_vibe_code_project_cancel_uses_resource_and_clears_ui_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     resource = FakeVibeCodeResource(_view([]))
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -394,7 +394,7 @@ async def test_teleport_resolution_uses_server_resolved_project(
     project = _project("mistral-vibe", "Mistral Vibe")
     view = _view([project], saved_link=_link(project))
     resource = FakeVibeCodeResource(view, resolved_project_id=project.project_id)
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -417,7 +417,7 @@ async def test_changed_remote_public_view_opens_picker_for_teleport(
 ) -> None:
     view = _view([], saved_project_link_cleared=True, project_repo_remote_changed=True)
     resource = FakeVibeCodeResource(view)
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -444,7 +444,7 @@ async def test_stale_link_recovery_replaces_ui_with_server_view(
     recovered_view = _view([_project("replacement", "Replacement")])
     resource = FakeVibeCodeResource(initial_view)
     resource.recovery_result = recovered_view, True
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)
@@ -472,7 +472,7 @@ async def test_vibe_code_project_command_displays_app_server_errors(
     monkeypatch: pytest.MonkeyPatch, message: str
 ) -> None:
     resource = FakeVibeCodeResource(_view([]), open_error=_response_error(message))
-    app = build_test_vibe_app(config=build_test_vibe_config(vibe_code_enabled=True))
+    app = build_test_vibe_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
         _install_resource(app, monkeypatch, resource)

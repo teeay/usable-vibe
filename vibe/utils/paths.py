@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-import os
+from nturl2path import url2pathname as windows_url2pathname
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 import re
+from urllib.parse import unquote, urlparse
 
 from vibe.utils.platform import is_windows
 
@@ -24,6 +25,20 @@ class UnanchoredWindowsPathError(ValueError):
             "path such as 'C:\\Users\\...', a Git Bash path such as "
             "'/c/Users/...', or a path relative to the working directory."
         )
+
+
+def file_uri_to_path(uri: str) -> str:
+    """Convert a file URI into a path using the current platform's rules."""
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        raise ValueError(f"Expected a file URI: {uri!r}")
+
+    encoded_path = parsed.path
+    if parsed.netloc and parsed.netloc != "localhost":
+        encoded_path = f"//{parsed.netloc}{encoded_path}"
+    if is_windows():
+        return windows_url2pathname(encoded_path)
+    return unquote(encoded_path)
 
 
 def normalize_windows_path(raw: str) -> str:
@@ -61,15 +76,6 @@ class GlobalPath:
     @property
     def path(self) -> Path:
         return self._resolver()
-
-
-_DEFAULT_VIBE_HOME = Path.home() / ".vibe"
-
-
-def get_vibe_home() -> Path:
-    if vibe_home := os.getenv("VIBE_HOME"):
-        return Path(vibe_home).expanduser().resolve()
-    return _DEFAULT_VIBE_HOME
 
 
 def is_dangerous_directory(path: Path | str = ".") -> tuple[bool, str]:
